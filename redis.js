@@ -1,13 +1,8 @@
 import Redis from "ioredis";
 
-const redis = new Redis({
-  host: process.env.REDIS_HOST || "127.0.0.1",
-  port: Number(process.env.REDIS_PORT || 6379),
+const redis = new Redis(process.env.REDIS_URL, {
   maxRetriesPerRequest: null,
-
-  retryStrategy(times) {
-    return Math.min(times * 50, 2000);
-  },
+  tls: {}, // required for rediss:// (Upstash)
 });
 
 redis.on("connect", () => {

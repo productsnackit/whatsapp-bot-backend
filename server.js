@@ -89,7 +89,7 @@ app.get("/tickets", auth, async (req, res) => {
         created_at,
         updated_at
       FROM tickets
-      WHERE category = 'REFUND'   -- ✅ ONLY REFUND
+      WHERE category = 'REFUND'
       ORDER BY id DESC
     `);
 
@@ -101,7 +101,7 @@ app.get("/tickets", auth, async (req, res) => {
 });
 
 /* =========================================================
-   📝 GET FEEDBACK (FROM feedback TABLE)
+   📝 GET FEEDBACK
 ========================================================= */
 app.get("/feedback", auth, async (req, res) => {
   try {
@@ -137,7 +137,7 @@ app.get("/product-leads", auth, async (req, res) => {
 });
 
 /* =========================================================
-   ⚙️ TICKET ACTION (ONLY FOR REFUND)
+   ⚙️ TICKET ACTION
 ========================================================= */
 app.post("/ticket/action", auth, async (req, res) => {
   try {
@@ -284,10 +284,10 @@ app.get("/", (req, res) => {
 });
 
 /* =========================================================
-   🚀 START SERVER
+   🚀 START SERVER (UPDATED)
 ========================================================= */
 const PORT = process.env.PORT || 3000;
 
-app.listen(PORT, () => {
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
