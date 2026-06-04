@@ -85,6 +85,7 @@ app.get("/tickets", auth, async (req, res) => {
         location,
         upi_id,
         image,
+        upi_image,   -- ✅ FIX: ADDED THIS LINE
         status,
         state,
         created_at,
