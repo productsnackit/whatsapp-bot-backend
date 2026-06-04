@@ -33,16 +33,19 @@ function cleanText(text) {
   return (text || "").trim().toLowerCase();
 }
 
-/* ================= MEDIA (FIXED SAFE MODE) ================= */
+/* ================= MEDIA (FINAL SAFE FIX) ================= */
 function extractMedia(jobData) {
   return {
-    isImage: jobData?.isImage || false,
+    isImage: Boolean(jobData?.isImage),
+
+    // 🔥 FIX: webhook never sends mediaUrl, so keep safe fallback only
     mediaUrl:
       jobData?.mediaUrl ||
       jobData?.url ||
       jobData?.image ||
       jobData?.file ||
       null,
+
     mediaType: jobData?.mediaType || null,
   };
 }
@@ -115,10 +118,9 @@ const worker = new Worker(
       let category = ticket.category;
       let subIssue = ticket.sub_issue;
 
-      /* ================= FIX #1: FORCE CATEGORY SYNC ================= */
+      /* ================= MENU ================= */
       if (!category) {
         await updateTicket(ticketId, { category: "MENU" });
-        category = "MENU"; // 🔥 IMPORTANT FIX (prevents logic skip)
 
         return sendWhatsApp(
           from,
@@ -130,13 +132,11 @@ const worker = new Worker(
         );
       }
 
-      /* ================= MENU ================= */
       if (category === "MENU") {
         if (message === "1") {
           await updateTicket(ticketId, { category: "REFUND", state: "MAIN" });
 
-          return sendWhatsApp(
-            from,
+          return sendWhatsApp(from,
             `Refund options:
 
 1 Product not dispensed  
@@ -149,8 +149,7 @@ const worker = new Worker(
         if (message === "2") {
           await updateTicket(ticketId, { category: "PRODUCT", state: "OPTIONS" });
 
-          return sendWhatsApp(
-            from,
+          return sendWhatsApp(from,
             `Product options:
 
 1 Brand Enquiry  
@@ -253,6 +252,7 @@ const worker = new Worker(
         if (state === "LOCATION") {
           if (isImage && mediaUrl) {
             const uploaded = await uploadToCloudinary(mediaUrl, "image");
+
             await updateTicket(ticketId, {
               image: uploaded || mediaUrl,
             });
@@ -308,6 +308,7 @@ const worker = new Worker(
           }
         }
       }
+
     } catch (err) {
       console.log("Worker Error:", err.message);
     }
