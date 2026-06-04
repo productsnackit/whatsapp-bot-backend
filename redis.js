@@ -4,7 +4,7 @@ console.log("REDIS_URL:", process.env.REDIS_URL);
 
 const redis = new Redis(process.env.REDIS_URL, {
   maxRetriesPerRequest: null,
-  tls: {},
+  tls: process.env.REDIS_URL?.startsWith("rediss://") ? {} : undefined, // ✅ FIX
 });
 
 redis.on("connect", () => {
