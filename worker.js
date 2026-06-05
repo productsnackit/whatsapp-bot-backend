@@ -35,14 +35,22 @@ function cleanText(text) {
 
 /* ================= MEDIA ================= */
 function extractMedia(jobData) {
+  const mediaUrl =
+    jobData?.mediaUrl ||
+    jobData?.url ||
+    jobData?.image ||
+    jobData?.file ||
+    null;
+
   return {
-    isImage: Boolean(jobData?.isImage),
-    mediaUrl:
-      jobData?.mediaUrl ||
-      jobData?.url ||
-      jobData?.image ||
-      jobData?.file ||
-      null,
+    isImage: Boolean(
+      jobData?.isImage ||
+        jobData?.type === "image" ||
+        jobData?.mediaType === "image" ||
+        jobData?.mediaType?.startsWith?.("image") ||
+        mediaUrl
+    ),
+    mediaUrl,
     mediaType: jobData?.mediaType || null,
   };
 }
