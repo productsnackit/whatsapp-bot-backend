@@ -33,18 +33,16 @@ function cleanText(text) {
   return (text || "").trim().toLowerCase();
 }
 
-/* ================= MEDIA (FINAL SAFE FIX) ================= */
+/* ================= MEDIA ================= */
 function extractMedia(jobData) {
   return {
     isImage: Boolean(jobData?.isImage),
-
     mediaUrl:
       jobData?.mediaUrl ||
       jobData?.url ||
       jobData?.image ||
       jobData?.file ||
       null,
-
     mediaType: jobData?.mediaType || null,
   };
 }
@@ -90,6 +88,10 @@ async function updateTicket(id, fields) {
   );
 }
 
+/* ================= FINAL MESSAGE ================= */
+const FINAL_MSG =
+  "🎉 Ticket has been raised, we will process your concern soon.";
+
 /* ================= WORKER ================= */
 const worker = new Worker(
   "ticketQueue",
@@ -99,16 +101,14 @@ const worker = new Worker(
     try {
       const { ticketId, from, text } = job.data || {};
 
-      if (!ticketId || !from) {
-        console.log("❌ Invalid job data");
-        return;
-      }
+      if (!ticketId || !from) return;
 
       const { isImage, mediaUrl } = extractMedia(job.data);
-
       const message = cleanText(text);
 
-      const res = await db.query("SELECT * FROM tickets WHERE id=$1", [ticketId]);
+      const res = await db.query("SELECT * FROM tickets WHERE id=$1", [
+        ticketId,
+      ]);
       if (!res.rows.length) return;
 
       const ticket = res.rows[0];
@@ -123,7 +123,8 @@ const worker = new Worker(
 
         return sendWhatsApp(
           from,
-          `👋 Welcome
+          `👋 Welcome to Snackit!
+How can we help you today?
 
 1️⃣ Refund  
 2️⃣ Product  
@@ -133,9 +134,13 @@ const worker = new Worker(
 
       if (category === "MENU") {
         if (message === "1") {
-          await updateTicket(ticketId, { category: "REFUND", state: "MAIN" });
+          await updateTicket(ticketId, {
+            category: "REFUND",
+            state: "MAIN",
+          });
 
-          return sendWhatsApp(from,
+          return sendWhatsApp(
+            from,
             `Refund options:
 
 1 Product not dispensed  
@@ -146,83 +151,24 @@ const worker = new Worker(
         }
 
         if (message === "2") {
-          await updateTicket(ticketId, { category: "PRODUCT", state: "OPTIONS" });
+          await updateTicket(ticketId, {
+            category: "PRODUCT",
+            state: "OPTIONS",
+          });
 
-          return sendWhatsApp(from,
-            `Product options:
-
-1 Brand Enquiry  
-2 New Product Collaboration`
-          );
+          return sendWhatsApp(from, `Product options:\n1 Brand Enquiry\n2 Collaboration`);
         }
 
         if (message === "3") {
-          await updateTicket(ticketId, { category: "FEEDBACK", state: "RATING" });
+          await updateTicket(ticketId, {
+            category: "FEEDBACK",
+            state: "RATING",
+          });
 
-          return sendWhatsApp(from, "⭐ Please rate your experience (1 to 5)");
+          return sendWhatsApp(from, "⭐ Rate us 1-5");
         }
 
         return sendWhatsApp(from, "Reply 1, 2 or 3");
-      }
-
-      /* ================= PRODUCT ================= */
-      if (category === "PRODUCT") {
-        if (state === "OPTIONS") {
-          if (message === "1") {
-            await db.query(
-              `INSERT INTO product_leads (phone, type, created_at)
-               VALUES ($1, $2, NOW())`,
-              [from, "Brand Enquiry"]
-            );
-
-            await updateTicket(ticketId, { state: "DONE", status: "done" });
-
-            return sendWhatsApp(from, `🏢 About Snackit...`);
-          }
-
-          if (message === "2") {
-            await db.query(
-              `INSERT INTO product_leads (phone, type, created_at)
-               VALUES ($1, $2, NOW())`,
-              [from, "Collaboration"]
-            );
-
-            await updateTicket(ticketId, { state: "DONE", status: "done" });
-
-            return sendWhatsApp(from, `🤝 Collaboration accepted.`);
-          }
-
-          return sendWhatsApp(from, "Reply 1 or 2");
-        }
-      }
-
-      /* ================= FEEDBACK ================= */
-      if (category === "FEEDBACK") {
-        if (state === "RATING") {
-          const rating = parseInt(message);
-
-          if (!rating || rating < 1 || rating > 5)
-            return sendWhatsApp(from, "Enter rating 1-5");
-
-          await updateTicket(ticketId, {
-            state: "COMMENT",
-            rating,
-          });
-
-          return sendWhatsApp(from, "📝 Enter your feedback");
-        }
-
-        if (state === "COMMENT") {
-          await db.query(
-            `INSERT INTO feedback (phone, rating, comment, created_at)
-             VALUES ($1, $2, $3, NOW())`,
-            [from, ticket.rating || 0, text]
-          );
-
-          await updateTicket(ticketId, { state: "DONE", status: "done" });
-
-          return sendWhatsApp(from, "🙏 Thank you!");
-        }
       }
 
       /* ================= REFUND ================= */
@@ -248,65 +194,21 @@ const worker = new Worker(
           return sendWhatsApp(from, "Enter machine location");
         }
 
-        if (state === "LOCATION") {
-          if (isImage && mediaUrl) {
-            const uploaded = await uploadToCloudinary(mediaUrl, "image");
-
-            await updateTicket(ticketId, {
-              image: uploaded || mediaUrl,
-            });
+        /* ================= PRODUCT NOT DISPENSED ================= */
+        if (subIssue === "Product not dispensed") {
+          if (state === "LOCATION") {
+            await updateTicket(ticketId, { location: text, state: "STEP1" });
+            return sendWhatsApp(from, "Send product image");
           }
 
-          await updateTicket(ticketId, {
-            location: text,
-            state: "STEP1",
-          });
-
-          if (subIssue === "Product not dispensed")
-            return sendWhatsApp(from, "Send product stuck image");
-
-          return sendWhatsApp(from, "Enter UPI ID");
-        }
-
-        /* ================= 🔥 FIX ADDED HERE ================= */
-        if (state === "STEP1" && subIssue !== "Product not dispensed") {
-          await updateTicket(ticketId, {
-            upi_id: text,
-            state: "STEP2",
-          });
-
-          return sendWhatsApp(from, "Send UPI screenshot");
-        }
-
-        if (state === "STEP2" && subIssue !== "Product not dispensed") {
-          if (!isImage) return sendWhatsApp(from, "Send UPI screenshot image");
-
-          const uploaded = await uploadToCloudinary(mediaUrl, "image");
-
-          await updateTicket(ticketId, {
-            upi_image: uploaded || mediaUrl,
-            state: "DONE",
-            status: "done",
-          });
-
-          return sendWhatsApp(
-            from,
-            "✅ Ticket has been raised successfully.\nWe will process your refund soon."
-          );
-        }
-
-        /* ================= SPECIAL FLOW ================= */
-        if (subIssue === "Product not dispensed") {
           if (state === "STEP1") {
-            if (!isImage) return sendWhatsApp(from, "Send image");
-
-            const uploaded = await uploadToCloudinary(mediaUrl, "image");
-
-            await updateTicket(ticketId, {
-              image: uploaded || mediaUrl,
-              state: "STEP2",
-            });
-
+            if (isImage && mediaUrl) {
+              const uploaded = await uploadToCloudinary(mediaUrl);
+              await updateTicket(ticketId, {
+                image: uploaded || mediaUrl,
+                state: "STEP2",
+              });
+            }
             return sendWhatsApp(from, "Enter UPI ID");
           }
 
@@ -320,24 +222,148 @@ const worker = new Worker(
           }
 
           if (state === "STEP3") {
-            if (!isImage) return sendWhatsApp(from, "Send image");
+            if (isImage && mediaUrl) {
+              const uploaded = await uploadToCloudinary(mediaUrl);
+              await updateTicket(ticketId, {
+                upi_image: uploaded || mediaUrl,
+                state: "DONE",
+              });
+            }
 
-            const uploaded = await uploadToCloudinary(mediaUrl, "image");
+            await updateTicket(ticketId, { state: "DONE" });
+            return sendWhatsApp(from, FINAL_MSG);
+          }
+        }
+
+        /* ================= EXPIRY ================= */
+        if (subIssue === "Expired") {
+          if (state === "LOCATION") {
+            await updateTicket(ticketId, { state: "EXP_IMG" });
+            return sendWhatsApp(from, "Send expiry image");
+          }
+
+          if (state === "EXP_IMG") {
+            const uploaded = isImage
+              ? await uploadToCloudinary(mediaUrl)
+              : null;
+
+            await updateTicket(ticketId, {
+              image: uploaded || mediaUrl,
+              state: "EXP_UPI",
+            });
+
+            return sendWhatsApp(from, "Enter UPI ID");
+          }
+
+          if (state === "EXP_UPI") {
+            await updateTicket(ticketId, {
+              upi_id: text,
+              state: "EXP_UPI_IMG",
+            });
+
+            return sendWhatsApp(from, "Send UPI screenshot");
+          }
+
+          if (state === "EXP_UPI_IMG") {
+            const uploaded = isImage
+              ? await uploadToCloudinary(mediaUrl)
+              : null;
 
             await updateTicket(ticketId, {
               upi_image: uploaded || mediaUrl,
               state: "DONE",
-              status: "done",
             });
 
-            return sendWhatsApp(
-              from,
-              "✅ Ticket has been raised successfully.\nWe will process your refund soon."
-            );
+            return sendWhatsApp(from, FINAL_MSG);
+          }
+        }
+
+        /* ================= WRONG PRICE ================= */
+        if (subIssue === "Wrong price") {
+          if (state === "LOCATION") {
+            await updateTicket(ticketId, { state: "PRICE_IMG" });
+            return sendWhatsApp(from, "Send product price image");
+          }
+
+          if (state === "PRICE_IMG") {
+            const uploaded = isImage
+              ? await uploadToCloudinary(mediaUrl)
+              : null;
+
+            await updateTicket(ticketId, {
+              image: uploaded || mediaUrl,
+              state: "PRICE_UPI",
+            });
+
+            return sendWhatsApp(from, "Enter UPI ID");
+          }
+
+          if (state === "PRICE_UPI") {
+            await updateTicket(ticketId, {
+              upi_id: text,
+              state: "PRICE_UPI_IMG",
+            });
+
+            return sendWhatsApp(from, "Send UPI screenshot");
+          }
+
+          if (state === "PRICE_UPI_IMG") {
+            const uploaded = isImage
+              ? await uploadToCloudinary(mediaUrl)
+              : null;
+
+            await updateTicket(ticketId, {
+              upi_image: uploaded || mediaUrl,
+              state: "DONE",
+            });
+
+            return sendWhatsApp(from, FINAL_MSG);
+          }
+        }
+
+        /* ================= DAMAGED ================= */
+        if (subIssue === "Damaged") {
+          if (state === "LOCATION") {
+            await updateTicket(ticketId, { state: "DAM_IMG" });
+            return sendWhatsApp(from, "Send damaged product image");
+          }
+
+          if (state === "DAM_IMG") {
+            const uploaded = isImage
+              ? await uploadToCloudinary(mediaUrl)
+              : null;
+
+            await updateTicket(ticketId, {
+              image: uploaded || mediaUrl,
+              state: "DAM_UPI",
+            });
+
+            return sendWhatsApp(from, "Enter UPI ID");
+          }
+
+          if (state === "DAM_UPI") {
+            await updateTicket(ticketId, {
+              upi_id: text,
+              state: "DAM_UPI_IMG",
+            });
+
+            return sendWhatsApp(from, "Send UPI screenshot");
+          }
+
+          if (state === "DAM_UPI_IMG") {
+            const uploaded = isImage
+              ? await uploadToCloudinary(mediaUrl)
+              : null;
+
+            await updateTicket(ticketId, {
+              upi_image: uploaded || mediaUrl,
+              state: "DONE",
+            });
+
+            return sendWhatsApp(from, FINAL_MSG);
           }
         }
       }
-
     } catch (err) {
       console.log("Worker Error:", err.message);
     }
