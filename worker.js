@@ -404,51 +404,50 @@ How can we help you today?
         }
       }
 
-            /* ================= PRODUCT ================= */
-      if (category === "PRODUCT") {
-        if (state === "OPTIONS") {
-          if (message === "1") {
-            await db.query(
-              "INSERT INTO product_leads (phone, type) VALUES ($1, $2)",
-              [from, "Brand Enquiry"]
-            );
+/* ================= PRODUCT ================= */
+if (category === "PRODUCT") {
+  if (state === "OPTIONS") {
+    if (message === "1") {
+      await db.query(
+        "INSERT INTO product_leads (phone, type) VALUES ($1, $2)",
+        [from, "Brand Enquiry"]
+      );
 
-            await updateTicket(ticketId, {
-              main_issue: "Product",
-              sub_issue: "Brand Enquiry",
-              state: "CLOSED",
-              status: "closed",
-            });
+      await updateTicket(ticketId, {
+        main_issue: "Product",
+        sub_issue: "Brand Enquiry",
+        state: "CLOSED",
+        status: "closed",
+      });
 
-            return sendWhatsApp(
-              from,
-              "Thank you. Your brand enquiry has been received. Our team will contact you soon."
-            );
-          }
+      return sendWhatsApp(
+        from,
+        "Thank you for your interest in Snackit.\n\nSnackit is a fast-growing smart vending solutions company providing seamless, cashless food and beverage experiences through our automated machines across multiple locations.\n\nIf you are a brand looking to showcase or distribute your products through our vending network, we would be happy to explore opportunities with you.\n\nPlease contact us at info@snackit.in. Our team will get in touch with you shortly."
+      );
+    }
 
-          if (message === "2") {
-            await db.query(
-              "INSERT INTO product_leads (phone, type) VALUES ($1, $2)",
-              [from, "Collaboration"]
-            );
+    if (message === "2") {
+      await db.query(
+        "INSERT INTO product_leads (phone, type) VALUES ($1, $2)",
+        [from, "Collaboration"]
+      );
 
-            await updateTicket(ticketId, {
-              main_issue: "Product",
-              sub_issue: "Collaboration",
-              state: "CLOSED",
-              status: "closed",
-            });
+      await updateTicket(ticketId, {
+        main_issue: "Product",
+        sub_issue: "Collaboration",
+        state: "CLOSED",
+        status: "closed",
+      });
 
-            return sendWhatsApp(
-              from,
-              "Thank you. Your collaboration request has been received. Our team will contact you soon."
-            );
-          }
+      return sendWhatsApp(
+        from,
+        "Thank you for your interest in collaborating with Snackit.\n\nSnackit partners with innovative brands to introduce new and exciting products through our smart vending machine network, helping increase product visibility and customer reach.\n\nWe are always open to mutually beneficial collaborations.\n\nPlease reach out to us at info@snackit.in. Our team will review your request and connect with you soon."
+      );
+    }
 
-          return sendWhatsApp(from, "Choose 1 or 2");
-        }
-      }
-
+    return sendWhatsApp(from, "Choose 1 or 2");
+  }
+}
       /* ================= FEEDBACK ================= */
       if (category === "FEEDBACK") {
         if (state === "RATING") {
