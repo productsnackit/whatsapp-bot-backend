@@ -90,7 +90,7 @@ async function updateTicket(id, fields) {
 
 /* ================= FINAL MESSAGE ================= */
 const FINAL_MSG =
-  "🎉 Ticket has been raised, we will process your concern soon.";
+  " Ticket has been raised, we will process your concern soon.";
 
 /* ================= WORKER ================= */
 const worker = new Worker(
@@ -191,7 +191,7 @@ How can we help you today?
             state: "LOCATION",
           });
 
-          return sendWhatsApp(from, "Enter machine location");
+          return sendWhatsApp(from, "Enter machine location ALONG with the company name");
         }
 
         /* ================= PRODUCT NOT DISPENSED ================= */
@@ -209,7 +209,7 @@ How can we help you today?
                 state: "STEP2",
               });
             }
-            return sendWhatsApp(from, "Enter UPI ID");
+            return sendWhatsApp(from, "Enter your UPI Transaction ID please ");
           }
 
           if (state === "STEP2") {
@@ -218,7 +218,7 @@ How can we help you today?
               state: "STEP3",
             });
 
-            return sendWhatsApp(from, "Send UPI screenshot");
+            return sendWhatsApp(from, "Send your UPI Transaction image please");
           }
 
           if (state === "STEP3") {
@@ -239,7 +239,7 @@ How can we help you today?
         if (subIssue === "Expired") {
           if (state === "LOCATION") {
             await updateTicket(ticketId, { state: "EXP_IMG" });
-            return sendWhatsApp(from, "Send expiry image");
+            return sendWhatsApp(from, "Send the expiry image please");
           }
 
           if (state === "EXP_IMG") {
@@ -252,7 +252,7 @@ How can we help you today?
               state: "EXP_UPI",
             });
 
-            return sendWhatsApp(from, "Enter UPI ID");
+            return sendWhatsApp(from, "Enter your UPI Transaction ID please");
           }
 
           if (state === "EXP_UPI") {
@@ -261,7 +261,7 @@ How can we help you today?
               state: "EXP_UPI_IMG",
             });
 
-            return sendWhatsApp(from, "Send UPI screenshot");
+            return sendWhatsApp(from, "Send your UPI Transaction image please");
           }
 
           if (state === "EXP_UPI_IMG") {
@@ -282,7 +282,7 @@ How can we help you today?
         if (subIssue === "Wrong price") {
           if (state === "LOCATION") {
             await updateTicket(ticketId, { state: "PRICE_IMG" });
-            return sendWhatsApp(from, "Send product price image");
+            return sendWhatsApp(from, "Send product price image please");
           }
 
           if (state === "PRICE_IMG") {
@@ -295,7 +295,7 @@ How can we help you today?
               state: "PRICE_UPI",
             });
 
-            return sendWhatsApp(from, "Enter UPI ID");
+            return sendWhatsApp(from, "Enter your UPI Transaction  ID");
           }
 
           if (state === "PRICE_UPI") {
@@ -304,7 +304,7 @@ How can we help you today?
               state: "PRICE_UPI_IMG",
             });
 
-            return sendWhatsApp(from, "Send UPI screenshot");
+            return sendWhatsApp(from, "Send your UPI Transaction image please");
           }
 
           if (state === "PRICE_UPI_IMG") {
@@ -325,7 +325,7 @@ How can we help you today?
         if (subIssue === "Damaged") {
           if (state === "LOCATION") {
             await updateTicket(ticketId, { state: "DAM_IMG" });
-            return sendWhatsApp(from, "Send damaged product image");
+            return sendWhatsApp(from, "Send the damaged product image please");
           }
 
           if (state === "DAM_IMG") {
@@ -338,7 +338,7 @@ How can we help you today?
               state: "DAM_UPI",
             });
 
-            return sendWhatsApp(from, "Enter UPI ID");
+            return sendWhatsApp(from, "Enter your UPI transaction ID please");
           }
 
           if (state === "DAM_UPI") {
@@ -347,7 +347,7 @@ How can we help you today?
               state: "DAM_UPI_IMG",
             });
 
-            return sendWhatsApp(from, "Send UPI screenshot");
+            return sendWhatsApp(from, "Send your UPI screenshot please");
           }
 
           if (state === "DAM_UPI_IMG") {
