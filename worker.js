@@ -149,7 +149,7 @@ const worker = new Worker(
 
         return sendWhatsApp(
           from,
-          `🤝 𝓦𝓮𝓵𝓬𝓸𝓂𝓮 TO SNACKIT!
+          `🤝 WELCOME TO SNACKIT!
 How can we help you today?
 
 1️⃣ Refund  
@@ -194,7 +194,7 @@ How can we help you today?
           return sendWhatsApp(from, "🌟 Rate us 1-5");
         }
 
-        return sendWhatsApp(from, "Reply 1, 2 or 3");
+        return sendWhatsApp(from, "Please Reply With 1, 2 or 3");
       }
 
       /* ================= REFUND ================= */
@@ -445,7 +445,7 @@ if (category === "PRODUCT") {
       );
     }
 
-    return sendWhatsApp(from, "Choose 1 or 2");
+    return sendWhatsApp(from, "Please Choose 1 or 2");
   }
 }
       /* ================= FEEDBACK ================= */
@@ -483,7 +483,7 @@ if (category === "PRODUCT") {
             status: "closed",
           });
 
-          return sendWhatsApp(from, "Thank you for your feedback.");
+          return sendWhatsApp(from, "Thank you for your Valuable feedback.");
         }
       }
     } catch (err) {
