@@ -17,13 +17,31 @@ cloudinary.config({
 
 async function uploadToCloudinary(url, type = "image") {
   try {
-    const result = await cloudinary.uploader.upload(url, {
+    if (!url) return null;
+
+    let uploadSource = url;
+
+    if (url.includes("lookaside.fbsbx.com")) {
+      const mediaRes = await axios.get(url, {
+        responseType: "arraybuffer",
+        headers: {
+          Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`,
+        },
+      });
+
+      const contentType = mediaRes.headers["content-type"] || "image/jpeg";
+      const base64 = Buffer.from(mediaRes.data).toString("base64");
+
+      uploadSource = `data:${contentType};base64,${base64}`;
+    }
+
+    const result = await cloudinary.uploader.upload(uploadSource, {
       resource_type: type,
     });
 
     return result.secure_url;
   } catch (err) {
-    console.log("Cloudinary Upload Error:", err.message);
+    console.log("Cloudinary Upload Error:", err.response?.data || err.message);
     return null;
   }
 }
