@@ -100,7 +100,6 @@ app.get("/tickets", auth, async (req, res) => {
       ORDER BY id DESC
     `);
 
-    /* ================= FIX: IMAGE URLS ================= */
     const rows = result.rows.map((t) => ({
       ...t,
       image: t.image
@@ -242,6 +241,58 @@ app.delete("/tickets/:id", auth, async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     console.log("DELETE ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+/* =========================================================
+   📊 ANALYTICS (ONLY ADDED - NOTHING MODIFIED)
+========================================================= */
+
+/* Daily Product Not Dispensed */
+app.get("/analytics/product-not-dispensed", auth, async (req, res) => {
+  try {
+    const result = await db.query(`
+      SELECT DATE(created_at) as date, COUNT(*) as count
+      FROM tickets
+      WHERE main_issue = 'Product Not Dispensed'
+      GROUP BY DATE(created_at)
+      ORDER BY date
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    console.log("ANALYTICS ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+/* Issues by Category */
+app.get("/analytics/category", auth, async (req, res) => {
+  try {
+    const result = await db.query(`
+      SELECT category, COUNT(*) as count
+      FROM tickets
+      GROUP BY category
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    console.log("ANALYTICS ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+/* Monthly Tickets */
+app.get("/analytics/monthly", auth, async (req, res) => {
+  try {
+    const result = await db.query(`
+      SELECT DATE_TRUNC('month', created_at) as month, COUNT(*) as count
+      FROM tickets
+      GROUP BY month
+      ORDER BY month
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    console.log("ANALYTICS ERROR:", err.message);
     res.status(500).json({ error: "Server error" });
   }
 });
