@@ -122,7 +122,7 @@ const FINAL_MSG =
 const worker = new Worker(
   "ticketQueue",
   async (job) => {
-    console.log("ðŸ”¥ JOB RECEIVED:", job.data);
+    console.log("JOB RECEIVED:", job.data);
 
     try {
       const { ticketId, from, text } = job.data || {};
@@ -170,7 +170,7 @@ How can we help you today?
             `Refund options:
 
 1 Product Not Dispensed  
-2 Received Expired Product
+2 Product Issue
 3 Charged Higher MRP 
 4 Received Damaged Product`
           );
@@ -202,7 +202,7 @@ How can we help you today?
         if (state === "MAIN") {
           const map = {
             "1": "Product Not Dispensed",
-            "2": "Recieved Expired Product",
+            "2": "Product Issue",
             "3": "Charged Higher MRP",
             "4": "Recieved Damaged Product",
           };
@@ -275,7 +275,7 @@ How can we help you today?
         }
 
         /* ================= EXPIRY ================= */
-        if (subIssue === "Recieved Expired Product") {
+        if (subIssue === "Product Issue") {
           if (state === "LOCATION") {
             await updateTicket(ticketId, { state: "EXP_IMG" });
             return sendWhatsApp(from, "Send the expiry image please");

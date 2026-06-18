@@ -31,7 +31,7 @@ const ADMIN_USER = "admin";
 const ADMIN_PASS = "admin";
 
 /* =========================================================
-   ÃƒÂ°Ã…Â¸Ã¢â‚¬ÂÃ‚Â AUTH MIDDLEWARE
+    AUTH MIDDLEWARE
 ========================================================= */
 function auth(req, res, next) {
   try {
@@ -59,7 +59,7 @@ function auth(req, res, next) {
 }
 
 /* =========================================================
-   ÃƒÂ°Ã…Â¸Ã¢â‚¬ÂÃ¢â‚¬Ëœ LOGIN
+    LOGIN
 ========================================================= */
 app.post("/login", (req, res) => {
   try {
@@ -76,7 +76,7 @@ app.post("/login", (req, res) => {
 });
 
 /* =========================================================
-   ÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã¢â‚¬Å¾ GET REFUND TICKETS ONLY
+    GET REFUND TICKETS ONLY
 ========================================================= */
 app.get("/tickets", auth, async (req, res) => {
   try {
@@ -123,7 +123,7 @@ app.get("/tickets", auth, async (req, res) => {
 });
 
 /* =========================================================
-   ÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã‚Â GET FEEDBACK
+    GET FEEDBACK
 ========================================================= */
 app.get("/feedback", auth, async (req, res) => {
   try {
@@ -141,7 +141,7 @@ app.get("/feedback", auth, async (req, res) => {
 });
 
 /* =========================================================
-   ÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã‚Â¦ GET PRODUCT LEADS
+   GET PRODUCT LEADS
 ========================================================= */
 app.get("/product-leads", auth, async (req, res) => {
   try {
@@ -159,7 +159,7 @@ app.get("/product-leads", auth, async (req, res) => {
 });
 
 /* =========================================================
-   ÃƒÂ¢Ã…Â¡Ã¢â€žÂ¢ÃƒÂ¯Ã‚Â¸Ã‚Â TICKET ACTION
+    TICKET ACTION
 ========================================================= */
 app.post("/ticket/action", auth, async (req, res) => {
   try {
@@ -184,7 +184,7 @@ app.post("/ticket/action", auth, async (req, res) => {
 
     switch (action) {
       case "REFUNDED":
-        message = "Refund processed Now. Please check your bank in 5ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“10 minutes.";
+        message = "Refund processed Now. Please check your bank in 5-10 minutes.";
         status = "refunded";
         break;
 
@@ -223,7 +223,7 @@ app.post("/ticket/action", auth, async (req, res) => {
 });
 
 /* =========================================================
-   ÃƒÂ°Ã…Â¸Ã¢â‚¬â€Ã¢â‚¬ËœÃƒÂ¯Ã‚Â¸Ã‚Â CLOSE TICKET
+  CLOSE TICKET
 ========================================================= */
 app.delete("/tickets/:id", auth, async (req, res) => {
   try {
@@ -246,7 +246,7 @@ app.delete("/tickets/:id", auth, async (req, res) => {
 });
 
 /* =========================================================
-   ÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã…Â  ANALYTICS (ONLY ADDED - NOTHING MODIFIED)
+   ANALYTICS (ONLY ADDED - NOTHING MODIFIED)
 ========================================================= */
 
 /* Daily Product Not Dispensed */
@@ -306,7 +306,7 @@ app.get("/analytics/monthly", auth, async (req, res) => {
 });
 
 /* =========================================================
-   ÃƒÂ°Ã…Â¸Ã¢â‚¬ÂÃ¢â‚¬â€ WEBHOOK VERIFY
+    WEBHOOK VERIFY
 ========================================================= */
 app.get("/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
@@ -314,16 +314,16 @@ app.get("/webhook", (req, res) => {
   const challenge = req.query["hub.challenge"];
 
   if (mode === "subscribe" && token === process.env.VERIFY_TOKEN) {
-    console.log("ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ Webhook verified");
+    console.log("Webhook verified");
     return res.status(200).send(challenge);
   }
 
-  console.log("ÃƒÂ¢Ã‚ÂÃ…â€™ Webhook verification failed");
+  console.log("Webhook verification failed");
   res.sendStatus(403);
 });
 
 /* =========================================================
-   ÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã‚Â© WEBHOOK RECEIVE
+   WEBHOOK RECEIVE
 ========================================================= */
 app.post("/webhook", async (req, res) => {
   try {
@@ -370,7 +370,7 @@ app.post("/webhook", async (req, res) => {
       }
     }
 
-    console.log("ÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã‚Â© Incoming:", { from, text, type, isImage, mediaUrl });
+    console.log("Incoming:", { from, text, type, isImage, mediaUrl });
 
     const ticket = await getOrCreateTicket(from);
 
@@ -386,23 +386,23 @@ app.post("/webhook", async (req, res) => {
 
     res.sendStatus(200);
   } catch (err) {
-    console.log("ÃƒÂ¢Ã‚ÂÃ…â€™ WEBHOOK ERROR:", err.message);
+    console.log("WEBHOOK ERROR:", err.message);
     res.sendStatus(200);
   }
 });
 
 /* =========================================================
-   ÃƒÂ¢Ã‚ÂÃ‚Â¤ÃƒÂ¯Ã‚Â¸Ã‚Â HEALTH CHECK
+    HEALTH CHECK
 ========================================================= */
 app.get("/", (req, res) => {
   res.send("Snackit backend running");
 });
 
 /* =========================================================
-   ÃƒÂ°Ã…Â¸Ã…Â¡Ã¢â€šÂ¬ START SERVER
+    START SERVER
 ========================================================= */
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`ÃƒÂ°Ã…Â¸Ã…Â¡Ã¢â€šÂ¬ Server running on port ${PORT}`);
+  console.log(` Server running on port ${PORT}`);
 });
