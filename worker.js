@@ -94,10 +94,10 @@ async function sendWhatsApp(to, message) {
       }
     );
 
-    console.log("✅ WhatsApp SENT:", res.data);
+    console.log("âœ… WhatsApp SENT:", res.data);
   } catch (err) {
-    console.log("❌ FULL ERROR:");
-    console.log(err.response?.data);   // 👈 IMPORTANT
+    console.log("âŒ FULL ERROR:");
+    console.log(err.response?.data);   // ðŸ‘ˆ IMPORTANT
     console.log(err.message);
   }
 }
@@ -143,7 +143,7 @@ const worker = new Worker(
 
       const ticket = res.rows[0];
 
-      // ✅ SAFE STATE HANDLING (VERY IMPORTANT FIX)
+      // âœ… SAFE STATE HANDLING (VERY IMPORTANT FIX)
 let state = ticket?.state || "START";
 let category = ticket?.category || null;
 let subIssue = ticket?.sub_issue || null;
@@ -158,18 +158,43 @@ console.log("STATE:", state);
 console.log("CATEGORY:", category);
 console.log("SUB ISSUE:", subIssue);
 
+      if (state === "DONE" || state === "CLOSED") {
+        await updateTicket(ticketId, {
+          category: "MENU",
+          state: "START",
+          main_issue: null,
+          sub_issue: null,
+          issue: null,
+          location: null,
+          upi_id: null,
+          image: null,
+          upi_image: null,
+          status: "OPEN",
+        });
+
+        return sendWhatsApp(
+          from,
+          `ðŸ¤ WELCOME TO SNACKIT!
+How can we help you today?
+
+1ï¸âƒ£ Refund  
+2ï¸âƒ£ Product  
+3ï¸âƒ£ Feedback`
+        );
+      }
+
       /* ================= MENU ================= */
       if (!category) {
         await updateTicket(ticketId, { category: "MENU" });
 
         return sendWhatsApp(
           from,
-          `🤝 WELCOME TO SNACKIT!
+          `ðŸ¤ WELCOME TO SNACKIT!
 How can we help you today?
 
-1️⃣ Refund  
-2️⃣ Product  
-3️⃣ Feedback`
+1ï¸âƒ£ Refund  
+2ï¸âƒ£ Product  
+3ï¸âƒ£ Feedback`
         );
       }
 
@@ -206,7 +231,7 @@ How can we help you today?
             state: "RATING",
           });
 
-          return sendWhatsApp(from, "🌟 Rate us 1-5");
+          return sendWhatsApp(from, "ðŸŒŸ Rate us 1-5");
         }
 
         return sendWhatsApp(from, "Please Reply With 1, 2 or 3");
@@ -283,6 +308,7 @@ How can we help you today?
             await updateTicket(ticketId, {
               upi_image: uploaded || mediaUrl,
               state: "DONE",
+              status: "PROCESSING",
             });
 
             return sendWhatsApp(from, FINAL_MSG);
@@ -326,6 +352,7 @@ How can we help you today?
             await updateTicket(ticketId, {
               upi_image: uploaded || mediaUrl,
               state: "DONE",
+              status: "PROCESSING",
             });
 
             return sendWhatsApp(from, FINAL_MSG);
@@ -369,6 +396,7 @@ How can we help you today?
             await updateTicket(ticketId, {
               upi_image: uploaded || mediaUrl,
               state: "DONE",
+              status: "PROCESSING",
             });
 
             return sendWhatsApp(from, FINAL_MSG);
@@ -412,6 +440,7 @@ How can we help you today?
             await updateTicket(ticketId, {
               upi_image: uploaded || mediaUrl,
               state: "DONE",
+              status: "PROCESSING",
             });
 
             return sendWhatsApp(from, FINAL_MSG);
@@ -467,7 +496,7 @@ if (category === "PRODUCT") {
       if (category === "FEEDBACK") {
         if (state === "RATING") {
           if (!["1", "2", "3", "4", "5"].includes(message)) {
-            return sendWhatsApp(from, "🌟 Rate us 1-5");
+            return sendWhatsApp(from, "ðŸŒŸ Rate us 1-5");
           }
 
           if (!global.feedbackActive) global.feedbackActive = {};

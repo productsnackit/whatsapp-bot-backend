@@ -374,8 +374,13 @@ app.post("/webhook", async (req, res) => {
 
     const ticket = await getOrCreateTicket(from);
 
+    if (!ticket) {
+      console.log("Ticket creation failed for:", from);
+      return res.sendStatus(200);
+    }
+
     await ticketQueue.add("process", {
-      ticketId: ticket ? ticket.id : null,
+      ticketId: ticket.id,
       from,
       text,
       isImage,

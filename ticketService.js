@@ -2,11 +2,11 @@ import db from "./db.js";
 
 /* ================= DEBUG CHECK ================= */
 if (!db || typeof db.query !== "function") {
-  throw new Error("❌ DB not initialized. Check db.js");
+  throw new Error("âŒ DB not initialized. Check db.js");
 }
 
 /* =========================================================
-   🔄 CREATE OR GET ACTIVE TICKET
+   ðŸ”„ CREATE OR GET ACTIVE TICKET
 ========================================================= */
 export async function getOrCreateTicket(phone) {
   try {
@@ -16,6 +16,7 @@ export async function getOrCreateTicket(phone) {
       `SELECT * FROM tickets 
        WHERE phone = $1 
        AND status IN ('OPEN','PROCESSING')
+       AND state NOT IN ('DONE','CLOSED')
        ORDER BY id DESC 
        LIMIT 1`,
       [phone]
@@ -34,28 +35,28 @@ export async function getOrCreateTicket(phone) {
 
     return result.rows[0];
   } catch (err) {
-    console.error("❌ getOrCreateTicket ERROR:", err.message);
+    console.error("âŒ getOrCreateTicket ERROR:", err.message);
     return null;
   }
 }
 
 /* =========================================================
-   🧠 SMART TEXT PROCESSING (NEW 🔥)
+   ðŸ§  SMART TEXT PROCESSING (NEW ðŸ”¥)
 ========================================================= */
 export async function processMessage(ticketId, text) {
   try {
     if (!text) return;
 
-    console.log("📩 Incoming:", text);
+    console.log("ðŸ“© Incoming:", text);
 
-    // 🔥 Extract UPI
+    // ðŸ”¥ Extract UPI
     let upi = null;
     if (text.includes("@")) {
       upi = text.trim();
-      console.log("💳 UPI Detected:", upi);
+      console.log("ðŸ’³ UPI Detected:", upi);
     }
 
-    // 🔥 Extract Issue (basic for now)
+    // ðŸ”¥ Extract Issue (basic for now)
     let issue = text;
 
     await db.query(
@@ -78,7 +79,7 @@ export async function processMessage(ticketId, text) {
 }
 
 /* =========================================================
-   📝 ISSUE
+   ðŸ“ ISSUE
 ========================================================= */
 export async function updateIssue(ticketId, issue) {
   try {
@@ -94,7 +95,7 @@ export async function updateIssue(ticketId, issue) {
 }
 
 /* =========================================================
-   💳 UPI (FIXED ✅)
+   ðŸ’³ UPI (FIXED âœ…)
 ========================================================= */
 export async function updateUPI(ticketId, upi) {
   try {
@@ -110,7 +111,7 @@ export async function updateUPI(ticketId, upi) {
 }
 
 /* =========================================================
-   🏷️ ISSUE TYPE
+   ðŸ·ï¸ ISSUE TYPE
 ========================================================= */
 export async function updateIssueType(ticketId, type) {
   try {
@@ -126,7 +127,7 @@ export async function updateIssueType(ticketId, type) {
 }
 
 /* =========================================================
-   📊 STATUS
+   ðŸ“Š STATUS
 ========================================================= */
 export async function updateStatus(ticketId, status) {
   try {
@@ -142,7 +143,7 @@ export async function updateStatus(ticketId, status) {
 }
 
 /* =========================================================
-   🔁 STATE
+   ðŸ” STATE
 ========================================================= */
 export async function updateState(ticketId, state) {
   try {
@@ -158,7 +159,7 @@ export async function updateState(ticketId, state) {
 }
 
 /* =========================================================
-   🖼️ IMAGE (FIXED ✅)
+   ðŸ–¼ï¸ IMAGE (FIXED âœ…)
 ========================================================= */
 export async function updateImage(ticketId, imageUrl) {
   try {
@@ -174,7 +175,7 @@ export async function updateImage(ticketId, imageUrl) {
 }
 
 /* =========================================================
-   ❌ CLOSE TICKET
+   âŒ CLOSE TICKET
 ========================================================= */
 export async function closeTicket(ticketId) {
   try {
