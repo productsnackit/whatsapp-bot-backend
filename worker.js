@@ -78,7 +78,7 @@ async function sendWhatsApp(to, message) {
   try {
     const cleanNumber = (to || "").replace(/\D/g, "");
 
-    await axios.post(
+    const res = await axios.post(
       `https://graph.facebook.com/v19.0/${process.env.PHONE_NUMBER_ID}/messages`,
       {
         messaging_product: "whatsapp",
@@ -93,8 +93,12 @@ async function sendWhatsApp(to, message) {
         },
       }
     );
+
+    console.log("✅ WhatsApp SENT:", res.data);
   } catch (err) {
-    console.log("WhatsApp Error:", err.response?.data || err.message);
+    console.log("❌ FULL ERROR:");
+    console.log(err.response?.data);   // 👈 IMPORTANT
+    console.log(err.message);
   }
 }
 
