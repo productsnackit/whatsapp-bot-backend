@@ -1,15 +1,8 @@
-import IORedis from "ioredis";
+import { Queue } from "bullmq";
+import connection from "./redis.js";
 
-const connection = new IORedis(process.env.REDIS_URL, {
-  maxRetriesPerRequest: null,
+const ticketQueue = new Queue("ticketQueue", {
+  connection,
 });
 
-connection.on("connect", () => {
-  console.log("✅ Redis connected");
-});
-
-connection.on("error", (err) => {
-  console.log("❌ Redis error:", err.message);
-});
-
-export default connection;
+export default ticketQueue;
