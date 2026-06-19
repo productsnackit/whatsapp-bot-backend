@@ -1,16 +1,15 @@
-import { Queue } from "bullmq";
-import connection from "./redis.js";   // ✅ UPDATED (removed IORedis)
+import IORedis from "ioredis";
+
+const connection = new IORedis(process.env.REDIS_URL, {
+  maxRetriesPerRequest: null,
+});
 
 connection.on("connect", () => {
-  console.log("✅ BullMQ Redis connected");
+  console.log("✅ Redis connected");
 });
 
 connection.on("error", (err) => {
-  console.log("❌ BullMQ Redis error:", err.message);
+  console.log("❌ Redis error:", err.message);
 });
 
-const ticketQueue = new Queue("ticketQueue", {
-  connection,
-});
-
-export default ticketQueue;
+export default connection;
