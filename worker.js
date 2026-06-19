@@ -94,10 +94,10 @@ async function sendWhatsApp(to, message) {
       }
     );
 
-    console.log("âœ… WhatsApp SENT:", res.data);
+    console.log("Ã¢Å“â€¦ WhatsApp SENT:", res.data);
   } catch (err) {
-    console.log("âŒ FULL ERROR:");
-    console.log(err.response?.data);   // ðŸ‘ˆ IMPORTANT
+    console.log("Ã¢ÂÅ’ FULL ERROR:");
+    console.log(err.response?.data);   // Ã°Å¸â€˜Ë† IMPORTANT
     console.log(err.message);
   }
 }
@@ -143,7 +143,7 @@ const worker = new Worker(
 
       const ticket = res.rows[0];
 
-      // âœ… SAFE STATE HANDLING (VERY IMPORTANT FIX)
+      // Ã¢Å“â€¦ SAFE STATE HANDLING (VERY IMPORTANT FIX)
 let state = ticket?.state || "START";
 let category = ticket?.category || null;
 let subIssue = ticket?.sub_issue || null;
@@ -174,12 +174,12 @@ console.log("SUB ISSUE:", subIssue);
 
         return sendWhatsApp(
           from,
-          `ðŸ¤ WELCOME TO SNACKIT!
+          `Ã°Å¸Â¤Â WELCOME TO SNACKIT!
 How can we help you today?
 
-1ï¸âƒ£ Refund  
-2ï¸âƒ£ Product  
-3ï¸âƒ£ Feedback`
+1Ã¯Â¸ÂÃ¢Æ’Â£ Refund  
+2Ã¯Â¸ÂÃ¢Æ’Â£ Product  
+3Ã¯Â¸ÂÃ¢Æ’Â£ Feedback`
         );
       }
 
@@ -189,12 +189,12 @@ How can we help you today?
 
         return sendWhatsApp(
           from,
-          `ðŸ¤ WELCOME TO SNACKIT!
+          `Ã°Å¸Â¤Â WELCOME TO SNACKIT!
 How can we help you today?
 
-1ï¸âƒ£ Refund  
-2ï¸âƒ£ Product  
-3ï¸âƒ£ Feedback`
+1Ã¯Â¸ÂÃ¢Æ’Â£ Refund  
+2Ã¯Â¸ÂÃ¢Æ’Â£ Product  
+3Ã¯Â¸ÂÃ¢Æ’Â£ Feedback`
         );
       }
 
@@ -231,7 +231,7 @@ How can we help you today?
             state: "RATING",
           });
 
-          return sendWhatsApp(from, "ðŸŒŸ Rate us 1-5");
+          return sendWhatsApp(from, "Ã°Å¸Å’Å¸ Rate us 1-5");
         }
 
         return sendWhatsApp(from, "Please Reply With 1, 2 or 3");
@@ -305,8 +305,12 @@ How can we help you today?
 
             const uploaded = await uploadToCloudinary(mediaUrl);
 
+            if (!uploaded) {
+              return sendWhatsApp(from, "Image upload failed. Please send your UPI transaction image again.");
+            }
+
             await updateTicket(ticketId, {
-              upi_image: uploaded || mediaUrl,
+              upi_image: uploaded,
               state: "DONE",
               status: "PROCESSING",
             });
@@ -349,8 +353,12 @@ How can we help you today?
           if (state === "EXP_UPI_IMG") {
             const uploaded = isImage && mediaUrl ? await uploadToCloudinary(mediaUrl) : null;
 
+            if (!uploaded) {
+              return sendWhatsApp(from, "Image upload failed. Please send your UPI transaction image again.");
+            }
+
             await updateTicket(ticketId, {
-              upi_image: uploaded || mediaUrl,
+              upi_image: uploaded,
               state: "DONE",
               status: "PROCESSING",
             });
@@ -393,8 +401,12 @@ How can we help you today?
           if (state === "PRICE_UPI_IMG") {
             const uploaded = isImage && mediaUrl ? await uploadToCloudinary(mediaUrl) : null;
 
+            if (!uploaded) {
+              return sendWhatsApp(from, "Image upload failed. Please send your UPI transaction image again.");
+            }
+
             await updateTicket(ticketId, {
-              upi_image: uploaded || mediaUrl,
+              upi_image: uploaded,
               state: "DONE",
               status: "PROCESSING",
             });
@@ -437,8 +449,12 @@ How can we help you today?
           if (state === "DAM_UPI_IMG") {
             const uploaded = isImage && mediaUrl ? await uploadToCloudinary(mediaUrl) : null;
 
+            if (!uploaded) {
+              return sendWhatsApp(from, "Image upload failed. Please send your UPI screenshot again.");
+            }
+
             await updateTicket(ticketId, {
-              upi_image: uploaded || mediaUrl,
+              upi_image: uploaded,
               state: "DONE",
               status: "PROCESSING",
             });
@@ -496,7 +512,7 @@ if (category === "PRODUCT") {
       if (category === "FEEDBACK") {
         if (state === "RATING") {
           if (!["1", "2", "3", "4", "5"].includes(message)) {
-            return sendWhatsApp(from, "ðŸŒŸ Rate us 1-5");
+            return sendWhatsApp(from, "Ã°Å¸Å’Å¸ Rate us 1-5");
           }
 
           if (!global.feedbackActive) global.feedbackActive = {};
