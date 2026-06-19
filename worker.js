@@ -78,8 +78,6 @@ async function sendWhatsApp(to, message) {
   try {
     const cleanNumber = (to || "").replace(/\D/g, "");
 
-    console.log("📤 Sending:", message);
-
     await axios.post(
       `https://graph.facebook.com/v19.0/${process.env.PHONE_NUMBER_ID}/messages`,
       {
@@ -95,10 +93,8 @@ async function sendWhatsApp(to, message) {
         },
       }
     );
-
-    console.log("✅ Message sent");
   } catch (err) {
-    console.log("❌ WhatsApp Error FULL:", err.response?.data || err.message);
+    console.log("WhatsApp Error:", err.response?.data || err.message);
   }
 }
 
@@ -149,21 +145,19 @@ const worker = new Worker(
 
       /* ================= MENU ================= */
       if (!category) {
-  await updateTicket(ticketId, {
-    category: "MENU",
-    state: "START",
-  });
+        await updateTicket(ticketId, { category: "MENU" });
 
-  return sendWhatsApp(
-    from,
-    `🤝 WELCOME TO SNACKIT!
+        return sendWhatsApp(
+          from,
+          `🤝 WELCOME TO SNACKIT!
 How can we help you today?
 
 1️⃣ Refund  
 2️⃣ Product  
 3️⃣ Feedback`
-  );
-}
+        );
+      }
+
       if (category === "MENU") {
         if (message === "1") {
           await updateTicket(ticketId, {
