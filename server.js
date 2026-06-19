@@ -105,13 +105,13 @@ app.get("/tickets", auth, async (req, res) => {
       image: t.image
         ? t.image.startsWith("http")
           ? t.image
-          : `https://whatsapp-bot-1x9v.onrender.com/${t.image}`
+          : `https://whatsapp-bot-backend-b3nb.onrender.com/${t.image}`
         : null,
 
       upi_image: t.upi_image
         ? t.upi_image.startsWith("http")
           ? t.upi_image
-          : `https://whatsapp-bot-1x9v.onrender.com/${t.upi_image}`
+          : `https://whatsapp-bot-backend-b3nb.onrender.com/${t.upi_image}`
         : null,
     }));
 
