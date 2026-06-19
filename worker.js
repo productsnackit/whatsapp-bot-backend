@@ -143,9 +143,20 @@ const worker = new Worker(
 
       const ticket = res.rows[0];
 
-      let state = ticket.state;
-      let category = ticket.category;
-      let subIssue = ticket.sub_issue;
+      // ✅ SAFE STATE HANDLING (VERY IMPORTANT FIX)
+let state = ticket?.state || "START";
+let category = ticket?.category || null;
+let subIssue = ticket?.sub_issue || null;
+
+// Normalize values (prevents undefined / case issues)
+state = typeof state === "string" ? state.trim().toUpperCase() : "START";
+category = typeof category === "string" ? category.trim().toUpperCase() : null;
+subIssue = typeof subIssue === "string" ? subIssue.trim() : null;
+
+// Debug logs (helps you track flow in Render logs)
+console.log("STATE:", state);
+console.log("CATEGORY:", category);
+console.log("SUB ISSUE:", subIssue);
 
       /* ================= MENU ================= */
       if (!category) {
