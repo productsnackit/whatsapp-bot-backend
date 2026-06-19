@@ -536,5 +536,16 @@ if (category === "PRODUCT") {
   },
   { connection }
 );
+worker.on("completed", (job) => {
+  console.log("JOB COMPLETED:", job.id);
+});
+
+worker.on("failed", (job, err) => {
+  console.log("JOB FAILED:", job?.id, err.message);
+});
+
+worker.on("error", (err) => {
+  console.log("WORKER ERROR EVENT:", err.message);
+});
 
 console.log("Worker running...");
