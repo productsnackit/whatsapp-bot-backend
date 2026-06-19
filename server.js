@@ -372,12 +372,18 @@ app.post("/webhook", async (req, res) => {
 
     console.log("Incoming:", { from, text, type, isImage, mediaUrl });
 
+    console.log("Creating/getting ticket for:", from);
+
     const ticket = await getOrCreateTicket(from);
+
+    console.log("Ticket result:", ticket?.id);
 
     if (!ticket) {
       console.log("Ticket creation failed for:", from);
       return res.sendStatus(200);
     }
+
+    console.log("Adding job to queue:", ticket.id);
 
     await ticketQueue.add("process", {
       ticketId: ticket.id,
@@ -388,6 +394,8 @@ app.post("/webhook", async (req, res) => {
       mediaType,
       timestamp: Number(msg.timestamp || Date.now()),
     });
+
+    console.log("Job added to queue:", ticket.id);
 
     res.sendStatus(200);
   } catch (err) {
