@@ -1,3 +1,4 @@
+console.log("🚀 WORKER FILE LOADED");
 import dotenv from "dotenv";
 dotenv.config();
 
@@ -142,6 +143,33 @@ const worker = new Worker(
       if (!res.rows.length) return;
 
       const ticket = res.rows[0];
+
+      let state = ticket?.state || "START";
+      let category = ticket?.category || null;
+      let subIssue = ticket?.sub_issue || null;
+
+      state = typeof state === "string" ? state.trim().toUpperCase() : "START";
+      category =
+        typeof category === "string" ? category.trim().toUpperCase() : null;
+      subIssue =
+        typeof subIssue === "string" ? subIssue.trim() : null;
+
+      console.log("STATE:", state);
+      console.log("CATEGORY:", category);
+      console.log("SUB ISSUE:", subIssue);
+
+      // 👉 your existing logic continues here (DO NOT CHANGE)
+
+    } catch (err) {
+      console.log("❌ Worker error:", err.message);
+    }
+  },
+  {
+    connection,
+    concurrency: 1,
+    lockDuration: 60000,
+  }
+);
 
       // Ã¢Å“â€¦ SAFE STATE HANDLING (VERY IMPORTANT FIX)
 let state = ticket?.state || "START";
