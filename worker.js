@@ -132,33 +132,50 @@ const worker = new Worker(
     try {
       const { ticketId, from, text } = job.data || {};
 
-      if (!ticketId || !from) return;
+      // ✅ validate input
+      if (!ticketId || !from) {
+        console.log("Missing ticketId or from");
+        return;
+      }
 
       const { isImage, mediaUrl } = extractMedia(job.data);
       const message = cleanText(text);
 
+      // ✅ fetch ticket
       const res = await db.query("SELECT * FROM tickets WHERE id=$1", [
         ticketId,
       ]);
-      if (!res.rows.length) return;
+
+      if (!res.rows.length) {
+        console.log("Ticket not found");
+        return;
+      }
 
       const ticket = res.rows[0];
 
+      // ✅ normalize values safely
       let state = ticket?.state || "START";
       let category = ticket?.category || null;
       let subIssue = ticket?.sub_issue || null;
 
-      state = typeof state === "string" ? state.trim().toUpperCase() : "START";
+      state =
+        typeof state === "string" ? state.trim().toUpperCase() : "START";
+
       category =
-        typeof category === "string" ? category.trim().toUpperCase() : null;
+        typeof category === "string"
+          ? category.trim().toUpperCase()
+          : null;
+
       subIssue =
-        typeof subIssue === "string" ? subIssue.trim() : null;
+        typeof subIssue === "string"
+          ? subIssue.trim()
+          : null;
 
       console.log("STATE:", state);
       console.log("CATEGORY:", category);
       console.log("SUB ISSUE:", subIssue);
 
-      // 👉 your existing logic continues here (DO NOT CHANGE)
+      // 👉 your logic continues here (no return sendWhatsApp)
 
     } catch (err) {
       console.log("❌ Worker error:", err.message);
@@ -170,6 +187,8 @@ const worker = new Worker(
     lockDuration: 60000,
   }
 );
+
+export default worker;
 
       // Ã¢Å“â€¦ SAFE STATE HANDLING (VERY IMPORTANT FIX)
 let state = ticket?.state || "START";
@@ -537,10 +556,55 @@ if (category === "PRODUCT") {
   }
 }
       /* ================= FEEDBACK ================= */
+      const worker = new Worker(
+  "ticketQueue",
+  async (job) => {
+    console.log("JOB RECEIVED:", job.data);
+
+    try {
+      const { ticketId, from, text } = job.data || {};
+
+      if (!ticketId || !from) return;
+
+      const { isImage, mediaUrl } = extractMedia(job.data);
+      const message = cleanText(text);
+
+      const res = await db.query("SELECT * FROM tickets WHERE id=$1", [
+        ticketId,
+      ]);
+
+      if (!res.rows.length) return;
+
+      const ticket = res.rows[0];
+
+      let state = ticket?.state || "START";
+      let category = ticket?.category || null;
+      let subIssue = ticket?.sub_issue || null;
+
+      state =
+        typeof state === "string" ? state.trim().toUpperCase() : "START";
+
+      category =
+        typeof category === "string"
+          ? category.trim().toUpperCase()
+          : null;
+
+      subIssue =
+        typeof subIssue === "string"
+          ? subIssue.trim()
+          : null;
+
+      console.log("STATE:", state);
+      console.log("CATEGORY:", category);
+      console.log("SUB ISSUE:", subIssue);
+
+      /* ================= FEEDBACK FLOW ================= */
+
       if (category === "FEEDBACK") {
         if (state === "RATING") {
           if (!["1", "2", "3", "4", "5"].includes(message)) {
-            return sendWhatsApp(from, "Ã°Å¸Å’Å¸ Rate us 1-5");
+            await sendWhatsApp(from, "⭐ Rate us 1-5");
+            return;
           }
 
           if (!global.feedbackActive) global.feedbackActive = {};
@@ -551,7 +615,8 @@ if (category === "PRODUCT") {
             state: "COMMENT",
           });
 
-          return sendWhatsApp(from, "Please share your feedback");
+          await sendWhatsApp(from, "Please share your feedback");
+          return;
         }
 
         if (state === "COMMENT") {
@@ -571,15 +636,28 @@ if (category === "PRODUCT") {
             status: "closed",
           });
 
-          return sendWhatsApp(from, "Thank you for your Valuable feedback.");
+          await sendWhatsApp(
+            from,
+            "Thank you for your valuable feedback."
+          );
+          return;
         }
       }
+
+      /* ================= END ================= */
+
     } catch (err) {
-      console.log("Worker Error:", err.message);
+      console.log("❌ Worker Error:", err.message);
     }
   },
-  { connection }
+  {
+    connection,
+    concurrency: 1,
+    lockDuration: 60000,
+  }
 );
+
+export default worker;
 worker.on("completed", (job) => {
   console.log("JOB COMPLETED:", job.id);
 });
