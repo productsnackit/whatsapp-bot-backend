@@ -714,7 +714,7 @@ app.post("/ticket/action", auth, async (req, res) => {
     let message, status;
 
     switch (action) {
-      case "REFUNDED":
+      case "Refund":
         message = "Refund processed Now. Please check your bank in 5-10 minutes.";
         status = "refunded";
         break;
@@ -727,6 +727,11 @@ app.post("/ticket/action", auth, async (req, res) => {
       case "RESOLVED":
         message = "Your Issue was resolved. Thank you for contacting Snackit!";
         status = "resolved";
+        break;
+
+      case "CLOSED":
+        message = "Your ticket has been closed. Thank you for contacting Snackit!";
+        status = "closed";
         break;
 
       default:
