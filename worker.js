@@ -1,4 +1,4 @@
-console.log("🚀 WORKER FILE LOADED");
+console.log("ðŸš€ WORKER FILE LOADED");
 import dotenv from "dotenv";
 dotenv.config();
 
@@ -95,10 +95,10 @@ async function sendWhatsApp(to, message) {
       }
     );
 
-    console.log("Ã¢Å“â€¦ WhatsApp SENT:", res.data);
+    console.log("ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ WhatsApp SENT:", res.data);
   } catch (err) {
-    console.log("Ã¢ÂÅ’ FULL ERROR:");
-    console.log(err.response?.data);   // Ã°Å¸â€˜Ë† IMPORTANT
+    console.log("ÃƒÂ¢Ã‚ÂÃ…â€™ FULL ERROR:");
+    console.log(err.response?.data);
     console.log(err.message);
   }
 }
@@ -132,7 +132,6 @@ const worker = new Worker(
     try {
       const { ticketId, from, text } = job.data || {};
 
-      // ✅ validate input
       if (!ticketId || !from) {
         console.log("Missing ticketId or from");
         return;
@@ -141,7 +140,6 @@ const worker = new Worker(
       const { isImage, mediaUrl } = extractMedia(job.data);
       const message = cleanText(text);
 
-      // ✅ fetch ticket
       const res = await db.query("SELECT * FROM tickets WHERE id=$1", [
         ticketId,
       ]);
@@ -153,7 +151,6 @@ const worker = new Worker(
 
       const ticket = res.rows[0];
 
-      // ✅ normalize values safely
       let state = ticket?.state || "START";
       let category = ticket?.category || null;
       let subIssue = ticket?.sub_issue || null;
@@ -175,36 +172,6 @@ const worker = new Worker(
       console.log("CATEGORY:", category);
       console.log("SUB ISSUE:", subIssue);
 
-      // 👉 your logic continues here (no return sendWhatsApp)
-
-    } catch (err) {
-      console.log("❌ Worker error:", err.message);
-    }
-  },
-  {
-    connection,
-    concurrency: 1,
-    lockDuration: 60000,
-  }
-);
-
-export default worker;
-
-      // Ã¢Å“â€¦ SAFE STATE HANDLING (VERY IMPORTANT FIX)
-let state = ticket?.state || "START";
-let category = ticket?.category || null;
-let subIssue = ticket?.sub_issue || null;
-
-// Normalize values (prevents undefined / case issues)
-state = typeof state === "string" ? state.trim().toUpperCase() : "START";
-category = typeof category === "string" ? category.trim().toUpperCase() : null;
-subIssue = typeof subIssue === "string" ? subIssue.trim() : null;
-
-// Debug logs (helps you track flow in Render logs)
-console.log("STATE:", state);
-console.log("CATEGORY:", category);
-console.log("SUB ISSUE:", subIssue);
-
       if (state === "DONE" || state === "CLOSED") {
         await updateTicket(ticketId, {
           category: "MENU",
@@ -221,12 +188,12 @@ console.log("SUB ISSUE:", subIssue);
 
         return sendWhatsApp(
           from,
-          `Ã°Å¸Â¤Â WELCOME TO SNACKIT!
+          `ÃƒÂ°Ã…Â¸Ã‚Â¤Ã‚Â WELCOME TO SNACKIT!
 How can we help you today?
 
-1Ã¯Â¸ÂÃ¢Æ’Â£ Refund  
-2Ã¯Â¸ÂÃ¢Æ’Â£ Product  
-3Ã¯Â¸ÂÃ¢Æ’Â£ Feedback`
+1ÃƒÂ¯Ã‚Â¸Ã‚ÂÃƒÂ¢Ã†â€™Ã‚Â£ Refund  
+2ÃƒÂ¯Ã‚Â¸Ã‚ÂÃƒÂ¢Ã†â€™Ã‚Â£ Product  
+3ÃƒÂ¯Ã‚Â¸Ã‚ÂÃƒÂ¢Ã†â€™Ã‚Â£ Feedback`
         );
       }
 
@@ -236,12 +203,12 @@ How can we help you today?
 
         return sendWhatsApp(
           from,
-          `Ã°Å¸Â¤Â WELCOME TO SNACKIT!
+          `ÃƒÂ°Ã…Â¸Ã‚Â¤Ã‚Â WELCOME TO SNACKIT!
 How can we help you today?
 
-1Ã¯Â¸ÂÃ¢Æ’Â£ Refund  
-2Ã¯Â¸ÂÃ¢Æ’Â£ Product  
-3Ã¯Â¸ÂÃ¢Æ’Â£ Feedback`
+1ÃƒÂ¯Ã‚Â¸Ã‚ÂÃƒÂ¢Ã†â€™Ã‚Â£ Refund  
+2ÃƒÂ¯Ã‚Â¸Ã‚ÂÃƒÂ¢Ã†â€™Ã‚Â£ Product  
+3ÃƒÂ¯Ã‚Â¸Ã‚ÂÃƒÂ¢Ã†â€™Ã‚Â£ Feedback`
         );
       }
 
@@ -278,7 +245,7 @@ How can we help you today?
             state: "RATING",
           });
 
-          return sendWhatsApp(from, "Ã°Å¸Å’Å¸ Rate us 1-5");
+          return sendWhatsApp(from, "ÃƒÂ°Ã…Â¸Ã…â€™Ã…Â¸ Rate us 1-5");
         }
 
         return sendWhatsApp(from, "Please Reply With 1, 2 or 3");
@@ -511,100 +478,56 @@ How can we help you today?
         }
       }
 
-/* ================= PRODUCT ================= */
-if (category === "PRODUCT") {
-  if (state === "OPTIONS") {
-    if (message === "1") {
-      await db.query(
-        "INSERT INTO product_leads (phone, type) VALUES ($1, $2)",
-        [from, "Brand Enquiry"]
-      );
+      /* ================= PRODUCT ================= */
+      if (category === "PRODUCT") {
+        if (state === "OPTIONS") {
+          if (message === "1") {
+            await db.query(
+              "INSERT INTO product_leads (phone, type) VALUES ($1, $2)",
+              [from, "Brand Enquiry"]
+            );
 
-      await updateTicket(ticketId, {
-        main_issue: "Product",
-        sub_issue: "Brand Enquiry",
-        state: "CLOSED",
-        status: "closed",
-      });
+            await updateTicket(ticketId, {
+              main_issue: "Product",
+              sub_issue: "Brand Enquiry",
+              state: "CLOSED",
+              status: "closed",
+            });
 
-      return sendWhatsApp(
-        from,
-        "Thank you for your interest in Snackit.\n\nSnackit is a fast-growing smart vending solutions company providing seamless, cashless food and beverage experiences through our automated machines across multiple locations.\n\nIf you are a brand looking to showcase or distribute your products through our vending network, we would be happy to explore opportunities with you.\n\nPlease contact us at info@snackit.in. Our team will get in touch with you shortly."
-      );
-    }
+            return sendWhatsApp(
+              from,
+              "Thank you for your interest in Snackit.\n\nSnackit is a fast-growing smart vending solutions company providing seamless, cashless food and beverage experiences through our automated machines across multiple locations.\n\nIf you are a brand looking to showcase or distribute your products through our vending network, we would be happy to explore opportunities with you.\n\nPlease contact us at info@snackit.in. Our team will get in touch with you shortly."
+            );
+          }
 
-    if (message === "2") {
-      await db.query(
-        "INSERT INTO product_leads (phone, type) VALUES ($1, $2)",
-        [from, "Collaboration"]
-      );
+          if (message === "2") {
+            await db.query(
+              "INSERT INTO product_leads (phone, type) VALUES ($1, $2)",
+              [from, "Collaboration"]
+            );
 
-      await updateTicket(ticketId, {
-        main_issue: "Product",
-        sub_issue: "Collaboration",
-        state: "CLOSED",
-        status: "closed",
-      });
+            await updateTicket(ticketId, {
+              main_issue: "Product",
+              sub_issue: "Collaboration",
+              state: "CLOSED",
+              status: "closed",
+            });
 
-      return sendWhatsApp(
-        from,
-        "Thank you for your interest in collaborating with Snackit.\n\nSnackit partners with innovative brands to introduce new and exciting products through our smart vending machine network, helping increase product visibility and customer reach.\n\nWe are always open to mutually beneficial collaborations.\n\nPlease reach out to us at info@snackit.in. Our team will review your request and connect with you soon."
-      );
-    }
+            return sendWhatsApp(
+              from,
+              "Thank you for your interest in collaborating with Snackit.\n\nSnackit partners with innovative brands to introduce new and exciting products through our smart vending machine network, helping increase product visibility and customer reach.\n\nWe are always open to mutually beneficial collaborations.\n\nPlease reach out to us at info@snackit.in. Our team will review your request and connect with you soon."
+            );
+          }
 
-    return sendWhatsApp(from, "Please Choose 1 or 2");
-  }
-}
+          return sendWhatsApp(from, "Please Choose 1 or 2");
+        }
+      }
+
       /* ================= FEEDBACK ================= */
-      const worker = new Worker(
-  "ticketQueue",
-  async (job) => {
-    console.log("JOB RECEIVED:", job.data);
-
-    try {
-      const { ticketId, from, text } = job.data || {};
-
-      if (!ticketId || !from) return;
-
-      const { isImage, mediaUrl } = extractMedia(job.data);
-      const message = cleanText(text);
-
-      const res = await db.query("SELECT * FROM tickets WHERE id=$1", [
-        ticketId,
-      ]);
-
-      if (!res.rows.length) return;
-
-      const ticket = res.rows[0];
-
-      let state = ticket?.state || "START";
-      let category = ticket?.category || null;
-      let subIssue = ticket?.sub_issue || null;
-
-      state =
-        typeof state === "string" ? state.trim().toUpperCase() : "START";
-
-      category =
-        typeof category === "string"
-          ? category.trim().toUpperCase()
-          : null;
-
-      subIssue =
-        typeof subIssue === "string"
-          ? subIssue.trim()
-          : null;
-
-      console.log("STATE:", state);
-      console.log("CATEGORY:", category);
-      console.log("SUB ISSUE:", subIssue);
-
-      /* ================= FEEDBACK FLOW ================= */
-
       if (category === "FEEDBACK") {
         if (state === "RATING") {
           if (!["1", "2", "3", "4", "5"].includes(message)) {
-            await sendWhatsApp(from, "⭐ Rate us 1-5");
-            return;
+            return sendWhatsApp(from, "â­ Rate us 1-5");
           }
 
           if (!global.feedbackActive) global.feedbackActive = {};
@@ -615,8 +538,7 @@ if (category === "PRODUCT") {
             state: "COMMENT",
           });
 
-          await sendWhatsApp(from, "Please share your feedback");
-          return;
+          return sendWhatsApp(from, "Please share your feedback");
         }
 
         if (state === "COMMENT") {
@@ -636,18 +558,11 @@ if (category === "PRODUCT") {
             status: "closed",
           });
 
-          await sendWhatsApp(
-            from,
-            "Thank you for your valuable feedback."
-          );
-          return;
+          return sendWhatsApp(from, "Thank you for your valuable feedback.");
         }
       }
-
-      /* ================= END ================= */
-
     } catch (err) {
-      console.log("❌ Worker Error:", err.message);
+      console.log("âŒ Worker Error:", err.message);
     }
   },
   {
@@ -657,7 +572,6 @@ if (category === "PRODUCT") {
   }
 );
 
-export default worker;
 worker.on("completed", (job) => {
   console.log("JOB COMPLETED:", job.id);
 });
@@ -671,3 +585,5 @@ worker.on("error", (err) => {
 });
 
 console.log("Worker running...");
+
+export default worker;
