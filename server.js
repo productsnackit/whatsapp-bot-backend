@@ -695,14 +695,17 @@ app.get("/product-leads", auth, async (req, res) => {
 ========================================================= */
 app.post("/ticket/action", auth, async (req, res) => {
   try {
-    console.log("BODY RECEIVED:", req.body);
+    console.log("🔥 API CALLED");
 
     const { ticketId, action } = req.body;
+
+    console.log("DATA:", ticketId, action);
 
     if (!ticketId || !action) {
       return res.status(400).json({ error: "Missing data" });
     }
 
+    // ✅ GET TICKET
     const result = await db.query(
       "SELECT * FROM tickets WHERE id=$1",
       [ticketId]
@@ -714,26 +717,34 @@ app.post("/ticket/action", auth, async (req, res) => {
 
     const ticket = result.rows[0];
 
-    let message, status;
+    console.log("PHONE:", ticket.phone);
+
+    // ✅ CREATE MESSAGE
+    let message = "";
+    let status = "";
 
     switch (action) {
       case "REFUNDED":
-        message = "Refund processed Now. Please check your bank in 5-10 minutes.";
+        message =
+          "Refund processed Now. Please check your bank in 5-10 minutes.";
         status = "refunded";
         break;
 
       case "AUTO_REFUNDED":
-        message = "Amount was already credited. Please check your bank statement.";
+        message =
+          "Amount was already credited. Please check your bank statement.";
         status = "auto_refunded";
         break;
 
       case "RESOLVED":
-        message = "Your Issue was resolved. Thank you for contacting Snackit!";
+        message =
+          "Your Issue was resolved. Thank you for contacting Snackit!";
         status = "resolved";
         break;
 
       case "CLOSED":
-        message = "Your ticket has been closed. Thank you for contacting Snackit!";
+        message =
+          "Your ticket has been closed. Thank you for contacting Snackit!";
         status = "closed";
         break;
 
@@ -741,27 +752,25 @@ app.post("/ticket/action", auth, async (req, res) => {
         return res.status(400).json({ error: "Invalid action" });
     }
 
-    console.log("PHONE:", ticket.phone);
     console.log("MESSAGE:", message);
 
+    // ✅ FORMAT PHONE
     let phone = ticket.phone;
 
     if (phone && !phone.startsWith("91")) {
       phone = "91" + phone;
     }
 
+    // ✅ SEND WHATSAPP
     if (phone) {
-      try {
-        console.log("Sending WhatsApp to:", phone);
-        await sendWhatsApp(phone, message);
-        console.log("Message sent successfully ✅");
-      } catch (err) {
-        console.log("WhatsApp Error:", err.message);
-      }
+      console.log("📲 Sending WhatsApp to:", phone);
+      await sendWhatsApp(phone, message);
+      console.log("✅ WhatsApp sent");
     } else {
-      console.log("No phone number found ❌");
+      console.log("❌ No phone found");
     }
 
+    // ✅ UPDATE DB
     await db.query(
       `
       UPDATE tickets 
@@ -771,10 +780,11 @@ app.post("/ticket/action", auth, async (req, res) => {
       [status, ticketId]
     );
 
-    res.json({ success: true });
+    console.log("✅ DONE");
 
+    res.json({ success: true });
   } catch (err) {
-    console.log("ACTION ERROR:", err.message);
+    console.log("❌ ERROR:", err.message);
     res.status(500).json({ error: "Server error" });
   }
 });
@@ -968,3 +978,11 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, "0.0.0.0", () => {
   console.log(` Server running on port ${PORT}`);
 });
+async function sendWhatsApp(phone, message) {
+  console.log("📤 WhatsApp Function Called");
+  console.log("TO:", phone);
+  console.log("MSG:", message);
+
+  // 🔥 For now just simulate
+  return true;
+}
