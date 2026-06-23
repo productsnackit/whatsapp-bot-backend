@@ -321,7 +321,10 @@ How can we help you today?
 
       if (subIssue === "Product Issue") {
         if (state === "LOCATION") {
-          await updateTicket(ticketId, { state: "EXP_IMG" });
+          await updateTicket(ticketId, {
+          location: text,
+          state: "EXP_IMG",
+      });
           return sendWhatsApp(from, "Send the expiry image please");
         }
 
@@ -373,7 +376,10 @@ How can we help you today?
 
       if (subIssue === "Charged Higher MRP") {
         if (state === "LOCATION") {
-          await updateTicket(ticketId, { state: "PRICE_IMG" });
+          await updateTicket(ticketId, {
+          location: text,
+          state: "PRICE_IMG",
+});
           return sendWhatsApp(from, "Send your product price image please");
         }
 
@@ -425,7 +431,10 @@ How can we help you today?
 
       if (subIssue === "Recieved Damaged Product") {
         if (state === "LOCATION") {
-          await updateTicket(ticketId, { state: "DAM_IMG" });
+          await updateTicket(ticketId, {
+          location: text,
+          state: "DAM_IMG",
+      });
           return sendWhatsApp(from, "Send the damaged product image please");
         }
 
