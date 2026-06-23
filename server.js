@@ -694,8 +694,9 @@ app.get("/product-leads", auth, async (req, res) => {
     TICKET ACTION
 ========================================================= */
 app.post("/ticket/action", auth, async (req, res) => {
-   try {
+  try {
     console.log("BODY RECEIVED:", req.body);
+
     const { ticketId, action } = req.body;
 
     if (!ticketId || !action) {
@@ -715,7 +716,6 @@ app.post("/ticket/action", auth, async (req, res) => {
 
     let message, status;
 
-    // ✅ DEFINE MESSAGE FIRST
     switch (action) {
       case "REFUNDED":
         message = "Refund processed Now. Please check your bank in 5-10 minutes.";
@@ -741,17 +741,15 @@ app.post("/ticket/action", auth, async (req, res) => {
         return res.status(400).json({ error: "Invalid action" });
     }
 
-    // ✅ DEBUG AFTER MESSAGE IS READY
     console.log("PHONE:", ticket.phone);
     console.log("MESSAGE:", message);
 
-    // ✅ FORMAT PHONE (IMPORTANT)
     let phone = ticket.phone;
+
     if (phone && !phone.startsWith("91")) {
       phone = "91" + phone;
     }
 
-    // ✅ SEND MESSAGE SAFELY
     if (phone) {
       try {
         console.log("Sending WhatsApp to:", phone);
@@ -764,7 +762,6 @@ app.post("/ticket/action", auth, async (req, res) => {
       console.log("No phone number found ❌");
     }
 
-    // ✅ UPDATE DB
     await db.query(
       `
       UPDATE tickets 
