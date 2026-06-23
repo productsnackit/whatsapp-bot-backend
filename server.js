@@ -694,7 +694,8 @@ app.get("/product-leads", auth, async (req, res) => {
     TICKET ACTION
 ========================================================= */
 app.post("/ticket/action", auth, async (req, res) => {
-  try {
+   try {
+    console.log("BODY RECEIVED:", req.body);
     const { ticketId, action } = req.body;
 
     if (!ticketId || !action) {
