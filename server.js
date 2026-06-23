@@ -701,9 +701,10 @@ app.post("/ticket/action", auth, async (req, res) => {
       return res.status(400).json({ error: "Missing data" });
     }
 
-    const result = await db.query("SELECT * FROM tickets WHERE id=$1", [
-      ticketId,
-    ]);
+    const result = await db.query(
+      "SELECT * FROM tickets WHERE id=$1",
+      [ticketId]
+    );
 
     if (!result.rows.length) {
       return res.status(404).json({ error: "Ticket not found" });
@@ -713,8 +714,9 @@ app.post("/ticket/action", auth, async (req, res) => {
 
     let message, status;
 
+    // ✅ DEFINE MESSAGE FIRST
     switch (action) {
-      case "Refund":
+      case "REFUNDED":
         message = "Refund processed Now. Please check your bank in 5-10 minutes.";
         status = "refunded";
         break;
@@ -738,10 +740,30 @@ app.post("/ticket/action", auth, async (req, res) => {
         return res.status(400).json({ error: "Invalid action" });
     }
 
-    if (ticket.phone) {
-      await sendWhatsApp(ticket.phone, message);
+    // ✅ DEBUG AFTER MESSAGE IS READY
+    console.log("PHONE:", ticket.phone);
+    console.log("MESSAGE:", message);
+
+    // ✅ FORMAT PHONE (IMPORTANT)
+    let phone = ticket.phone;
+    if (phone && !phone.startsWith("91")) {
+      phone = "91" + phone;
     }
 
+    // ✅ SEND MESSAGE SAFELY
+    if (phone) {
+      try {
+        console.log("Sending WhatsApp to:", phone);
+        await sendWhatsApp(phone, message);
+        console.log("Message sent successfully ✅");
+      } catch (err) {
+        console.log("WhatsApp Error:", err.message);
+      }
+    } else {
+      console.log("No phone number found ❌");
+    }
+
+    // ✅ UPDATE DB
     await db.query(
       `
       UPDATE tickets 
@@ -752,6 +774,7 @@ app.post("/ticket/action", auth, async (req, res) => {
     );
 
     res.json({ success: true });
+
   } catch (err) {
     console.log("ACTION ERROR:", err.message);
     res.status(500).json({ error: "Server error" });
