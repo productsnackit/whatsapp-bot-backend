@@ -146,35 +146,42 @@ async function processMessage(jobData) {
     console.log("CATEGORY:", category);
     console.log("SUB ISSUE:", subIssue);
 
-   if (state === "DONE" || state === "CLOSED") {
+    if (state === "DONE") {
   return sendWhatsApp(
     from,
-    "Your ticket is already raised. Our team will assist you shortly. Thank you for your patience."
+    "Your ticket is already raised. Our team will assist you shortly."
   );
-}
-      await updateTicket(ticketId, {
-        category: "MENU",
-        state: "START",
-        main_issue: null,
-        sub_issue: null,
-        issue: null,
-        location: null,
-        upi_id: null,
-        image: null,
-        upi_image: null,
-        status: "OPEN",
-      });
+} 
+else if (state === "CLOSED") {
+  return sendWhatsApp(
+    from,
+    "Your previous ticket is closed. Please type 1 to create a new request."
+  );
+} 
+else {
+  await updateTicket(ticketId, {
+    category: "MENU",
+    state: "START",
+    main_issue: null,
+    sub_issue: null,
+    issue: null,
+    location: null,
+    upi_id: null,
+    image: null,
+    upi_image: null,
+    status: "OPEN",
+  });
 
-      return sendWhatsApp(
-        from,
-        `WELCOME TO SNACKIT!
+  return sendWhatsApp(
+    from,
+    `WELCOME TO SNACKIT!
 How can we help you today?
 
 1 Refund
 2 Product
 3 Feedback`
-      );
-    }
+  );
+}
 
     if (!category) {
       await updateTicket(ticketId, { category: "MENU" });
