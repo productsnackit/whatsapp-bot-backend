@@ -146,7 +146,12 @@ async function processMessage(jobData) {
     console.log("CATEGORY:", category);
     console.log("SUB ISSUE:", subIssue);
 
-    if (state === "DONE" || state === "CLOSED") {
+   if (state === "DONE" || state === "CLOSED") {
+  return sendWhatsApp(
+    from,
+    "Your ticket is already raised. Our team will assist you shortly. Thank you for your patience."
+  );
+}
       await updateTicket(ticketId, {
         category: "MENU",
         state: "START",

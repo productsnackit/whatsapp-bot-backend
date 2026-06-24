@@ -9,35 +9,28 @@ if (!db || typeof db.query !== "function") {
    ðŸ”„ CREATE OR GET ACTIVE TICKET
 ========================================================= */
 export async function getOrCreateTicket(phone) {
-  try {
-    if (!phone) throw new Error("Phone is required");
+  // 1️⃣ CHECK if active ticket exists
+  const existing = await db.query(
+    `SELECT * FROM tickets 
+     WHERE phone = $1 
+     AND state NOT IN ('DONE', 'CLOSED') 
+     LIMIT 1`,
+    [phone]
+  );
 
-    const existing = await db.query(
-      `SELECT * FROM tickets 
-       WHERE phone = $1 
-       AND status IN ('OPEN','PROCESSING')
-       AND state NOT IN ('DONE','CLOSED')
-       ORDER BY id DESC 
-       LIMIT 1`,
-      [phone]
-    );
-
-    if (existing.rows.length > 0) {
-      return existing.rows[0];
-    }
-
-    const result = await db.query(
-      `INSERT INTO tickets (phone, status, state, created_at)
-       VALUES ($1, 'OPEN', 'INIT', NOW())
-       RETURNING *`,
-      [phone]
-    );
-
-    return result.rows[0];
-  } catch (err) {
-    console.error("âŒ getOrCreateTicket ERROR:", err.message);
-    return null;
+  if (existing.rows.length > 0) {
+    return existing.rows[0]; // ✅ RETURN EXISTING
   }
+
+  // 2️⃣ CREATE NEW ONLY IF NONE EXISTS
+  const result = await db.query(
+    `INSERT INTO tickets (phone, state, category, status, created_at)
+     VALUES ($1, 'START', NULL, 'OPEN', NOW())
+     RETURNING *`,
+    [phone]
+  );
+
+  return result.rows[0];
 }
 
 /* =========================================================
