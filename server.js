@@ -173,7 +173,7 @@ if (ticket.takeover) {
       return;
     }
 
-    const ticket = res.rows[0];
+    const existingTicket = res.rows[0];
 
     // ✅ ADMIN TAKEOVER CHECK
 if (ticket.takeover) {
