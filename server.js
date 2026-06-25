@@ -191,40 +191,17 @@ let subIssue = existingTicket.sub_issue || null;
     console.log("CATEGORY:", category);
     console.log("SUB ISSUE:", subIssue);
 
-    if (state === "DONE") {
+   if (state === "DONE") {
   return sendWhatsApp(
     from,
     "Your ticket is already raised. Our team will assist you shortly."
   );
-} 
-else if (state === "CLOSED") {
+}
+
+if (state === "CLOSED") {
   return sendWhatsApp(
     from,
     "Your previous ticket is closed. Please type 1 to create a new request."
-  );
-} 
-else {
-  await updateTicket(ticketId, {
-    category: "MENU",
-    state: "START",
-    main_issue: null,
-    sub_issue: null,
-    issue: null,
-    location: null,
-    upi_id: null,
-    image: null,
-    upi_image: null,
-    status: "OPEN",
-  });
-
-  return sendWhatsApp(
-    from,
-    `WELCOME TO SNACKIT!
-How can we help you today?
-
-1 Refund
-2 Product
-3 Feedback`
   );
 }
 
@@ -861,6 +838,9 @@ app.post("/admin/send", async (req, res) => {
 
   await sendWhatsApp(phone, message);
 
+  // ✅ ADD THIS LINE
+  await saveMessageByPhone(phone, "admin", message);
+
   res.json({ success: true });
 });
 
@@ -869,8 +849,8 @@ app.post("/admin/takeover", async (req, res) => {
   const { phone } = req.body;
 
   await updateTicketByPhone(phone, {
-    takeOver: true
-  });
+  takeover: true
+});
 
   res.send("Takeover enabled");
 });
@@ -1053,6 +1033,7 @@ app.post("/webhook", async (req, res) => {
       mediaType,
       timestamp: Number(msg.timestamp || Date.now()),
     });
+    await saveMessageByPhone(from, "user", text || "[media]");
 
     res.sendStatus(200);
   } catch (err) {
