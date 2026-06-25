@@ -149,13 +149,10 @@ async function processMessage(jobData) {
 
   try {
     // 🔥 ADMIN TAKEOVER CHECK
-const ticket = res.rows[0];
+
 
 // ✅ ADMIN TAKEOVER CHECK
-if (ticket.takeover) {
-  console.log("Admin handling this chat");
-  return; // stop bot
-}
+
     const { ticketId, from, text } = jobData || {};
 
     if (!ticketId || !from) {
@@ -175,16 +172,15 @@ if (ticket.takeover) {
 
     const existingTicket = res.rows[0];
 
-    // ✅ ADMIN TAKEOVER CHECK
-if (ticket.takeover) {
+// ✅ ADMIN TAKEOVER CHECK (CORRECT PLACE)
+if (existingTicket.takeover) {
   console.log("Admin handling this chat");
-
-  return; // stop bot
+  return;
 }
 
-    let state = ticket?.state || "START";
-    let category = ticket?.category || null;
-    let subIssue = ticket?.sub_issue || null;
+   let state = existingTicket.state || "START";
+let category = existingTicket.category || null;
+let subIssue = existingTicket.sub_issue || null;
 
     state = typeof state === "string" ? state.trim().toUpperCase() : "START";
     category =
@@ -883,7 +879,7 @@ app.post("/admin/release", async (req, res) => {
   const { phone } = req.body;
 
   await updateTicketByPhone(phone, {
-    takeOver: false
+    takeover: false
   });
 
   res.send("Bot resumed");
