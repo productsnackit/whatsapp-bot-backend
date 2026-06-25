@@ -28,6 +28,7 @@ app.use("/uploads", express.static("uploads"));
 /* ================= GLOBAL STATE ================= */
 if (!global.feedbackActive) global.feedbackActive = {};
 if (!global.upiActive) global.upiActive = {};
+if (!global.adminTakeover) global.adminTakeover = {};
 
 /* ================= AUTH CONFIG ================= */
 const SECRET_TOKEN = "mysecrettoken123";
@@ -90,7 +91,40 @@ async function uploadToCloudinary(url, type = "image") {
     return null;
   }
 }
+async function updateTicketByPhone(phone, fields) {
+  const keys = Object.keys(fields);
+  const values = Object.values(fields);
 
+  const setQuery = keys.map((key, i) => `${key}=$${i + 1}`).join(", ");
+
+  await db.query(
+    `UPDATE tickets SET ${setQuery} WHERE phone=$${keys.length + 1}`,
+    [...values, phone]
+  );
+}
+
+async function saveMessageByPhone(phone, sender, message) {
+  try {
+    // Get ticket by phone
+    const res = await db.query(
+      "SELECT id FROM tickets WHERE phone = $1",
+      [phone]
+    );
+
+    if (!res.rows.length) return;
+
+    const ticketId = res.rows[0].id;
+
+    // Insert message
+    await db.query(
+      "INSERT INTO messages (ticket_id, sender, message) VALUES ($1, $2, $3)",
+      [ticketId, sender, message]
+    );
+
+  } catch (err) {
+    console.error("Error saving message:", err);
+  }
+}
 async function updateTicket(id, fields) {
   const keys = Object.keys(fields);
   const values = Object.values(fields);
@@ -114,6 +148,14 @@ async function processMessage(jobData) {
   console.log("JOB RECEIVED:", jobData);
 
   try {
+    // 🔥 ADMIN TAKEOVER CHECK
+const ticket = res.rows[0];
+
+// ✅ ADMIN TAKEOVER CHECK
+if (ticket.takeover) {
+  console.log("Admin handling this chat");
+  return; // stop bot
+}
     const { ticketId, from, text } = jobData || {};
 
     if (!ticketId || !from) {
@@ -132,6 +174,13 @@ async function processMessage(jobData) {
     }
 
     const ticket = res.rows[0];
+
+    // ✅ ADMIN TAKEOVER CHECK
+if (ticket.takeover) {
+  console.log("Admin handling this chat");
+
+  return; // stop bot
+}
 
     let state = ticket?.state || "START";
     let category = ticket?.category || null;
@@ -810,6 +859,36 @@ app.post("/ticket/action", auth, async (req, res) => {
   }
 });
 
+
+app.post("/admin/send", async (req, res) => {
+  const { phone, message } = req.body;
+
+  await sendWhatsApp(phone, message);
+
+  res.json({ success: true });
+});
+
+// 🔥 ADMIN TAKEOVER API
+app.post("/admin/takeover", async (req, res) => {
+  const { phone } = req.body;
+
+  await updateTicketByPhone(phone, {
+    takeOver: true
+  });
+
+  res.send("Takeover enabled");
+});
+
+app.post("/admin/release", async (req, res) => {
+  const { phone } = req.body;
+
+  await updateTicketByPhone(phone, {
+    takeOver: false
+  });
+
+  res.send("Bot resumed");
+});
+
 /* =========================================================
   CLOSE TICKET
 ========================================================= */
@@ -911,6 +990,8 @@ app.get("/webhook", (req, res) => {
 ========================================================= */
 app.post("/webhook", async (req, res) => {
   try {
+
+
     const entry = req.body?.entry?.[0];
     const change = entry?.changes?.[0];
     const value = change?.value;
