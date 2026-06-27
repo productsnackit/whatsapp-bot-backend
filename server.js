@@ -125,6 +125,20 @@ async function saveMessageByPhone(phone, sender, message) {
     console.error("Error saving message:", err);
   }
 }
+
+// ✅ FIX: save message directly by ticketId (used in admin/send)
+async function saveMessage(ticketId, sender, message) {
+  try {
+    if (!ticketId) return;
+    await db.query(
+      "INSERT INTO messages (ticket_id, sender, message) VALUES ($1, $2, $3)",
+      [ticketId, sender, message]
+    );
+  } catch (err) {
+    console.error("Error saving message:", err);
+  }
+}
+
 async function updateTicket(id, fields) {
   const keys = Object.keys(fields);
   const values = Object.values(fields);
@@ -173,7 +187,8 @@ async function processMessage(jobData) {
     const existingTicket = res.rows[0];
 
 // ✅ ADMIN TAKEOVER CHECK (CORRECT PLACE)
-if (existingTicket.takeover) {
+// FIX: also check for string "true" since PostgreSQL can return either
+if (existingTicket.takeover === true || existingTicket.takeover === "true") {
   console.log("Admin handling this chat");
   return;
 }
@@ -668,6 +683,7 @@ app.get("/tickets", auth, async (req, res) => {
         upi_image,
         status,
         state,
+        takeover,
         created_at,
         updated_at
       FROM tickets
@@ -832,37 +848,62 @@ app.post("/ticket/action", auth, async (req, res) => {
   }
 });
 
+// ✅ FIX: added auth middleware + accepts ticketId for reliable message saving
+app.post("/admin/send", auth, async (req, res) => {
+  try {
+    const { phone, message, ticketId } = req.body;
 
-app.post("/admin/send", async (req, res) => {
-  const { phone, message } = req.body;
+    await sendWhatsApp(phone, message);
 
-  await sendWhatsApp(phone, message);
+    // ✅ FIX: save by ticketId if provided, else fall back to phone lookup
+    if (ticketId) {
+      await saveMessage(ticketId, "admin", message);
+    } else {
+      await saveMessageByPhone(phone, "admin", message);
+    }
 
-  // ✅ ADD THIS LINE
-  await saveMessageByPhone(phone, "admin", message);
-
-  res.json({ success: true });
+    res.json({ success: true });
+  } catch (err) {
+    console.log("ADMIN SEND ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
 });
 
 // 🔥 ADMIN TAKEOVER API
-app.post("/admin/takeover", async (req, res) => {
-  const { phone } = req.body;
+// ✅ FIX: added auth middleware + returns JSON with updated ticket
+app.post("/admin/takeover", auth, async (req, res) => {
+  try {
+    const { phone } = req.body;
 
-  await updateTicketByPhone(phone, {
-  takeover: true
+    await updateTicketByPhone(phone, {
+      takeover: true
+    });
+
+    // ✅ FIX: return updated ticket so frontend can sync activeChat immediately
+    const result = await db.query("SELECT * FROM tickets WHERE phone=$1", [phone]);
+    res.json({ success: true, ticket: result.rows[0] || null });
+  } catch (err) {
+    console.log("TAKEOVER ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
 });
 
-  res.send("Takeover enabled");
-});
+// ✅ FIX: added auth middleware + returns JSON with updated ticket
+app.post("/admin/release", auth, async (req, res) => {
+  try {
+    const { phone } = req.body;
 
-app.post("/admin/release", async (req, res) => {
-  const { phone } = req.body;
+    await updateTicketByPhone(phone, {
+      takeover: false
+    });
 
-  await updateTicketByPhone(phone, {
-    takeover: false
-  });
-
-  res.send("Bot resumed");
+    // ✅ FIX: return updated ticket so frontend can sync activeChat immediately
+    const result = await db.query("SELECT * FROM tickets WHERE phone=$1", [phone]);
+    res.json({ success: true, ticket: result.rows[0] || null });
+  } catch (err) {
+    console.log("RELEASE ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
 });
 
 /* =========================================================
@@ -1023,6 +1064,9 @@ app.post("/webhook", async (req, res) => {
       return res.sendStatus(200);
     }
 
+    // ✅ FIX: save user message BEFORE processMessage so it always persists
+    await saveMessageByPhone(from, "user", text || "[media]");
+
     await processMessage({
       ticketId: ticket.id,
       from,
@@ -1033,12 +1077,31 @@ app.post("/webhook", async (req, res) => {
       mediaType,
       timestamp: Number(msg.timestamp || Date.now()),
     });
-    await saveMessageByPhone(from, "user", text || "[media]");
 
     res.sendStatus(200);
   } catch (err) {
     console.log("WEBHOOK ERROR:", err.message);
     res.sendStatus(200);
+  }
+});
+
+/* =========================================================
+    GET MESSAGES FOR A TICKET (NEW ROUTE - was missing)
+========================================================= */
+// ✅ FIX: this route was missing — frontend fetchMessages was calling 404
+app.get("/admin/messages/:ticketId", auth, async (req, res) => {
+  try {
+    const { ticketId } = req.params;
+
+    const result = await db.query(
+      "SELECT * FROM messages WHERE ticket_id = $1 ORDER BY created_at ASC",
+      [ticketId]
+    );
+
+    res.json(result.rows);
+  } catch (err) {
+    console.log("MESSAGES FETCH ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
   }
 });
 
