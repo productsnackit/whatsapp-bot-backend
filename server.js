@@ -662,7 +662,7 @@ Thank you for choosing Snackit!`
       }
 
       // PRODUCT EXPIRED/DAMAGED
-      if (subIssue === "Product Expired/Damaged") {
+      if (subIssue === "Product issue") {
         if (state === "LOCATION") {
           if (!text || text.length < 5) {
             return sendWhatsApp(
