@@ -29,6 +29,7 @@ app.use("/uploads", express.static("uploads"));
 if (!global.feedbackActive) global.feedbackActive = {};
 if (!global.upiActive) global.upiActive = {};
 if (!global.adminTakeover) global.adminTakeover = {};
+if (!global.retryCount) global.retryCount = {}; // Track retry attempts
 
 /* ================= AUTH CONFIG ================= */
 const SECRET_TOKEN = "mysecrettoken123";
@@ -91,6 +92,7 @@ async function uploadToCloudinary(url, type = "image") {
     return null;
   }
 }
+
 async function updateTicketByPhone(phone, fields) {
   const keys = Object.keys(fields);
   const values = Object.values(fields);
@@ -105,7 +107,6 @@ async function updateTicketByPhone(phone, fields) {
 
 async function saveMessageByPhone(phone, sender, message) {
   try {
-    // Get ticket by phone
     const res = await db.query(
       "SELECT id FROM tickets WHERE phone = $1",
       [phone]
@@ -115,7 +116,6 @@ async function saveMessageByPhone(phone, sender, message) {
 
     const ticketId = res.rows[0].id;
 
-    // Insert message
     await db.query(
       "INSERT INTO messages (ticket_id, sender, message) VALUES ($1, $2, $3)",
       [ticketId, sender, message]
@@ -126,7 +126,6 @@ async function saveMessageByPhone(phone, sender, message) {
   }
 }
 
-// ✅ FIX: save message directly by ticketId (used in admin/send)
 async function saveMessage(ticketId, sender, message) {
   try {
     if (!ticketId) return;
@@ -154,19 +153,67 @@ async function updateTicket(id, fields) {
   );
 }
 
-const FINAL_MSG =
-  " Ticket has been raised, we will process your concern soon.";
+/* ================= VALIDATION FUNCTIONS (NEXT LEVEL) ================= */
 
-/* ================= BOT MESSAGE PROCESSOR ================= */
+// Validate UPI ID format
+function validateUPIId(upiId) {
+  if (!upiId || upiId.length < 5) return false;
+  
+  // UPI format: username@bankname or phone@bankname
+  const upiRegex = /^[a-zA-Z0-9._-]+@[a-zA-Z0-9]+$/;
+  return upiRegex.test(upiId);
+}
+
+// Check if input is alphabetic (invalid for UPI)
+function isAlphabetOnly(text) {
+  return /^[a-zA-Z\s]+$/.test(text);
+}
+
+// Check if it's a valid transaction ID format (alphanumeric, no special chars)
+function isValidTransactionId(text) {
+  return /^[a-zA-Z0-9]{5,}$/.test(text);
+}
+
+// Validate image media type
+function isValidImage(mediaType) {
+  return mediaType === "image" || (mediaType && mediaType.startsWith("image/"));
+}
+
+// Validate if it's video (should reject for image upload)
+function isVideo(mediaType) {
+  return mediaType === "video" || (mediaType && mediaType.startsWith("video/"));
+}
+
+// Get retry key for a user
+function getRetryKey(ticketId, step) {
+  return `${ticketId}-${step}`;
+}
+
+// Increment retry count
+function incrementRetry(key) {
+  if (!global.retryCount[key]) global.retryCount[key] = 0;
+  global.retryCount[key]++;
+  return global.retryCount[key];
+}
+
+// Reset retry count
+function resetRetry(key) {
+  delete global.retryCount[key];
+}
+
+// Get retry count
+function getRetryCount(key) {
+  return global.retryCount[key] || 0;
+}
+
+const FINAL_MSG = "✅ Ticket has been raised, we will process your concern soon.";
+const MAX_RETRIES = 3;
+
+/* ================= BOT MESSAGE PROCESSOR - NEXT LEVEL ================= */
 async function processMessage(jobData) {
   console.log("JOB RECEIVED:", jobData);
 
   try {
-    // 🔥 ADMIN TAKEOVER CHECK
-
-
-// ✅ ADMIN TAKEOVER CHECK
-
     const { ticketId, from, text } = jobData || {};
 
     if (!ticketId || !from) {
@@ -174,7 +221,7 @@ async function processMessage(jobData) {
       return;
     }
 
-    const { isImage, mediaUrl } = extractMedia(jobData);
+    const { isImage, mediaUrl, mediaType } = extractMedia(jobData);
     const message = cleanText(text);
 
     const res = await db.query("SELECT * FROM tickets WHERE id=$1", [ticketId]);
@@ -186,54 +233,58 @@ async function processMessage(jobData) {
 
     const existingTicket = res.rows[0];
 
-// ✅ ADMIN TAKEOVER CHECK (CORRECT PLACE)
-// FIX: also check for string "true" since PostgreSQL can return either
-if (existingTicket.takeover === true || existingTicket.takeover === "true") {
-  console.log("Admin handling this chat");
-  return;
-}
+    // ADMIN TAKEOVER CHECK
+    if (existingTicket.takeover === true || existingTicket.takeover === "true") {
+      console.log("Admin handling this chat");
+      return;
+    }
 
-   let state = existingTicket.state || "START";
-let category = existingTicket.category || null;
-let subIssue = existingTicket.sub_issue || null;
+    let state = existingTicket.state || "START";
+    let category = existingTicket.category || null;
+    let subIssue = existingTicket.sub_issue || null;
 
     state = typeof state === "string" ? state.trim().toUpperCase() : "START";
-    category =
-      typeof category === "string" ? category.trim().toUpperCase() : null;
+    category = typeof category === "string" ? category.trim().toUpperCase() : null;
     subIssue = typeof subIssue === "string" ? subIssue.trim() : null;
 
     console.log("STATE:", state);
     console.log("CATEGORY:", category);
     console.log("SUB ISSUE:", subIssue);
 
-   if (state === "DONE") {
-  return sendWhatsApp(
-    from,
-    "Your ticket is already raised. Our team will assist you shortly."
-  );
-}
+    // Already closed or done states
+    if (state === "DONE") {
+      return sendWhatsApp(
+        from,
+        "✅ Your ticket is already raised. Our team will assist you shortly."
+      );
+    }
 
-if (state === "CLOSED") {
-  return sendWhatsApp(
-    from,
-    "Your previous ticket is closed. Please type 1 to create a new request."
-  );
-}
+    if (state === "CLOSED") {
+      return sendWhatsApp(
+        from,
+        "🔄 Your previous ticket is closed. Please type *1* to create a new request."
+      );
+    }
 
+    // INITIAL MENU
     if (!category) {
       await updateTicket(ticketId, { category: "MENU" });
 
       return sendWhatsApp(
         from,
-        `WELCOME TO SNACKIT!
+        `👋 *WELCOME TO SNACKIT!*
+
 How can we help you today?
 
-1 Refund
-2 Product
-3 Feedback`
+1️⃣ Refund Issues
+2️⃣ Product Enquiry
+3️⃣ Share Feedback
+
+Please reply with the number (1, 2, or 3)`
       );
     }
 
+    // CATEGORY SELECTION
     if (category === "MENU") {
       if (message === "1") {
         await updateTicket(ticketId, {
@@ -243,12 +294,16 @@ How can we help you today?
 
         return sendWhatsApp(
           from,
-          `Refund options:
+          `💰 *REFUND OPTIONS*
 
-1 Product Not Dispensed
-2 Product Issue
-3 Charged Higher MRP
-4 Received Damaged Product`
+What's your refund issue?
+
+1️⃣ Product Not Dispensed
+2️⃣ Product Expired/Damaged
+3️⃣ Charged Higher Price
+4️⃣ Received Damaged Product
+
+Please reply with the number (1-4)`
         );
       }
 
@@ -260,9 +315,14 @@ How can we help you today?
 
         return sendWhatsApp(
           from,
-          `Product options:
-1 Brand Enquiry
-2 Collaboration`
+          `🛍️ *PRODUCT ENQUIRY*
+
+What would you like to do?
+
+1️⃣ Brand Enquiry
+2️⃣ Partnership/Collaboration
+
+Please reply with the number (1 or 2)`
         );
       }
 
@@ -272,22 +332,43 @@ How can we help you today?
           state: "RATING",
         });
 
-        return sendWhatsApp(from, "Rate us 1-5");
+        return sendWhatsApp(
+          from,
+          `⭐ *RATE YOUR EXPERIENCE*
+
+Please rate us on a scale of 1-5:
+1️⃣ Very Bad
+2️⃣ Bad
+3️⃣ Average
+4️⃣ Good
+5️⃣ Excellent
+
+Reply with your rating (1-5)`
+        );
       }
 
-      return sendWhatsApp(from, "Please Reply With 1, 2 or 3");
+      return sendWhatsApp(
+        from,
+        `❌ Invalid option. Please reply with *1*, *2*, or *3* only.`
+      );
     }
 
+    // ===== REFUND LOGIC =====
     if (category === "REFUND") {
       if (state === "MAIN") {
         const map = {
           "1": "Product Not Dispensed",
-          "2": "Product Issue",
+          "2": "Product Expired/Damaged",
           "3": "Charged Higher MRP",
-          "4": "Recieved Damaged Product",
+          "4": "Received Damaged Product",
         };
 
-        if (!map[message]) return sendWhatsApp(from, "Choose 1-4");
+        if (!map[message]) {
+          return sendWhatsApp(
+            from,
+            `❌ Invalid choice. Please reply with *1*, *2*, *3*, or *4* only.`
+          );
+        }
 
         subIssue = map[message];
 
@@ -299,241 +380,659 @@ How can we help you today?
 
         return sendWhatsApp(
           from,
-          "Enter machine location along with the company name"
+          `📍 *MACHINE LOCATION REQUIRED*
+
+Please share the machine location along with the company/store name.
+
+Example: "Bangalore Airport Terminal 2, TCS Canteen"`
         );
       }
 
+      // PRODUCT NOT DISPENSED
       if (subIssue === "Product Not Dispensed") {
         if (state === "LOCATION") {
+          if (!text || text.length < 5) {
+            return sendWhatsApp(
+              from,
+              `❌ Please provide a valid location. Include store name and city.`
+            );
+          }
+
           await updateTicket(ticketId, {
             location: text,
             state: "STEP1",
           });
 
-          return sendWhatsApp(from, "Send the product image please");
+          return sendWhatsApp(
+            from,
+            `📸 *SEND PRODUCT IMAGE*
+
+Please send a clear photo of the product/machine where issue occurred.
+
+⚠️ Make sure:
+✓ Image is clear and visible
+✓ You can see the product/machine clearly`
+          );
         }
 
         if (state === "STEP1") {
-          if (!isImage || !mediaUrl) {
-            return sendWhatsApp(from, "Please send product image");
+          const retryKey = getRetryKey(ticketId, "STEP1_IMAGE");
+
+          // Check if it's a video (reject)
+          if (isVideo(mediaType)) {
+            incrementRetry(retryKey);
+            const retries = getRetryCount(retryKey);
+
+            if (retries >= MAX_RETRIES) {
+              await updateTicket(ticketId, { state: "FAILED_STEP1" });
+              return sendWhatsApp(
+                from,
+                `❌ Maximum attempts exceeded for image upload. Please type *1* to restart or contact support.`
+              );
+            }
+
+            return sendWhatsApp(
+              from,
+              `❌ Please send an *IMAGE*, not a video.
+
+Attempt ${retries}/${MAX_RETRIES}
+
+Send a clear photo of the product/machine.`
+            );
           }
 
+          // Check if it's a valid image
+          if (!isImage || !mediaUrl) {
+            incrementRetry(retryKey);
+            const retries = getRetryCount(retryKey);
+
+            if (retries >= MAX_RETRIES) {
+              await updateTicket(ticketId, { state: "FAILED_STEP1" });
+              return sendWhatsApp(
+                from,
+                `❌ Could not process image. Please type *1* to restart.`
+              );
+            }
+
+            return sendWhatsApp(
+              from,
+              `❌ Image not received properly.
+
+Attempt ${retries}/${MAX_RETRIES}
+
+Please send a clear photo.`
+            );
+          }
+
+          // Upload image
           const uploaded = await uploadToCloudinary(mediaUrl);
 
+          if (!uploaded) {
+            incrementRetry(retryKey);
+            const retries = getRetryCount(retryKey);
+
+            if (retries >= MAX_RETRIES) {
+              await updateTicket(ticketId, { state: "FAILED_STEP1" });
+              return sendWhatsApp(
+                from,
+                `❌ Image upload failed multiple times. Please type *1* to restart.`
+              );
+            }
+
+            return sendWhatsApp(
+              from,
+              `❌ Upload failed. Attempt ${retries}/${MAX_RETRIES}
+
+Please try again.`
+            );
+          }
+
+          resetRetry(retryKey);
           await updateTicket(ticketId, {
-            image: uploaded || mediaUrl,
+            image: uploaded,
             state: "STEP2",
           });
 
-          return sendWhatsApp(from, "Enter your UPI Transaction ID please ");
+          return sendWhatsApp(
+            from,
+            `✅ Image received!
+
+💳 *ENTER UPI TRANSACTION ID*
+
+Share the UPI Transaction ID (found in your payment app).
+
+Example: "TXN123456789@upi"`
+          );
         }
 
         if (state === "STEP2") {
-          if (!text || text.trim().length < 5) {
-            return sendWhatsApp(from, "Enter your UPI Transaction ID please ");
+          const retryKey = getRetryKey(ticketId, "STEP2_UPI");
+
+          // Check if it's alphabetic only
+          if (isAlphabetOnly(text)) {
+            incrementRetry(retryKey);
+            const retries = getRetryCount(retryKey);
+
+            return sendWhatsApp(
+              from,
+              `❌ UPI ID contains only letters. This is invalid.
+
+Attempt ${retries}/${MAX_RETRIES}
+
+UPI ID should have numbers and symbols. Example: "7892xxx123@okhdfcbank"`
+            );
           }
 
+          // Validate UPI format
+          if (!isValidTransactionId(text)) {
+            incrementRetry(retryKey);
+            const retries = getRetryCount(retryKey);
+
+            if (retries >= MAX_RETRIES) {
+              await updateTicket(ticketId, { state: "FAILED_STEP2" });
+              return sendWhatsApp(
+                from,
+                `❌ Invalid Transaction ID format after multiple attempts. Please type *1* to restart.`
+              );
+            }
+
+            return sendWhatsApp(
+              from,
+              `❌ Invalid UPI Transaction ID.
+
+Attempt ${retries}/${MAX_RETRIES}
+
+Transaction ID should be alphanumeric (numbers & letters only, no spaces).
+
+Example: "UTR123456789ABC"`
+            );
+          }
+
+          resetRetry(retryKey);
           await updateTicket(ticketId, {
             upi_id: text.trim(),
             state: "STEP3",
           });
 
-          return sendWhatsApp(from, "Send your UPI Transaction image please");
+          return sendWhatsApp(
+            from,
+            `💾 UPI ID received!
+
+📸 *SEND UPI TRANSACTION SCREENSHOT*
+
+Please send a screenshot of the UPI transaction from your payment app.
+
+⚠️ Make sure:
+✓ Screenshot shows date & time
+✓ Transaction amount is visible
+✓ Status is clear`
+          );
         }
 
         if (state === "STEP3") {
-          if (!isImage || !mediaUrl) {
+          const retryKey = getRetryKey(ticketId, "STEP3_IMAGE");
+
+          // Check if it's a video (reject)
+          if (isVideo(mediaType)) {
+            incrementRetry(retryKey);
+            const retries = getRetryCount(retryKey);
+
+            if (retries >= MAX_RETRIES) {
+              await updateTicket(ticketId, { state: "FAILED_STEP3" });
+              return sendWhatsApp(
+                from,
+                `❌ Maximum attempts exceeded. Please type *1* to restart.`
+              );
+            }
+
             return sendWhatsApp(
               from,
-              "Please send your UPI transaction image"
+              `❌ Please send an *IMAGE*, not a video.
+
+Attempt ${retries}/${MAX_RETRIES}
+
+Send your UPI screenshot.`
+            );
+          }
+
+          if (!isImage || !mediaUrl) {
+            incrementRetry(retryKey);
+            const retries = getRetryCount(retryKey);
+
+            if (retries >= MAX_RETRIES) {
+              await updateTicket(ticketId, { state: "FAILED_STEP3" });
+              return sendWhatsApp(
+                from,
+                `❌ Image could not be processed. Please type *1* to restart.`
+              );
+            }
+
+            return sendWhatsApp(
+              from,
+              `❌ Screenshot not received.
+
+Attempt ${retries}/${MAX_RETRIES}
+
+Please send your UPI transaction screenshot.`
             );
           }
 
           const uploaded = await uploadToCloudinary(mediaUrl);
 
           if (!uploaded) {
+            incrementRetry(retryKey);
+            const retries = getRetryCount(retryKey);
+
+            if (retries >= MAX_RETRIES) {
+              await updateTicket(ticketId, { state: "FAILED_STEP3" });
+              return sendWhatsApp(
+                from,
+                `❌ Upload failed multiple times. Please type *1* to restart.`
+              );
+            }
+
             return sendWhatsApp(
               from,
-              "Image upload failed. Please send your UPI transaction image again."
+              `❌ Upload failed. Attempt ${retries}/${MAX_RETRIES}
+
+Try again.`
             );
           }
 
+          resetRetry(retryKey);
           await updateTicket(ticketId, {
             upi_image: uploaded,
             state: "DONE",
             status: "PROCESSING",
           });
 
-          return sendWhatsApp(from, FINAL_MSG);
+          return sendWhatsApp(
+            from,
+            `✅ *TICKET SUBMITTED SUCCESSFULLY!*
+
+📋 Your refund request has been received.
+
+🕐 Processing time: 3-5 working days
+
+Our team will review and contact you soon.
+
+Thank you for choosing Snackit! 🙏`
+          );
         }
       }
 
-      if (subIssue === "Product Issue") {
+      // PRODUCT EXPIRED/DAMAGED
+      if (subIssue === "Product Expired/Damaged") {
         if (state === "LOCATION") {
+          if (!text || text.length < 5) {
+            return sendWhatsApp(
+              from,
+              `❌ Please provide a valid location.`
+            );
+          }
+
           await updateTicket(ticketId, {
-          location: text,
-          state: "EXP_IMG",
-      });
-          return sendWhatsApp(from, "Send the expiry image please");
+            location: text,
+            state: "EXP_IMG",
+          });
+
+          return sendWhatsApp(
+            from,
+            `📸 *SEND PRODUCT IMAGE*
+
+Please send a clear photo showing the expiry date or damage.`
+          );
         }
 
         if (state === "EXP_IMG") {
-          const uploaded =
-            isImage && mediaUrl ? await uploadToCloudinary(mediaUrl) : null;
+          const retryKey = getRetryKey(ticketId, "EXP_IMG");
 
+          if (isVideo(mediaType)) {
+            incrementRetry(retryKey);
+            return sendWhatsApp(from, `❌ Please send an *IMAGE*, not a video.`);
+          }
+
+          if (!isImage || !mediaUrl) {
+            incrementRetry(retryKey);
+            return sendWhatsApp(from, `❌ Image not received. Please try again.`);
+          }
+
+          const uploaded = await uploadToCloudinary(mediaUrl);
+
+          if (!uploaded) {
+            return sendWhatsApp(from, `❌ Upload failed. Please try again.`);
+          }
+
+          resetRetry(retryKey);
           await updateTicket(ticketId, {
-            image: uploaded || mediaUrl,
+            image: uploaded,
             state: "EXP_UPI",
           });
 
-          return sendWhatsApp(from, "Enter your UPI Transaction ID please");
+          return sendWhatsApp(
+            from,
+            `✅ Image received!
+
+💳 *ENTER UPI TRANSACTION ID*
+
+Share your UPI Transaction ID.`
+          );
         }
 
         if (state === "EXP_UPI") {
-          if (!text || text.trim().length < 5) {
-            return sendWhatsApp(from, "Enter your UPI Transaction ID please");
+          const retryKey = getRetryKey(ticketId, "EXP_UPI");
+
+          if (isAlphabetOnly(text)) {
+            incrementRetry(retryKey);
+            return sendWhatsApp(
+              from,
+              `❌ UPI ID should contain numbers. Please re-enter.`
+            );
           }
 
+          if (!isValidTransactionId(text)) {
+            incrementRetry(retryKey);
+            return sendWhatsApp(
+              from,
+              `❌ Invalid UPI ID format. Try again.`
+            );
+          }
+
+          resetRetry(retryKey);
           await updateTicket(ticketId, {
             upi_id: text.trim(),
             state: "EXP_UPI_IMG",
           });
 
-          return sendWhatsApp(from, "Send your UPI Transaction image please");
+          return sendWhatsApp(
+            from,
+            `📸 *SEND UPI SCREENSHOT*
+
+Please send your transaction screenshot.`
+          );
         }
 
         if (state === "EXP_UPI_IMG") {
-          const uploaded =
-            isImage && mediaUrl ? await uploadToCloudinary(mediaUrl) : null;
+          const retryKey = getRetryKey(ticketId, "EXP_UPI_IMG");
 
-          if (!uploaded) {
-            return sendWhatsApp(
-              from,
-              "Image upload failed. Please send your UPI transaction image again."
-            );
+          if (isVideo(mediaType)) {
+            incrementRetry(retryKey);
+            return sendWhatsApp(from, `❌ Please send an *IMAGE*, not a video.`);
           }
 
+          if (!isImage || !mediaUrl) {
+            incrementRetry(retryKey);
+            return sendWhatsApp(from, `❌ Screenshot not received. Try again.`);
+          }
+
+          const uploaded = await uploadToCloudinary(mediaUrl);
+
+          if (!uploaded) {
+            return sendWhatsApp(from, `❌ Upload failed. Try again.`);
+          }
+
+          resetRetry(retryKey);
           await updateTicket(ticketId, {
             upi_image: uploaded,
             state: "DONE",
             status: "PROCESSING",
           });
 
-          return sendWhatsApp(from, FINAL_MSG);
+          return sendWhatsApp(
+            from,
+            `✅ *TICKET SUBMITTED!*
+
+Your request has been received. We'll review within 3-5 working days.
+
+Thank you! 🙏`
+          );
         }
       }
 
+      // CHARGED HIGHER MRP
       if (subIssue === "Charged Higher MRP") {
         if (state === "LOCATION") {
+          if (!text || text.length < 5) {
+            return sendWhatsApp(
+              from,
+              `❌ Please provide a valid location.`
+            );
+          }
+
           await updateTicket(ticketId, {
-          location: text,
-          state: "PRICE_IMG",
-});
-          return sendWhatsApp(from, "Send your product price image please");
+            location: text,
+            state: "PRICE_IMG",
+          });
+
+          return sendWhatsApp(
+            from,
+            `📸 *SEND PRODUCT PRICE IMAGE*
+
+Show the product with its price tag clearly visible.`
+          );
         }
 
         if (state === "PRICE_IMG") {
-          const uploaded =
-            isImage && mediaUrl ? await uploadToCloudinary(mediaUrl) : null;
+          const retryKey = getRetryKey(ticketId, "PRICE_IMG");
 
+          if (isVideo(mediaType)) {
+            incrementRetry(retryKey);
+            return sendWhatsApp(from, `❌ Please send an *IMAGE*, not a video.`);
+          }
+
+          if (!isImage || !mediaUrl) {
+            incrementRetry(retryKey);
+            return sendWhatsApp(from, `❌ Image not received. Try again.`);
+          }
+
+          const uploaded = await uploadToCloudinary(mediaUrl);
+
+          if (!uploaded) {
+            return sendWhatsApp(from, `❌ Upload failed. Try again.`);
+          }
+
+          resetRetry(retryKey);
           await updateTicket(ticketId, {
-            image: uploaded || mediaUrl,
+            image: uploaded,
             state: "PRICE_UPI",
           });
 
-          return sendWhatsApp(from, "Enter your UPI Transaction  ID");
+          return sendWhatsApp(
+            from,
+            `✅ Image received!
+
+💳 *ENTER UPI TRANSACTION ID*`
+          );
         }
 
         if (state === "PRICE_UPI") {
-          if (!text || text.trim().length < 5) {
-            return sendWhatsApp(from, "Enter your UPI Transaction ID");
+          const retryKey = getRetryKey(ticketId, "PRICE_UPI");
+
+          if (isAlphabetOnly(text)) {
+            incrementRetry(retryKey);
+            return sendWhatsApp(
+              from,
+              `❌ UPI ID should have numbers. Please re-enter.`
+            );
           }
 
+          if (!isValidTransactionId(text)) {
+            incrementRetry(retryKey);
+            return sendWhatsApp(from, `❌ Invalid UPI ID format. Try again.`);
+          }
+
+          resetRetry(retryKey);
           await updateTicket(ticketId, {
             upi_id: text.trim(),
             state: "PRICE_UPI_IMG",
           });
 
-          return sendWhatsApp(from, "Send your UPI Transaction image please");
+          return sendWhatsApp(
+            from,
+            `📸 *SEND UPI SCREENSHOT*`
+          );
         }
 
         if (state === "PRICE_UPI_IMG") {
-          const uploaded =
-            isImage && mediaUrl ? await uploadToCloudinary(mediaUrl) : null;
+          const retryKey = getRetryKey(ticketId, "PRICE_UPI_IMG");
 
-          if (!uploaded) {
-            return sendWhatsApp(
-              from,
-              "Image upload failed. Please send your UPI transaction image again."
-            );
+          if (isVideo(mediaType)) {
+            incrementRetry(retryKey);
+            return sendWhatsApp(from, `❌ Please send an *IMAGE*, not a video.`);
           }
 
+          if (!isImage || !mediaUrl) {
+            incrementRetry(retryKey);
+            return sendWhatsApp(from, `❌ Screenshot not received. Try again.`);
+          }
+
+          const uploaded = await uploadToCloudinary(mediaUrl);
+
+          if (!uploaded) {
+            return sendWhatsApp(from, `❌ Upload failed. Try again.`);
+          }
+
+          resetRetry(retryKey);
           await updateTicket(ticketId, {
             upi_image: uploaded,
             state: "DONE",
             status: "PROCESSING",
           });
 
-          return sendWhatsApp(from, FINAL_MSG);
+          return sendWhatsApp(
+            from,
+            `✅ *TICKET SUBMITTED!*
+
+We've received your complaint. Expected resolution: 3-5 working days.
+
+Thank you! 🙏`
+          );
         }
       }
 
-      if (subIssue === "Recieved Damaged Product") {
+      // RECEIVED DAMAGED PRODUCT
+      if (subIssue === "Received Damaged Product") {
         if (state === "LOCATION") {
+          if (!text || text.length < 5) {
+            return sendWhatsApp(
+              from,
+              `❌ Please provide a valid location.`
+            );
+          }
+
           await updateTicket(ticketId, {
-          location: text,
-          state: "DAM_IMG",
-      });
-          return sendWhatsApp(from, "Send the damaged product image please");
+            location: text,
+            state: "DAM_IMG",
+          });
+
+          return sendWhatsApp(
+            from,
+            `📸 *SEND DAMAGED PRODUCT IMAGE*
+
+Show the damage clearly in the photo.`
+          );
         }
 
         if (state === "DAM_IMG") {
-          const uploaded =
-            isImage && mediaUrl ? await uploadToCloudinary(mediaUrl) : null;
+          const retryKey = getRetryKey(ticketId, "DAM_IMG");
 
+          if (isVideo(mediaType)) {
+            incrementRetry(retryKey);
+            return sendWhatsApp(from, `❌ Please send an *IMAGE*, not a video.`);
+          }
+
+          if (!isImage || !mediaUrl) {
+            incrementRetry(retryKey);
+            return sendWhatsApp(from, `❌ Image not received. Try again.`);
+          }
+
+          const uploaded = await uploadToCloudinary(mediaUrl);
+
+          if (!uploaded) {
+            return sendWhatsApp(from, `❌ Upload failed. Try again.`);
+          }
+
+          resetRetry(retryKey);
           await updateTicket(ticketId, {
-            image: uploaded || mediaUrl,
+            image: uploaded,
             state: "DAM_UPI",
           });
 
-          return sendWhatsApp(from, "Enter your UPI transaction ID please");
+          return sendWhatsApp(
+            from,
+            `✅ Image received!
+
+💳 *ENTER UPI TRANSACTION ID*`
+          );
         }
 
         if (state === "DAM_UPI") {
-          if (!text || text.trim().length < 5) {
-            return sendWhatsApp(from, "Enter your UPI transaction ID please");
+          const retryKey = getRetryKey(ticketId, "DAM_UPI");
+
+          if (isAlphabetOnly(text)) {
+            incrementRetry(retryKey);
+            return sendWhatsApp(
+              from,
+              `❌ UPI ID should have numbers. Please re-enter.`
+            );
           }
 
+          if (!isValidTransactionId(text)) {
+            incrementRetry(retryKey);
+            return sendWhatsApp(from, `❌ Invalid UPI ID format. Try again.`);
+          }
+
+          resetRetry(retryKey);
           await updateTicket(ticketId, {
             upi_id: text.trim(),
             state: "DAM_UPI_IMG",
           });
 
-          return sendWhatsApp(from, "Send your UPI screenshot please");
+          return sendWhatsApp(
+            from,
+            `📸 *SEND UPI SCREENSHOT*`
+          );
         }
 
         if (state === "DAM_UPI_IMG") {
-          const uploaded =
-            isImage && mediaUrl ? await uploadToCloudinary(mediaUrl) : null;
+          const retryKey = getRetryKey(ticketId, "DAM_UPI_IMG");
 
-          if (!uploaded) {
-            return sendWhatsApp(
-              from,
-              "Image upload failed. Please send your UPI screenshot again."
-            );
+          if (isVideo(mediaType)) {
+            incrementRetry(retryKey);
+            return sendWhatsApp(from, `❌ Please send an *IMAGE*, not a video.`);
           }
 
+          if (!isImage || !mediaUrl) {
+            incrementRetry(retryKey);
+            return sendWhatsApp(from, `❌ Screenshot not received. Try again.`);
+          }
+
+          const uploaded = await uploadToCloudinary(mediaUrl);
+
+          if (!uploaded) {
+            return sendWhatsApp(from, `❌ Upload failed. Try again.`);
+          }
+
+          resetRetry(retryKey);
           await updateTicket(ticketId, {
             upi_image: uploaded,
             state: "DONE",
             status: "PROCESSING",
           });
 
-          return sendWhatsApp(from, FINAL_MSG);
+          return sendWhatsApp(
+            from,
+            `✅ *TICKET SUBMITTED!*
+
+We regret the inconvenience. Our team will process this within 3-5 working days.
+
+Thank you for your patience! 🙏`
+          );
         }
       }
     }
 
+    // ===== PRODUCT ENQUIRY LOGIC =====
     if (category === "PRODUCT") {
       if (state === "OPTIONS") {
         if (message === "1") {
@@ -551,7 +1050,15 @@ How can we help you today?
 
           return sendWhatsApp(
             from,
-            "Thank you for your interest in Snackit.\n\nSnackit is a fast-growing smart vending solutions company providing seamless, cashless food and beverage experiences through our automated machines across multiple locations.\n\nIf you are a brand looking to showcase or distribute your products through our vending network, we would be happy to explore opportunities with you.\n\nPlease contact us at info@snackit.in. Our team will get in touch with you shortly."
+            `✅ *Thank you for your interest!*
+
+Snackit is a fast-growing smart vending solutions company providing seamless, cashless food and beverage experiences through automated machines across India.
+
+🤝 If you're a brand looking to showcase or distribute your products through our network, we'd love to collaborate!
+
+📧 *Contact us:* info@snackit.in
+
+Our team will reach out shortly. 🚀`
           );
         }
 
@@ -570,18 +1077,36 @@ How can we help you today?
 
           return sendWhatsApp(
             from,
-            "Thank you for your interest in collaborating with Snackit.\n\nSnackit partners with innovative brands to introduce new and exciting products through our smart vending machine network, helping increase product visibility and customer reach.\n\nWe are always open to mutually beneficial collaborations.\n\nPlease reach out to us at info@snackit.in. Our team will review your request and connect with you soon."
+            `✅ *Partnership Opportunity!*
+
+Snackit partners with innovative brands to introduce exciting products through our smart vending machine network.
+
+🌟 Benefits:
+✓ Increased product visibility
+✓ Wider customer reach
+✓ Seamless integration
+
+📧 *Contact:* info@snackit.in
+
+We're always open to mutually beneficial collaborations! 🤝`
           );
         }
 
-        return sendWhatsApp(from, "Please Choose 1 or 2");
+        return sendWhatsApp(
+          from,
+          `❌ Invalid option. Please reply with *1* or *2*.`
+        );
       }
     }
 
+    // ===== FEEDBACK LOGIC =====
     if (category === "FEEDBACK") {
       if (state === "RATING") {
         if (!["1", "2", "3", "4", "5"].includes(message)) {
-          return sendWhatsApp(from, "Rate us 1-5");
+          return sendWhatsApp(
+            from,
+            `❌ Invalid rating. Please reply with a number between *1* and *5*.`
+          );
         }
 
         if (!global.feedbackActive) global.feedbackActive = {};
@@ -592,11 +1117,25 @@ How can we help you today?
           state: "COMMENT",
         });
 
-        return sendWhatsApp(from, "Please share your feedback");
+        return sendWhatsApp(
+          from,
+          `✅ Thanks for rating us *${message}/5*!
+
+📝 *SHARE YOUR FEEDBACK*
+
+Tell us what we can improve. Any comments or suggestions?`
+        );
       }
 
       if (state === "COMMENT") {
         const rating = global.feedbackActive?.[from] || null;
+
+        if (!text || text.length < 3) {
+          return sendWhatsApp(
+            from,
+            `❌ Please share meaningful feedback (at least 3 characters).`
+          );
+        }
 
         await db.query(
           "INSERT INTO feedback (phone, rating, comment) VALUES ($1, $2, $3)",
@@ -612,16 +1151,21 @@ How can we help you today?
           status: "closed",
         });
 
-        return sendWhatsApp(from, "Thank you for your valuable feedback.");
+        return sendWhatsApp(
+          from,
+          `✅ *THANK YOU FOR YOUR FEEDBACK!*
+
+Your input helps us improve. We appreciate it! 🙏
+
+Keep using Snackit! 🎉`
+        );
       }
     }
+
   } catch (err) {
     console.log("PROCESS MESSAGE ERROR:", err.message);
   }
 }
-
-
-
 
 /* =========================================================
     AUTH MIDDLEWARE
@@ -768,7 +1312,6 @@ app.post("/ticket/action", auth, async (req, res) => {
       return res.status(400).json({ error: "Missing data" });
     }
 
-    // ✅ GET TICKET
     const result = await db.query(
       "SELECT * FROM tickets WHERE id=$1",
       [ticketId]
@@ -782,32 +1325,31 @@ app.post("/ticket/action", auth, async (req, res) => {
 
     console.log("PHONE:", ticket.phone);
 
-    // ✅ CREATE MESSAGE
     let message = "";
     let status = "";
 
     switch (action) {
       case "REFUNDED":
         message =
-          "Refund processed Now. Please check your bank in 5-10 minutes.";
+          "✅ *Refund Processed!*\n\nYour amount has been processed. Check your bank account in 5-10 minutes.\n\nThank you for your patience! 🙏";
         status = "refunded";
         break;
 
       case "AUTO_REFUNDED":
         message =
-          "Amount was already credited. Please check your bank statement.";
+          "ℹ️ *Auto-Refund Detected*\n\nYour amount was already credited to your account. Please check your bank statement.\n\nThank you! 🙏";
         status = "auto_refunded";
         break;
 
       case "RESOLVED":
         message =
-          "Your Issue was resolved. Thank you for contacting Snackit!";
+          "✅ *Issue Resolved!*\n\nYour concern has been resolved. Thank you for contacting Snackit!\n\nWe appreciate your feedback! 🙏";
         status = "resolved";
         break;
 
       case "CLOSED":
         message =
-          "Your ticket has been closed. Thank you for contacting Snackit!";
+          "🔒 *Ticket Closed*\n\nYour ticket has been closed. Thank you for using Snackit!\n\nFor new issues, type 1. 🚀";
         status = "closed";
         break;
 
@@ -817,14 +1359,12 @@ app.post("/ticket/action", auth, async (req, res) => {
 
     console.log("MESSAGE:", message);
 
-    // ✅ FORMAT PHONE
     let phone = ticket.phone;
 
     if (phone && !phone.startsWith("91")) {
       phone = "91" + phone;
     }
 
-    // ✅ SEND WHATSAPP
     if (phone) {
       console.log("📲 Sending WhatsApp to:", phone);
       await sendWhatsApp(phone, message);
@@ -833,7 +1373,6 @@ app.post("/ticket/action", auth, async (req, res) => {
       console.log("❌ No phone found");
     }
 
-    // ✅ UPDATE DB
     await db.query(
       `
       UPDATE tickets 
@@ -852,14 +1391,12 @@ app.post("/ticket/action", auth, async (req, res) => {
   }
 });
 
-// ✅ FIX: added auth middleware + accepts ticketId for reliable message saving
 app.post("/admin/send", auth, async (req, res) => {
   try {
     const { phone, message, ticketId } = req.body;
 
     await sendWhatsApp(phone, message);
 
-    // ✅ FIX: save by ticketId if provided, else fall back to phone lookup
     if (ticketId) {
       await saveMessage(ticketId, "admin", message);
     } else {
@@ -873,8 +1410,6 @@ app.post("/admin/send", auth, async (req, res) => {
   }
 });
 
-// 🔥 ADMIN TAKEOVER API
-// ✅ FIX: added auth middleware + returns JSON with updated ticket
 app.post("/admin/takeover", auth, async (req, res) => {
   try {
     const { phone } = req.body;
@@ -883,7 +1418,6 @@ app.post("/admin/takeover", auth, async (req, res) => {
       takeover: true
     });
 
-    // ✅ FIX: return updated ticket so frontend can sync activeChat immediately
     const result = await db.query("SELECT * FROM tickets WHERE phone=$1", [phone]);
     res.json({ success: true, ticket: result.rows[0] || null });
   } catch (err) {
@@ -892,7 +1426,6 @@ app.post("/admin/takeover", auth, async (req, res) => {
   }
 });
 
-// ✅ FIX: added auth middleware + returns JSON with updated ticket
 app.post("/admin/release", auth, async (req, res) => {
   try {
     const { phone } = req.body;
@@ -901,7 +1434,6 @@ app.post("/admin/release", auth, async (req, res) => {
       takeover: false
     });
 
-    // ✅ FIX: return updated ticket so frontend can sync activeChat immediately
     const result = await db.query("SELECT * FROM tickets WHERE phone=$1", [phone]);
     res.json({ success: true, ticket: result.rows[0] || null });
   } catch (err) {
@@ -910,10 +1442,6 @@ app.post("/admin/release", auth, async (req, res) => {
   }
 });
 
-
-/* =========================================================
-    UPDATE REFUND AMOUNT
-========================================================= */
 app.post("/tickets/:id/refund-amount", auth, async (req, res) => {
   try {
     const { id } = req.params;
@@ -935,9 +1463,6 @@ app.post("/tickets/:id/refund-amount", auth, async (req, res) => {
   }
 });
 
-/* =========================================================
-  CLOSE TICKET
-========================================================= */
 app.delete("/tickets/:id", auth, async (req, res) => {
   try {
     const id = req.params.id;
@@ -1014,9 +1539,6 @@ app.get("/analytics/monthly", auth, async (req, res) => {
   }
 });
 
-/* =========================================================
-    ANALYTICS - DAILY REFUNDS
-========================================================= */
 app.get("/analytics/refunds-daily", auth, async (req, res) => {
   try {
     const result = await db.query(`
@@ -1035,11 +1557,6 @@ app.get("/analytics/refunds-daily", auth, async (req, res) => {
   }
 });
 
-
-
-/* =========================================================
-    ANALYTICS - MONTHLY REFUNDS
-========================================================= */
 app.get("/analytics/refunds-monthly", auth, async (req, res) => {
   try {
     const result = await db.query(`
@@ -1080,8 +1597,6 @@ app.get("/webhook", (req, res) => {
 ========================================================= */
 app.post("/webhook", async (req, res) => {
   try {
-
-
     const entry = req.body?.entry?.[0];
     const change = entry?.changes?.[0];
     const value = change?.value;
@@ -1137,7 +1652,6 @@ app.post("/webhook", async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // ✅ FIX: save user message BEFORE processMessage so it always persists
     await saveMessageByPhone(from, "user", text || "[media]");
 
     await processMessage({
@@ -1159,9 +1673,8 @@ app.post("/webhook", async (req, res) => {
 });
 
 /* =========================================================
-    GET MESSAGES FOR A TICKET (NEW ROUTE - was missing)
+    GET MESSAGES FOR A TICKET
 ========================================================= */
-// ✅ FIX: this route was missing — frontend fetchMessages was calling 404
 app.get("/admin/messages/:ticketId", auth, async (req, res) => {
   try {
     const { ticketId } = req.params;
