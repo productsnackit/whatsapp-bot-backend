@@ -620,6 +620,9 @@ How can we help you today?
   }
 }
 
+
+
+
 /* =========================================================
     AUTH MIDDLEWARE
 ========================================================= */
@@ -681,6 +684,7 @@ app.get("/tickets", auth, async (req, res) => {
         upi_id,
         image,
         upi_image,
+        refund_amount,
         status,
         state,
         takeover,
@@ -756,7 +760,7 @@ app.post("/ticket/action", auth, async (req, res) => {
   try {
     console.log("🔥 API CALLED");
 
-    const { ticketId, action } = req.body;
+    const { ticketId, action, } = req.body;
 
     console.log("DATA:", ticketId, action);
 
@@ -906,6 +910,31 @@ app.post("/admin/release", auth, async (req, res) => {
   }
 });
 
+
+/* =========================================================
+    UPDATE REFUND AMOUNT
+========================================================= */
+app.post("/tickets/:id/refund-amount", auth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { refund_amount } = req.body;
+
+    if (!id || refund_amount === undefined) {
+      return res.status(400).json({ error: "Missing data" });
+    }
+
+    await db.query(
+      "UPDATE tickets SET refund_amount=$1, updated_at=NOW() WHERE id=$2",
+      [refund_amount, id]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.log("REFUND UPDATE ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
 /* =========================================================
   CLOSE TICKET
 ========================================================= */
@@ -981,6 +1010,50 @@ app.get("/analytics/monthly", auth, async (req, res) => {
     res.json(result.rows);
   } catch (err) {
     console.log("ANALYTICS ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+/* =========================================================
+    ANALYTICS - DAILY REFUNDS
+========================================================= */
+app.get("/analytics/refunds-daily", auth, async (req, res) => {
+  try {
+    const result = await db.query(`
+      SELECT 
+        DATE(created_at) as date,
+        SUM(CAST(refund_amount AS DECIMAL)) as total_refund
+      FROM tickets
+      WHERE refund_amount > 0
+      GROUP BY DATE(created_at)
+      ORDER BY date
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    console.log("REFUND DAILY ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+
+
+/* =========================================================
+    ANALYTICS - MONTHLY REFUNDS
+========================================================= */
+app.get("/analytics/refunds-monthly", auth, async (req, res) => {
+  try {
+    const result = await db.query(`
+      SELECT 
+        DATE_TRUNC('month', created_at) as month,
+        SUM(CAST(refund_amount AS DECIMAL)) as total_refund
+      FROM tickets
+      WHERE refund_amount > 0
+      GROUP BY month
+      ORDER BY month
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    console.log("REFUND MONTHLY ERROR:", err.message);
     res.status(500).json({ error: "Server error" });
   }
 });
