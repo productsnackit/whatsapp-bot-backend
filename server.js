@@ -299,7 +299,7 @@ Please reply with the number (1, 2, or 3)`
 What's your refund issue?
 
 1️⃣ Product Not Dispensed
-2️⃣ Product Expired/Damaged
+2️⃣ Product Issue
 3️⃣ Charged Higher Price
 4️⃣ Received Damaged Product
 
@@ -358,7 +358,7 @@ Reply with your rating (1-5)`
       if (state === "MAIN") {
         const map = {
           "1": "Product Not Dispensed",
-          "2": "Product Expired/Damaged",
+          "2": "Product Issue",
           "3": "Charged Higher MRP",
           "4": "Received Damaged Product",
         };
@@ -501,7 +501,7 @@ Please try again.`
 
 Share the UPI Transaction ID (found in your payment app).
 
-Example: "TXN123456789@upi"`
+Example: "1234567890566654"`
           );
         }
 
@@ -519,7 +519,7 @@ Example: "TXN123456789@upi"`
 
 Attempt ${retries}/${MAX_RETRIES}
 
-UPI ID should have numbers and symbols. Example: "7892xxx123@okhdfcbank"`
+UPI ID should have numbers.Example: "36263772828822"`
             );
           }
 
@@ -652,11 +652,11 @@ Try again.`
 
 📋 Your refund request has been received.
 
-🕐 Processing time: 3-5 working days
+🕐 Processing time: 1 working day
 
 Our team will review and contact you soon.
 
-Thank you for choosing Snackit! 🙏`
+Thank you for choosing Snackit!`
           );
         }
       }
@@ -782,9 +782,9 @@ Please send your transaction screenshot.`
             from,
             `✅ *TICKET SUBMITTED!*
 
-Your request has been received. We'll review within 3-5 working days.
+Your request has been received. We'll review within short time.
 
-Thank you! 🙏`
+Thank you!`
           );
         }
       }
@@ -903,9 +903,9 @@ Show the product with its price tag clearly visible.`
             from,
             `✅ *TICKET SUBMITTED!*
 
-We've received your complaint. Expected resolution: 3-5 working days.
+We've received your complaint. Expected resolution: 1 working day.
 
-Thank you! 🙏`
+Thank you!`
           );
         }
       }
@@ -1024,9 +1024,9 @@ Show the damage clearly in the photo.`
             from,
             `✅ *TICKET SUBMITTED!*
 
-We regret the inconvenience. Our team will process this within 3-5 working days.
+We regret the inconvenience. Our team will process this within short time.
 
-Thank you for your patience! 🙏`
+Thank you for your patience!`
           );
         }
       }
@@ -1058,7 +1058,7 @@ Snackit is a fast-growing smart vending solutions company providing seamless, ca
 
 📧 *Contact us:* info@snackit.in
 
-Our team will reach out shortly. 🚀`
+Our team will reach out shortly.`
           );
         }
 
@@ -1153,11 +1153,11 @@ Tell us what we can improve. Any comments or suggestions?`
 
         return sendWhatsApp(
           from,
-          `✅ *THANK YOU FOR YOUR FEEDBACK!*
+          ` *THANK YOU FOR YOUR FEEDBACK!*
 
-Your input helps us improve. We appreciate it! 🙏
+Your feedback helps us improve. We appreciate it!
 
-Keep using Snackit! 🎉`
+Keep using Snackit!`
         );
       }
     }
@@ -1331,25 +1331,25 @@ app.post("/ticket/action", auth, async (req, res) => {
     switch (action) {
       case "REFUNDED":
         message =
-          "✅ *Refund Processed!*\n\nYour amount has been processed. Check your bank account in 5-10 minutes.\n\nThank you for your patience! 🙏";
+          "✅ *Refund Processed!*\n\nYour amount has been processed. Check your bank account in 5-10 minutes.\n\nThank you for your patience!";
         status = "refunded";
         break;
 
       case "AUTO_REFUNDED":
         message =
-          "ℹ️ *Auto-Refund Detected*\n\nYour amount was already credited to your account. Please check your bank statement.\n\nThank you! 🙏";
+          "ℹ️ *Auto-Refund Detected*\n\nYour amount was already credited to your account. Please check your bank statement.\n\nThank you for your patience!";
         status = "auto_refunded";
         break;
 
       case "RESOLVED":
         message =
-          "✅ *Issue Resolved!*\n\nYour concern has been resolved. Thank you for contacting Snackit!\n\nWe appreciate your feedback! 🙏";
+          "✅ *Issue Resolved!*\n\nYour concern has been resolved. Thank you for contacting Snackit!\n\nThank you for your patience!";
         status = "resolved";
         break;
 
       case "CLOSED":
         message =
-          "🔒 *Ticket Closed*\n\nYour ticket has been closed. Thank you for using Snackit!\n\nFor new issues, type 1. 🚀";
+          "🔒 *Ticket Closed*\n\nYour ticket has been closed. Thank you for using Snackit!\n\nFor new issues, Type 1.";
         status = "closed";
         break;
 
