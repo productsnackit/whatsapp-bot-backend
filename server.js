@@ -6,7 +6,7 @@ import cors from "cors";
 import axios from "axios";
 import { v2 as cloudinary } from "cloudinary";
 
-import { getOrCreateTicket } from "./ticketService.js";
+import { getOrCreateTicket, verifyPaymentOnPaytm, storePaytmVerification } from "./ticketService.js";
 import db from "./db.js";
 import { sendWhatsApp } from "./whatsapp.js";
 
@@ -30,6 +30,7 @@ if (!global.feedbackActive) global.feedbackActive = {};
 if (!global.upiActive) global.upiActive = {};
 if (!global.adminTakeover) global.adminTakeover = {};
 if (!global.retryCount) global.retryCount = {}; // Track retry attempts
+if (!global.paytmVerificationAttempts) global.paytmVerificationAttempts = {}; // Paytm retry tracking
 
 /* ================= AUTH CONFIG ================= */
 const SECRET_TOKEN = "mysecrettoken123";
@@ -153,55 +154,44 @@ async function updateTicket(id, fields) {
   );
 }
 
-/* ================= VALIDATION FUNCTIONS (NEXT LEVEL) ================= */
+/* ================= VALIDATION FUNCTIONS ================= */
 
-// Validate UPI ID format
 function validateUPIId(upiId) {
   if (!upiId || upiId.length < 5) return false;
-  
-  // UPI format: username@bankname or phone@bankname
   const upiRegex = /^[a-zA-Z0-9._-]+@[a-zA-Z0-9]+$/;
   return upiRegex.test(upiId);
 }
 
-// Check if input is alphabetic (invalid for UPI)
 function isAlphabetOnly(text) {
   return /^[a-zA-Z\s]+$/.test(text);
 }
 
-// Check if it's a valid transaction ID format (alphanumeric, no special chars)
 function isValidTransactionId(text) {
   return /^[a-zA-Z0-9]{5,}$/.test(text);
 }
 
-// Validate image media type
 function isValidImage(mediaType) {
   return mediaType === "image" || (mediaType && mediaType.startsWith("image/"));
 }
 
-// Validate if it's video (should reject for image upload)
 function isVideo(mediaType) {
   return mediaType === "video" || (mediaType && mediaType.startsWith("video/"));
 }
 
-// Get retry key for a user
 function getRetryKey(ticketId, step) {
   return `${ticketId}-${step}`;
 }
 
-// Increment retry count
 function incrementRetry(key) {
   if (!global.retryCount[key]) global.retryCount[key] = 0;
   global.retryCount[key]++;
   return global.retryCount[key];
 }
 
-// Reset retry count
 function resetRetry(key) {
   delete global.retryCount[key];
 }
 
-// Get retry count
 function getRetryCount(key) {
   return global.retryCount[key] || 0;
 }
@@ -209,7 +199,31 @@ function getRetryCount(key) {
 const FINAL_MSG = "✅ Ticket has been raised, we will process your concern soon.";
 const MAX_RETRIES = 3;
 
-/* ================= BOT MESSAGE PROCESSOR - NEXT LEVEL ================= */
+/* ================= PAYTM PAYMENT VERIFICATION ================= */
+async function verifyAndProcessPayment(ticketId, upiId, from) {
+  try {
+    console.log("🔍 Verifying payment on Paytm for Order ID:", upiId);
+
+    // Call Paytm API
+    const paytmResult = await verifyPaymentOnPaytm(upiId);
+
+    console.log("✅ Paytm Response:", paytmResult);
+
+    // Store verification in DB
+    await storePaytmVerification(ticketId, paytmResult);
+
+    return paytmResult;
+  } catch (err) {
+    console.error("❌ Payment verification error:", err.message);
+    return {
+      status: "ERROR",
+      verified: false,
+      message: "Could not verify payment",
+    };
+  }
+}
+
+/* ================= BOT MESSAGE PROCESSOR - PAYTM INTEGRATED ================= */
 async function processMessage(jobData) {
   console.log("JOB RECEIVED:", jobData);
 
@@ -418,7 +432,6 @@ Please send a clear photo of the product/machine where issue occurred.
         if (state === "STEP1") {
           const retryKey = getRetryKey(ticketId, "STEP1_IMAGE");
 
-          // Check if it's a video (reject)
           if (isVideo(mediaType)) {
             incrementRetry(retryKey);
             const retries = getRetryCount(retryKey);
@@ -441,7 +454,6 @@ Send a clear photo of the product/machine.`
             );
           }
 
-          // Check if it's a valid image
           if (!isImage || !mediaUrl) {
             incrementRetry(retryKey);
             const retries = getRetryCount(retryKey);
@@ -464,7 +476,6 @@ Please send a clear photo.`
             );
           }
 
-          // Upload image
           const uploaded = await uploadToCloudinary(mediaUrl);
 
           if (!uploaded) {
@@ -497,11 +508,11 @@ Please try again.`
             from,
             `✅ Image received!
 
-💳 *ENTER UPI TRANSACTION ID*
+💳 *ENTER TRANSACTION ID*
 
-Share the UPI Transaction ID (found in your payment app).
+Share your Transaction ID (from payment app or Paytm).
 
-Example: "1234567890566654"`
+Example: "1234567890566654" or "UTR123456789ABC"`
           );
         }
 
@@ -515,15 +526,15 @@ Example: "1234567890566654"`
 
             return sendWhatsApp(
               from,
-              `❌ UPI ID contains only letters. This is invalid.
+              `❌ Transaction ID contains only letters. This is invalid.
 
 Attempt ${retries}/${MAX_RETRIES}
 
-UPI ID should have numbers.Example: "36263772828822"`
+Transaction ID should have numbers. Example: "36263772828822"`
             );
           }
 
-          // Validate UPI format
+          // Validate format
           if (!isValidTransactionId(text)) {
             incrementRetry(retryKey);
             const retries = getRetryCount(retryKey);
@@ -538,41 +549,194 @@ UPI ID should have numbers.Example: "36263772828822"`
 
             return sendWhatsApp(
               from,
-              `❌ Invalid UPI Transaction ID.
+              `❌ Invalid Transaction ID.
 
 Attempt ${retries}/${MAX_RETRIES}
 
 Transaction ID should be alphanumeric (numbers & letters only, no spaces).
 
-Example: "UTR123456789ABC"`
+Example: "UTR123456789ABC" or "1234567890"`
             );
           }
 
+          // ========== 🔥 PAYTM VERIFICATION STARTS HERE ==========
           resetRetry(retryKey);
-          await updateTicket(ticketId, {
-            upi_id: text.trim(),
-            state: "STEP3",
-          });
+          const transactionId = text.trim();
 
-          return sendWhatsApp(
+          // Send "Verifying..." message
+          await sendWhatsApp(
             from,
-            `💾 UPI ID received!
+            `⏳ *VERIFYING PAYMENT*
+
+Please wait while we verify your transaction on Paytm...`
+          );
+
+          // Call Paytm verification
+          const paytmResult = await verifyAndProcessPayment(
+            ticketId,
+            transactionId,
+            from
+          );
+
+          console.log("🔍 Paytm Result:", paytmResult);
+
+          // ========== HANDLE PAYTM RESPONSES ==========
+          if (paytmResult.status === "TXN_SUCCESS" || paytmResult.verified) {
+            // ✅ PAYMENT SUCCESSFUL - AUTO-ADVANCE
+            await updateTicket(ticketId, {
+              upi_id: transactionId,
+              transaction_verified: true,
+              state: "STEP3",
+            });
+
+            return sendWhatsApp(
+              from,
+              `✅ *PAYMENT VERIFIED!*
+
+Transaction Status: *SUCCESS*
+Transaction ID: ${paytmResult.txnId || transactionId}
+Amount: ₹${paytmResult.amount || "N/A"}
 
 📸 *SEND UPI TRANSACTION SCREENSHOT*
 
-Please send a screenshot of the UPI transaction from your payment app.
+Please send a screenshot of the transaction from your payment app.
 
 ⚠️ Make sure:
 ✓ Screenshot shows date & time
 ✓ Transaction amount is visible
 ✓ Status is clear`
+            );
+          } else if (
+            paytmResult.status === "TXN_FAILURE" ||
+            paytmResult.status === "FAILED"
+          ) {
+            // ❌ PAYMENT FAILED
+            await updateTicket(ticketId, {
+              upi_id: transactionId,
+              transaction_verified: false,
+              paytm_status: "FAILED",
+              state: "STEP2_RETRY",
+            });
+
+            return sendWhatsApp(
+              from,
+              `❌ *PAYMENT VERIFICATION FAILED*
+
+Transaction Status: *FAILED*
+Error: ${paytmResult.message || "Payment was not successful"}
+
+🔄 *RETRY PAYMENT*
+
+Please check your payment and try with a different transaction ID, or:
+1. Retry with another transaction ID
+2. Type *1* to restart the process
+3. Contact support for assistance
+
+What would you like to do?`
+            );
+          } else if (paytmResult.status === "PENDING") {
+            // ⏳ PAYMENT PENDING
+            return sendWhatsApp(
+              from,
+              `⏳ *PAYMENT PENDING*
+
+Transaction Status: *PENDING*
+
+Your payment is still being processed. This usually takes 1-2 minutes.
+
+🔄 *PLEASE WAIT*
+
+Please try again in a moment. If it still shows pending:
+1. Check your bank/payment app for confirmation
+2. If money was deducted, share the screenshot
+3. If not, type *1* to restart
+
+Type "retry" to verify again.`
+            );
+          } else if (paytmResult.status === "TXN_INITIATED") {
+            // 🔄 PROCESSING
+            return sendWhatsApp(
+              from,
+              `🔄 *PAYMENT PROCESSING*
+
+Transaction Status: *PROCESSING*
+
+Your payment is being processed. Please wait a moment.
+
+Type "retry" to check status again, or share a screenshot if payment was completed.`
+            );
+          } else if (paytmResult.status === "ERROR" || !paytmResult.verified) {
+            // ⚠️ API ERROR OR UNKNOWN
+            return sendWhatsApp(
+              from,
+              `⚠️ *VERIFICATION ERROR*
+
+We couldn't verify your payment at this moment:
+${paytmResult.message || "Unknown error"}
+
+📸 *PLEASE SEND SCREENSHOT INSTEAD*
+
+For now, please send a screenshot of your transaction receipt from your payment app. Our team will verify it manually.
+
+⚠️ Make sure:
+✓ Screenshot shows transaction details clearly
+✓ Transaction ID is visible
+✓ Status and amount are clear`
+            );
+          }
+        }
+
+        if (state === "STEP2_RETRY") {
+          // User retrying after payment failed
+          if (message === "retry" || isValidTransactionId(text)) {
+            const newTransactionId = isValidTransactionId(text)
+              ? text.trim()
+              : null;
+
+            if (newTransactionId) {
+              // Try verification again
+              await sendWhatsApp(from, `⏳ Verifying new transaction...`);
+
+              const paytmResult = await verifyAndProcessPayment(
+                ticketId,
+                newTransactionId,
+                from
+              );
+
+              if (paytmResult.verified) {
+                await updateTicket(ticketId, {
+                  upi_id: newTransactionId,
+                  transaction_verified: true,
+                  state: "STEP3",
+                });
+
+                return sendWhatsApp(
+                  from,
+                  `✅ *PAYMENT VERIFIED!*\n\n📸 Now send your transaction screenshot.`
+                );
+              } else {
+                return sendWhatsApp(
+                  from,
+                  `❌ This transaction also failed. \n\nPlease send a screenshot of a successful transaction instead.`
+                );
+              }
+            } else {
+              return sendWhatsApp(
+                from,
+                `❌ Invalid transaction ID. Please try again with correct format.`
+              );
+            }
+          }
+
+          return sendWhatsApp(
+            from,
+            `Please enter a valid transaction ID or type "1" to restart.`
           );
         }
 
         if (state === "STEP3") {
           const retryKey = getRetryKey(ticketId, "STEP3_IMAGE");
 
-          // Check if it's a video (reject)
           if (isVideo(mediaType)) {
             incrementRetry(retryKey);
             const retries = getRetryCount(retryKey);
@@ -591,7 +755,7 @@ Please send a screenshot of the UPI transaction from your payment app.
 
 Attempt ${retries}/${MAX_RETRIES}
 
-Send your UPI screenshot.`
+Send your transaction screenshot.`
             );
           }
 
@@ -650,18 +814,20 @@ Try again.`
             from,
             `✅ *TICKET SUBMITTED SUCCESSFULLY!*
 
-📋 Your refund request has been received.
+📋 Your refund request has been received and verified.
 
 🕐 Processing time: 1 working day
 
-Our team will review and contact you soon.
+💳 Payment Status: VERIFIED ✅
 
-Thank you for choosing Snackit!`
+Our team will review and process your refund within 24 hours.
+
+Thank you for choosing Snackit! 🙏`
           );
         }
       }
 
-      // PRODUCT EXPIRED/DAMAGED
+      // PRODUCT ISSUE
       if (subIssue === "Product Issue") {
         if (state === "LOCATION") {
           if (!text || text.length < 5) {
@@ -713,9 +879,9 @@ Please send a clear photo showing the expiry date or damage.`
             from,
             `✅ Image received!
 
-💳 *ENTER UPI TRANSACTION ID*
+💳 *ENTER TRANSACTION ID*
 
-Share your UPI Transaction ID.`
+Share your Transaction ID.`
           );
         }
 
@@ -726,7 +892,7 @@ Share your UPI Transaction ID.`
             incrementRetry(retryKey);
             return sendWhatsApp(
               from,
-              `❌ UPI ID should contain numbers. Please re-enter.`
+              `❌ Transaction ID should contain numbers. Please re-enter.`
             );
           }
 
@@ -734,22 +900,47 @@ Share your UPI Transaction ID.`
             incrementRetry(retryKey);
             return sendWhatsApp(
               from,
-              `❌ Invalid UPI ID format. Try again.`
+              `❌ Invalid Transaction ID format. Try again.`
             );
           }
 
           resetRetry(retryKey);
-          await updateTicket(ticketId, {
-            upi_id: text.trim(),
-            state: "EXP_UPI_IMG",
-          });
 
-          return sendWhatsApp(
-            from,
-            `📸 *SEND UPI SCREENSHOT*
+          // Verify payment
+          const paytmResult = await verifyAndProcessPayment(
+            ticketId,
+            text.trim(),
+            from
+          );
+
+          if (paytmResult.verified) {
+            await updateTicket(ticketId, {
+              upi_id: text.trim(),
+              transaction_verified: true,
+              state: "EXP_UPI_IMG",
+            });
+
+            return sendWhatsApp(
+              from,
+              `✅ Payment Verified!
+
+📸 *SEND TRANSACTION SCREENSHOT*
 
 Please send your transaction screenshot.`
-          );
+            );
+          } else {
+            await updateTicket(ticketId, {
+              upi_id: text.trim(),
+              transaction_verified: false,
+            });
+
+            return sendWhatsApp(
+              from,
+              `⚠️ Payment verification failed or pending.
+
+📸 Please send your transaction screenshot anyway. Our team will verify manually.`
+            );
+          }
         }
 
         if (state === "EXP_UPI_IMG") {
@@ -782,9 +973,9 @@ Please send your transaction screenshot.`
             from,
             `✅ *TICKET SUBMITTED!*
 
-Your request has been received. We'll review within short time.
+Your request has been received. We'll review within 24 hours.
 
-Thank you!`
+Thank you! 🙏`
           );
         }
       }
@@ -841,7 +1032,7 @@ Show the product with its price tag clearly visible.`
             from,
             `✅ Image received!
 
-💳 *ENTER UPI TRANSACTION ID*`
+💳 *ENTER TRANSACTION ID*`
           );
         }
 
@@ -852,25 +1043,44 @@ Show the product with its price tag clearly visible.`
             incrementRetry(retryKey);
             return sendWhatsApp(
               from,
-              `❌ UPI ID should have numbers. Please re-enter.`
+              `❌ Transaction ID should have numbers. Please re-enter.`
             );
           }
 
           if (!isValidTransactionId(text)) {
             incrementRetry(retryKey);
-            return sendWhatsApp(from, `❌ Invalid UPI ID format. Try again.`);
+            return sendWhatsApp(from, `❌ Invalid Transaction ID format. Try again.`);
           }
 
           resetRetry(retryKey);
-          await updateTicket(ticketId, {
-            upi_id: text.trim(),
-            state: "PRICE_UPI_IMG",
-          });
 
-          return sendWhatsApp(
-            from,
-            `📸 *SEND UPI SCREENSHOT*`
+          const paytmResult = await verifyAndProcessPayment(
+            ticketId,
+            text.trim(),
+            from
           );
+
+          if (paytmResult.verified) {
+            await updateTicket(ticketId, {
+              upi_id: text.trim(),
+              transaction_verified: true,
+              state: "PRICE_UPI_IMG",
+            });
+
+            return sendWhatsApp(
+              from,
+              `✅ Payment Verified!
+
+📸 *SEND TRANSACTION SCREENSHOT*`
+            );
+          } else {
+            return sendWhatsApp(
+              from,
+              `⚠️ Payment verification pending.
+
+📸 Please send your screenshot. We'll verify manually.`
+            );
+          }
         }
 
         if (state === "PRICE_UPI_IMG") {
@@ -903,9 +1113,9 @@ Show the product with its price tag clearly visible.`
             from,
             `✅ *TICKET SUBMITTED!*
 
-We've received your complaint. Expected resolution: 1 working day.
+We've received your complaint. Expected resolution: 24 hours.
 
-Thank you!`
+Thank you! 🙏`
           );
         }
       }
@@ -962,7 +1172,7 @@ Show the damage clearly in the photo.`
             from,
             `✅ Image received!
 
-💳 *ENTER UPI TRANSACTION ID*`
+💳 *ENTER TRANSACTION ID*`
           );
         }
 
@@ -973,25 +1183,44 @@ Show the damage clearly in the photo.`
             incrementRetry(retryKey);
             return sendWhatsApp(
               from,
-              `❌ UPI ID should have numbers. Please re-enter.`
+              `❌ Transaction ID should have numbers. Please re-enter.`
             );
           }
 
           if (!isValidTransactionId(text)) {
             incrementRetry(retryKey);
-            return sendWhatsApp(from, `❌ Invalid UPI ID format. Try again.`);
+            return sendWhatsApp(from, `❌ Invalid Transaction ID format. Try again.`);
           }
 
           resetRetry(retryKey);
-          await updateTicket(ticketId, {
-            upi_id: text.trim(),
-            state: "DAM_UPI_IMG",
-          });
 
-          return sendWhatsApp(
-            from,
-            `📸 *SEND UPI SCREENSHOT*`
+          const paytmResult = await verifyAndProcessPayment(
+            ticketId,
+            text.trim(),
+            from
           );
+
+          if (paytmResult.verified) {
+            await updateTicket(ticketId, {
+              upi_id: text.trim(),
+              transaction_verified: true,
+              state: "DAM_UPI_IMG",
+            });
+
+            return sendWhatsApp(
+              from,
+              `✅ Payment Verified!
+
+📸 *SEND TRANSACTION SCREENSHOT*`
+            );
+          } else {
+            return sendWhatsApp(
+              from,
+              `⚠️ Payment verification pending.
+
+📸 Please send your screenshot.`
+            );
+          }
         }
 
         if (state === "DAM_UPI_IMG") {
@@ -1024,9 +1253,9 @@ Show the damage clearly in the photo.`
             from,
             `✅ *TICKET SUBMITTED!*
 
-We regret the inconvenience. Our team will process this within short time.
+We regret the inconvenience. Our team will process this within 24 hours.
 
-Thank you for your patience!`
+Thank you for your patience! 🙏`
           );
         }
       }
@@ -1058,7 +1287,7 @@ Snackit is a fast-growing smart vending solutions company providing seamless, ca
 
 📧 *Contact us:* info@snackit.in
 
-Our team will reach out shortly.`
+Our team will reach out shortly. 🚀`
           );
         }
 
@@ -1153,11 +1382,11 @@ Tell us what we can improve. Any comments or suggestions?`
 
         return sendWhatsApp(
           from,
-          ` *THANK YOU FOR YOUR FEEDBACK!*
+          `✅ *THANK YOU FOR YOUR FEEDBACK!*
 
-Your feedback helps us improve. We appreciate it!
+Your feedback helps us improve. We appreciate it! 🙏
 
-Keep using Snackit!`
+Keep using Snackit! 🎉`
         );
       }
     }
@@ -1229,6 +1458,8 @@ app.get("/tickets", auth, async (req, res) => {
         image,
         upi_image,
         refund_amount,
+        transaction_verified,
+        paytm_status,
         status,
         state,
         takeover,
@@ -1304,7 +1535,7 @@ app.post("/ticket/action", auth, async (req, res) => {
   try {
     console.log("🔥 API CALLED");
 
-    const { ticketId, action, } = req.body;
+    const { ticketId, action } = req.body;
 
     console.log("DATA:", ticketId, action);
 
@@ -1331,19 +1562,19 @@ app.post("/ticket/action", auth, async (req, res) => {
     switch (action) {
       case "REFUNDED":
         message =
-          "✅ *Refund Processed!*\n\nYour amount has been processed. Check your bank account in 5-10 minutes.\n\nThank you for your patience!";
+          "✅ *Refund Processed!*\n\nYour amount has been processed. Check your bank account in 5-10 minutes.\n\nThank you for your patience! 🙏";
         status = "refunded";
         break;
 
       case "AUTO_REFUNDED":
         message =
-          "ℹ️ *Auto-Refund Detected*\n\nYour amount was already credited to your account. Please check your bank statement.\n\nThank you for your patience!";
+          "ℹ️ *Auto-Refund Detected*\n\nYour amount was already credited to your account. Please check your bank statement.\n\nThank you for your patience! 🙏";
         status = "auto_refunded";
         break;
 
       case "RESOLVED":
         message =
-          "✅ *Issue Resolved!*\n\nYour concern has been resolved. Thank you for contacting Snackit!\n\nThank you for your patience!";
+          "✅ *Issue Resolved!*\n\nYour concern has been resolved. Thank you for contacting Snackit!\n\nThank you for your patience! 🙏";
         status = "resolved";
         break;
 
@@ -1415,7 +1646,7 @@ app.post("/admin/takeover", auth, async (req, res) => {
     const { phone } = req.body;
 
     await updateTicketByPhone(phone, {
-      takeover: true
+      takeover: true,
     });
 
     const result = await db.query("SELECT * FROM tickets WHERE phone=$1", [phone]);
@@ -1431,7 +1662,7 @@ app.post("/admin/release", auth, async (req, res) => {
     const { phone } = req.body;
 
     await updateTicketByPhone(phone, {
-      takeover: false
+      takeover: false,
     });
 
     const result = await db.query("SELECT * FROM tickets WHERE phone=$1", [phone]);
