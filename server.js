@@ -122,6 +122,10 @@ async function saveMessageByPhone(phone, sender, message) {
       [ticketId, sender, message]
     );
 
+    await db.query(
+      "UPDATE tickets SET updated_at = NOW() WHERE phone = $1",
+      [phone]
+    );
   } catch (err) {
     console.error("Error saving message:", err);
   }
@@ -198,6 +202,52 @@ function getRetryCount(key) {
 
 const FINAL_MSG = "✅ Ticket has been raised, we will process your concern soon.";
 const MAX_RETRIES = 3;
+const AUTO_CLOSE_TICKET_MINUTES = 5; // Auto-close after 5 minutes of inactivity
+
+async function closeInactiveTicket(ticket) {
+  try {
+    if (!ticket || !ticket.phone) return;
+
+    let phone = ticket.phone;
+    if (phone && !phone.startsWith("91")) {
+      phone = "91" + phone;
+    }
+
+    const closeMessage =
+      "🔒 *Ticket Closed*\n\nNo response was received from your side, so this ticket has been automatically closed.\n\nFor new issues, Type 1.";
+
+    await sendWhatsApp(phone, closeMessage);
+
+    await db.query(
+      "UPDATE tickets SET status='closed', state='CLOSED', updated_at=NOW() WHERE id=$1",
+      [ticket.id]
+    );
+
+    console.log(`Auto-closed inactive ticket ${ticket.id} for ${phone}`);
+  } catch (err) {
+    console.log("AUTO CLOSE ERROR:", err.message);
+  }
+}
+
+async function autoCloseInactiveTickets() {
+  try {
+    const result = await db.query(
+      `
+        SELECT *
+        FROM tickets
+        WHERE LOWER(COALESCE(status, '')) NOT IN ('closed', 'resolved', 'refunded', 'auto_refunded')
+          AND state != 'CLOSED'
+          AND updated_at < NOW() - INTERVAL '${AUTO_CLOSE_TICKET_MINUTES} minutes'
+      `
+    );
+
+    for (const ticket of result.rows) {
+      await closeInactiveTicket(ticket);
+    }
+  } catch (err) {
+    console.log("AUTO CLOSE CHECK ERROR:", err.message);
+  }
+}
 
 /* ================= PAYTM PAYMENT VERIFICATION ================= */
 async function verifyAndProcessPayment(ticketId, upiId, from) {
@@ -1933,6 +1983,10 @@ app.get("/", (req, res) => {
     START SERVER
 ========================================================= */
 const PORT = process.env.PORT || 3000;
+
+setInterval(() => {
+  autoCloseInactiveTickets();
+}, 60 * 1000);
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(` Server running on port ${PORT}`);
