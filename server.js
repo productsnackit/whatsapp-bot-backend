@@ -36,6 +36,7 @@ if (!global.botSettings) {
   global.botSettings = {
     paytm_verification_enabled: process.env.PAYTM_VERIFICATION_ENABLED === "true",
     auto_close_inactive_tickets: true,
+    auto_close_minutes: 5,
     premium_message_mode: true,
   };
 }
@@ -51,6 +52,45 @@ async function ensurePaytmSettingTable() {
     `);
   } catch (err) {
     console.log("APP SETTINGS TABLE ERROR:", err.message);
+  }
+}
+
+async function ensureSupportColumns() {
+  try {
+    await db.query(`
+      ALTER TABLE tickets
+        ADD COLUMN IF NOT EXISTS priority TEXT DEFAULT 'normal',
+        ADD COLUMN IF NOT EXISTS assigned_to TEXT,
+        ADD COLUMN IF NOT EXISTS admin_notes TEXT DEFAULT '',
+        ADD COLUMN IF NOT EXISTS reopened_at TIMESTAMPTZ,
+        ADD COLUMN IF NOT EXISTS last_customer_message_at TIMESTAMPTZ
+    `);
+    await db.query("UPDATE tickets SET last_customer_message_at = COALESCE(last_customer_message_at, updated_at, created_at)");
+  } catch (err) {
+    console.log("SUPPORT COLUMNS ERROR:", err.message);
+  }
+}
+
+async function loadBotSettingsFromDb() {
+  try {
+    await ensurePaytmSettingTable();
+    await ensureSupportColumns();
+    const result = await db.query(
+      "SELECT key, value FROM app_settings WHERE key IN ('paytm_verification_enabled', 'auto_close_inactive_tickets', 'auto_close_minutes', 'premium_message_mode')"
+    );
+
+    for (const row of result.rows) {
+      if (row.key === "auto_close_minutes") {
+        const minutes = Number(row.value);
+        if (Number.isFinite(minutes) && minutes >= 1 && minutes <= 1440) {
+          global.botSettings.auto_close_minutes = minutes;
+        }
+      } else {
+        global.botSettings[row.key] = row.value === "true";
+      }
+    }
+  } catch (err) {
+    console.log("LOAD BOT SETTINGS ERROR:", err.message);
   }
 }
 
@@ -93,7 +133,7 @@ async function savePaytmSettingToDb(enabled) {
 async function saveBotSetting(key, value) {
   try {
     await ensurePaytmSettingTable();
-    global.botSettings[key] = Boolean(value);
+    global.botSettings[key] = key === "auto_close_minutes" ? Number(value) : Boolean(value);
 
     await db.query(
       `INSERT INTO app_settings (key, value, updated_at)
@@ -116,9 +156,9 @@ async function sendPremiumWhatsApp(phone, message) {
 }
 
 /* ================= AUTH CONFIG ================= */
-const SECRET_TOKEN = "mysecrettoken123";
-const ADMIN_USER = "admin";
-const ADMIN_PASS = "admin";
+const SECRET_TOKEN = process.env.ADMIN_SECRET_TOKEN || "mysecrettoken123";
+const ADMIN_USER = process.env.ADMIN_USER || "admin";
+const ADMIN_PASS = process.env.ADMIN_PASS || "admin";
 
 /* ================= HELPERS ================= */
 function cleanText(text) {
@@ -206,7 +246,7 @@ async function saveMessageByPhone(phone, sender, message) {
     );
 
     await db.query(
-      "UPDATE tickets SET updated_at = NOW() WHERE phone = $1",
+      "UPDATE tickets SET updated_at = NOW(), last_customer_message_at = NOW() WHERE phone = $1",
       [phone]
     );
   } catch (err) {
@@ -283,6 +323,18 @@ function getRetryCount(key) {
   return global.retryCount[key] || 0;
 }
 
+async function isDuplicateTransaction(transactionId, ticketId) {
+  const result = await db.query(
+    `SELECT id FROM tickets
+     WHERE id <> $1
+       AND (upi_id = $2 OR paytm_transaction_id = $2)
+       AND LOWER(COALESCE(status, '')) NOT IN ('closed', 'auto_closed')
+     LIMIT 1`,
+    [ticketId, transactionId]
+  );
+  return result.rows.length > 0;
+}
+
 const FINAL_MSG = "✅ Ticket has been raised, we will process your concern soon.";
 const MAX_RETRIES = 3;
 const AUTO_CLOSE_TICKET_MINUTES = 5; // Auto-close after 5 minutes of inactivity
@@ -322,14 +374,18 @@ async function closeInactiveTicket(ticket) {
 
 async function autoCloseInactiveTickets() {
   try {
+    if (global.botSettings?.auto_close_inactive_tickets === false) return;
+
+    const closeMinutes = Math.max(1, Math.min(1440, Number(global.botSettings?.auto_close_minutes) || 5));
     const result = await db.query(
       `
         SELECT *
         FROM tickets
         WHERE LOWER(COALESCE(status, '')) NOT IN ('closed', 'resolved', 'refunded', 'auto_refunded')
           AND state != 'CLOSED'
-          AND updated_at < NOW() - INTERVAL '${AUTO_CLOSE_TICKET_MINUTES} minutes'
-      `
+          AND COALESCE(last_customer_message_at, updated_at) < NOW() - ($1 * INTERVAL '1 minute')
+      `,
+      [closeMinutes]
     );
 
     for (const ticket of result.rows) {
@@ -406,6 +462,28 @@ async function processMessage(jobData) {
     console.log("CATEGORY:", category);
     console.log("SUB ISSUE:", subIssue);
 
+    if (message === "agent" || message === "human" || message === "support") {
+      await updateTicket(ticketId, { takeover: true, priority: "high", status: "OPEN", state: state === "CLOSED" ? "MENU" : state });
+      return sendWhatsApp(from, "A support specialist will continue this conversation shortly. Please keep this chat open.");
+    }
+
+    if (message === "menu" || message === "back") {
+      await updateTicket(ticketId, { category: "MENU", state: "MENU", status: "OPEN", takeover: false });
+      return sendWhatsApp(from, "Main menu\n\n1. Refund support\n2. Product enquiry\n3. Share feedback\n\nReply with 1, 2, or 3.");
+    }
+
+    if (message === "restart" || message === "reset") {
+      await updateTicket(ticketId, {
+        category: null,
+        main_issue: null,
+        sub_issue: null,
+        state: "START",
+        status: "OPEN",
+        takeover: false,
+      });
+      return sendWhatsApp(from, "Let us start again. Please reply with 1 for refund support, 2 for product enquiry, or 3 to share feedback.");
+    }
+
     // Already closed or done states
     if (state === "DONE") {
       return sendWhatsApp(
@@ -415,9 +493,20 @@ async function processMessage(jobData) {
     }
 
     if (state === "CLOSED") {
+      if (message === "1") {
+        await updateTicket(ticketId, {
+          category: "MENU",
+          state: "MENU",
+          status: "OPEN",
+          takeover: false,
+          reopened_at: new Date(),
+        });
+        return sendWhatsApp(from, "Your request has been reopened.\n\n1. Refund support\n2. Product enquiry\n3. Share feedback\n\nReply with 1, 2, or 3.");
+      }
+
       return sendWhatsApp(
         from,
-        "🔄 Your previous ticket is closed. Please type *1* to create a new request."
+        "Your previous ticket is closed. Reply with 1 to start a new request, or type menu to see the available options."
       );
     }
 
@@ -667,6 +756,10 @@ Example: "1234567890566654" or "UTR123456789ABC"`
               from,
               `❌ Please enter a valid transaction ID.`
             );
+          }
+
+          if (await isDuplicateTransaction(transactionId, ticketId)) {
+            return sendWhatsApp(from, "This transaction has already been linked to another request. Please check the transaction ID or contact support.");
           }
 
           if (!isPaytmVerificationEnabled()) {
@@ -1657,6 +1750,10 @@ app.get("/tickets", auth, async (req, res) => {
         status,
         state,
         takeover,
+        priority,
+        assigned_to,
+        admin_notes,
+        reopened_at,
         created_at,
         updated_at
       FROM tickets
@@ -1820,17 +1917,18 @@ app.get("/admin/settings", auth, async (req, res) => {
   try {
     await ensurePaytmSettingTable();
     const result = await db.query(
-      "SELECT key, value FROM app_settings WHERE key IN ('paytm_verification_enabled', 'auto_close_inactive_tickets', 'premium_message_mode')"
+      "SELECT key, value FROM app_settings WHERE key IN ('paytm_verification_enabled', 'auto_close_inactive_tickets', 'auto_close_minutes', 'premium_message_mode')"
     );
 
     const settings = {
       paytm_verification_enabled: false,
       auto_close_inactive_tickets: true,
+      auto_close_minutes: 5,
       premium_message_mode: true,
     };
 
     for (const row of result.rows) {
-      settings[row.key] = row.value === "true";
+      settings[row.key] = row.key === "auto_close_minutes" ? Number(row.value) || 5 : row.value === "true";
     }
 
     global.botSettings = { ...global.botSettings, ...settings };
@@ -1843,7 +1941,7 @@ app.get("/admin/settings", auth, async (req, res) => {
 
 app.post("/admin/settings", auth, async (req, res) => {
   try {
-    const { paytm_verification_enabled, auto_close_inactive_tickets, premium_message_mode } = req.body || {};
+    const { paytm_verification_enabled, auto_close_inactive_tickets, auto_close_minutes, premium_message_mode } = req.body || {};
 
     if (typeof paytm_verification_enabled !== "undefined") {
       await savePaytmSettingToDb(paytm_verification_enabled);
@@ -1853,6 +1951,14 @@ app.post("/admin/settings", auth, async (req, res) => {
       await saveBotSetting("auto_close_inactive_tickets", auto_close_inactive_tickets);
     }
 
+    if (typeof auto_close_minutes !== "undefined") {
+      const minutes = Number(auto_close_minutes);
+      if (!Number.isFinite(minutes) || minutes < 1 || minutes > 1440) {
+        return res.status(400).json({ error: "Auto-close time must be between 1 and 1440 minutes" });
+      }
+      await saveBotSetting("auto_close_minutes", Math.round(minutes));
+    }
+
     if (typeof premium_message_mode !== "undefined") {
       await saveBotSetting("premium_message_mode", premium_message_mode);
     }
@@ -1860,6 +1966,7 @@ app.post("/admin/settings", auth, async (req, res) => {
     const settings = {
       paytm_verification_enabled: Boolean(global.botSettings?.paytm_verification_enabled),
       auto_close_inactive_tickets: Boolean(global.botSettings?.auto_close_inactive_tickets),
+      auto_close_minutes: Number(global.botSettings?.auto_close_minutes) || 5,
       premium_message_mode: Boolean(global.botSettings?.premium_message_mode),
     };
 
@@ -1944,6 +2051,64 @@ app.post("/admin/release", auth, async (req, res) => {
     res.json({ success: true, ticket: result.rows[0] || null });
   } catch (err) {
     console.log("RELEASE ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.patch("/admin/tickets/:id", auth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { priority, assigned_to, admin_notes } = req.body || {};
+    const fields = {};
+
+    if (typeof priority !== "undefined") {
+      if (!["low", "normal", "high", "urgent"].includes(priority)) {
+        return res.status(400).json({ error: "Invalid priority" });
+      }
+      fields.priority = priority;
+    }
+    if (typeof assigned_to !== "undefined") fields.assigned_to = String(assigned_to || "").trim() || null;
+    if (typeof admin_notes !== "undefined") fields.admin_notes = String(admin_notes || "").trim();
+
+    const keys = Object.keys(fields);
+    if (!keys.length) return res.status(400).json({ error: "No fields to update" });
+
+    const values = keys.map((key) => fields[key]);
+    const setQuery = keys.map((key, index) => `${key}=$${index + 1}`).join(", ");
+    const result = await db.query(
+      `UPDATE tickets SET ${setQuery}, updated_at=NOW() WHERE id=$${keys.length + 1} RETURNING *`,
+      [...values, id]
+    );
+
+    if (!result.rows.length) return res.status(404).json({ error: "Ticket not found" });
+    res.json({ success: true, ticket: result.rows[0] });
+  } catch (err) {
+    console.log("TICKET UPDATE ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.post("/admin/tickets/:id/reopen", auth, async (req, res) => {
+  try {
+    const result = await db.query(
+      `UPDATE tickets
+       SET status='OPEN', state='MENU', takeover=false, reopened_at=NOW(), updated_at=NOW()
+       WHERE id=$1
+       RETURNING *`,
+      [req.params.id]
+    );
+
+    if (!result.rows.length) return res.status(404).json({ error: "Ticket not found" });
+
+    let phone = result.rows[0].phone;
+    if (phone && !phone.startsWith("91")) phone = "91" + phone;
+    if (phone) {
+      await sendWhatsApp(phone, "Your support request has been reopened. Please reply with the information requested to continue.");
+    }
+
+    res.json({ success: true, ticket: result.rows[0] });
+  } catch (err) {
+    console.log("REOPEN ERROR:", err.message);
     res.status(500).json({ error: "Server error" });
   }
 });
@@ -2208,6 +2373,8 @@ app.get("/", (req, res) => {
     START SERVER
 ========================================================= */
 const PORT = process.env.PORT || 3000;
+
+loadBotSettingsFromDb();
 
 setInterval(() => {
   autoCloseInactiveTickets();
