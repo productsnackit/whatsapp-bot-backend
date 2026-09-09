@@ -16,14 +16,15 @@ export async function sendWhatsApp(to, message) {
       },
     };
 
-    await axios.post(url, data, {
-      headers: {
-        Authorization: `Bearer ${WHATSAPP_TOKEN}`,
-        "Content-Type": "application/json",
-      },
-    });
+    const response = await axios.post(url, data, {
+  headers: {
+    Authorization: `Bearer ${WHATSAPP_TOKEN}`,
+    "Content-Type": "application/json",
+  },
+});
 
-    console.log("✅ WhatsApp sent to:", to);
+console.log("✅ WhatsApp Meta response:", response.data);
+console.log("✅ WhatsApp sent to:", to);
   } catch (err) {
     console.log("❌ WhatsApp send error:", err.response?.data || err.message);
   }
