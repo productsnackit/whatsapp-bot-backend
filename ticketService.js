@@ -139,7 +139,8 @@ export async function getOrCreateTicket(phone) {
     `SELECT * FROM tickets 
      WHERE phone = $1 
      AND state NOT IN ('DONE', 'CLOSED') 
-     LIMIT 1`,
+      ORDER BY takeover DESC, updated_at DESC NULLS LAST, id DESC
+      LIMIT 1`,
     [phone]
   );
 

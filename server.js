@@ -2025,13 +2025,19 @@ app.post("/admin/send", auth, async (req, res) => {
 
 app.post("/admin/takeover", auth, async (req, res) => {
   try {
-    const { phone } = req.body;
+    const { phone, ticketId } = req.body || {};
 
-    await updateTicketByPhone(phone, {
-      takeover: true,
-    });
+    if (!phone && !ticketId) return res.status(400).json({ error: "Phone or ticket ID is required" });
 
-    const result = await db.query("SELECT * FROM tickets WHERE phone=$1", [phone]);
+    if (ticketId) {
+      await updateTicket(ticketId, { takeover: true, status: "OPEN" });
+    } else {
+      await updateTicketByPhone(phone, { takeover: true, status: "OPEN" });
+    }
+
+    const result = ticketId
+      ? await db.query("SELECT * FROM tickets WHERE id=$1", [ticketId])
+      : await db.query("SELECT * FROM tickets WHERE phone=$1 ORDER BY updated_at DESC LIMIT 1", [phone]);
     res.json({ success: true, ticket: result.rows[0] || null });
   } catch (err) {
     console.log("TAKEOVER ERROR:", err.message);
@@ -2041,13 +2047,19 @@ app.post("/admin/takeover", auth, async (req, res) => {
 
 app.post("/admin/release", auth, async (req, res) => {
   try {
-    const { phone } = req.body;
+    const { phone, ticketId } = req.body || {};
 
-    await updateTicketByPhone(phone, {
-      takeover: false,
-    });
+    if (!phone && !ticketId) return res.status(400).json({ error: "Phone or ticket ID is required" });
 
-    const result = await db.query("SELECT * FROM tickets WHERE phone=$1", [phone]);
+    if (ticketId) {
+      await updateTicket(ticketId, { takeover: false });
+    } else {
+      await updateTicketByPhone(phone, { takeover: false });
+    }
+
+    const result = ticketId
+      ? await db.query("SELECT * FROM tickets WHERE id=$1", [ticketId])
+      : await db.query("SELECT * FROM tickets WHERE phone=$1 ORDER BY updated_at DESC LIMIT 1", [phone]);
     res.json({ success: true, ticket: result.rows[0] || null });
   } catch (err) {
     console.log("RELEASE ERROR:", err.message);
@@ -2323,7 +2335,7 @@ app.post("/webhook", async (req, res) => {
       return res.sendStatus(200);
     }
 
-    await saveMessageByPhone(from, "user", text || "[media]");
+    await saveMessage(ticket.id, "user", text || "[media]");
 
     await processMessage({
       ticketId: ticket.id,

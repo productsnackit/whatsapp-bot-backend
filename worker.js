@@ -151,6 +151,11 @@ const worker = new Worker(
 
       const ticket = res.rows[0];
 
+      if (ticket.takeover === true || ticket.takeover === "true") {
+        console.log("Admin takeover active; skipping bot response for ticket", ticketId);
+        return;
+      }
+
       let state = ticket?.state || "START";
       let category = ticket?.category || null;
       let subIssue = ticket?.sub_issue || null;
