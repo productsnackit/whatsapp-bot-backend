@@ -32,6 +32,89 @@ if (!global.adminTakeover) global.adminTakeover = {};
 if (!global.retryCount) global.retryCount = {}; // Track retry attempts
 if (!global.paytmVerificationAttempts) global.paytmVerificationAttempts = {}; // Paytm retry tracking
 
+if (!global.botSettings) {
+  global.botSettings = {
+    paytm_verification_enabled: process.env.PAYTM_VERIFICATION_ENABLED === "true",
+    auto_close_inactive_tickets: true,
+    premium_message_mode: true,
+  };
+}
+
+async function ensurePaytmSettingTable() {
+  try {
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS app_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+  } catch (err) {
+    console.log("APP SETTINGS TABLE ERROR:", err.message);
+  }
+}
+
+async function loadPaytmSettingFromDb() {
+  try {
+    await ensurePaytmSettingTable();
+    const result = await db.query(
+      "SELECT value FROM app_settings WHERE key = 'paytm_verification_enabled'"
+    );
+
+    if (result.rows.length > 0) {
+      global.paytmVerificationEnabled = result.rows[0].value === "true";
+    } else {
+      await db.query(
+        "INSERT INTO app_settings (key, value, updated_at) VALUES ($1, $2, NOW()) ON CONFLICT (key) DO NOTHING",
+        ["paytm_verification_enabled", String(Boolean(global.paytmVerificationEnabled))]
+      );
+    }
+  } catch (err) {
+    console.log("LOAD PAYTM SETTING ERROR:", err.message);
+  }
+}
+
+async function savePaytmSettingToDb(enabled) {
+  try {
+    await ensurePaytmSettingTable();
+    global.botSettings.paytm_verification_enabled = Boolean(enabled);
+
+    await db.query(
+      `INSERT INTO app_settings (key, value, updated_at)
+       VALUES ('paytm_verification_enabled', $1, NOW())
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+      [String(global.botSettings.paytm_verification_enabled)]
+    );
+  } catch (err) {
+    console.log("SAVE PAYTM SETTING ERROR:", err.message);
+  }
+}
+
+async function saveBotSetting(key, value) {
+  try {
+    await ensurePaytmSettingTable();
+    global.botSettings[key] = Boolean(value);
+
+    await db.query(
+      `INSERT INTO app_settings (key, value, updated_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+      [key, String(global.botSettings[key])]
+    );
+  } catch (err) {
+    console.log("SAVE BOT SETTING ERROR:", err.message);
+  }
+}
+
+function premiumMessage(text) {
+  return String(text || "").replace(/[❌✅💳💸🔒📸⚠️📍🔄⏳📦📷🚫💰]/g, "").replace(/\s{2,}/g, " ").trim();
+}
+
+async function sendPremiumWhatsApp(phone, message) {
+  const finalText = global.botSettings?.premium_message_mode === false ? String(message || "") : premiumMessage(message);
+  return sendWhatsApp(phone, finalText);
+}
+
 /* ================= AUTH CONFIG ================= */
 const SECRET_TOKEN = "mysecrettoken123";
 const ADMIN_USER = "admin";
@@ -206,7 +289,7 @@ const AUTO_CLOSE_TICKET_MINUTES = 5; // Auto-close after 5 minutes of inactivity
 
 function isPaytmVerificationEnabled() {
   return (
-    process.env.PAYTM_VERIFICATION_ENABLED === "true" &&
+    Boolean(global.botSettings?.paytm_verification_enabled) &&
     Boolean(process.env.PAYTM_MERCHANT_ID) &&
     Boolean(process.env.PAYTM_MERCHANT_KEY)
   );
@@ -224,7 +307,7 @@ async function closeInactiveTicket(ticket) {
     const closeMessage =
       "🔒 *Ticket Closed*\n\nNo response was received from your side, so this ticket has been automatically closed.\n\nFor new issues, Type 1.";
 
-    await sendWhatsApp(phone, closeMessage);
+    await sendPremiumWhatsApp(phone, closeMessage);
 
     await db.query(
       "UPDATE tickets SET status='auto_closed', state='CLOSED', updated_at=NOW() WHERE id=$1",
@@ -1729,6 +1812,87 @@ app.post("/ticket/action", auth, async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     console.log("❌ ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.get("/admin/settings", auth, async (req, res) => {
+  try {
+    await ensurePaytmSettingTable();
+    const result = await db.query(
+      "SELECT key, value FROM app_settings WHERE key IN ('paytm_verification_enabled', 'auto_close_inactive_tickets', 'premium_message_mode')"
+    );
+
+    const settings = {
+      paytm_verification_enabled: false,
+      auto_close_inactive_tickets: true,
+      premium_message_mode: true,
+    };
+
+    for (const row of result.rows) {
+      settings[row.key] = row.value === "true";
+    }
+
+    global.botSettings = { ...global.botSettings, ...settings };
+    res.json(settings);
+  } catch (err) {
+    console.log("GET SETTINGS ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.post("/admin/settings", auth, async (req, res) => {
+  try {
+    const { paytm_verification_enabled, auto_close_inactive_tickets, premium_message_mode } = req.body || {};
+
+    if (typeof paytm_verification_enabled !== "undefined") {
+      await savePaytmSettingToDb(paytm_verification_enabled);
+    }
+
+    if (typeof auto_close_inactive_tickets !== "undefined") {
+      await saveBotSetting("auto_close_inactive_tickets", auto_close_inactive_tickets);
+    }
+
+    if (typeof premium_message_mode !== "undefined") {
+      await saveBotSetting("premium_message_mode", premium_message_mode);
+    }
+
+    const settings = {
+      paytm_verification_enabled: Boolean(global.botSettings?.paytm_verification_enabled),
+      auto_close_inactive_tickets: Boolean(global.botSettings?.auto_close_inactive_tickets),
+      premium_message_mode: Boolean(global.botSettings?.premium_message_mode),
+    };
+
+    res.json(settings);
+  } catch (err) {
+    console.log("UPDATE SETTINGS ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.get("/admin/paytm-setting", auth, async (req, res) => {
+  try {
+    const result = await db.query(
+      "SELECT value FROM app_settings WHERE key = 'paytm_verification_enabled'"
+    );
+
+    const enabled = result.rows[0]?.value === "true";
+    global.botSettings.paytm_verification_enabled = enabled;
+
+    res.json({ enabled });
+  } catch (err) {
+    console.log("PAYTM SETTING GET ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.post("/admin/paytm-setting", auth, async (req, res) => {
+  try {
+    const { enabled } = req.body;
+    await savePaytmSettingToDb(enabled);
+    res.json({ enabled: Boolean(global.botSettings?.paytm_verification_enabled) });
+  } catch (err) {
+    console.log("PAYTM SETTING UPDATE ERROR:", err.message);
     res.status(500).json({ error: "Server error" });
   }
 });
