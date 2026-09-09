@@ -43,7 +43,11 @@ export async function verifyPaymentOnPaytm(orderId) {
   try {
     if (!PAYTM_MERCHANT_ID || !PAYTM_MERCHANT_KEY) {
       console.log("⚠️ Paytm credentials not configured");
-      return { status: "UNKNOWN", message: "API not configured" };
+      return {
+        status: "DISABLED",
+        verified: false,
+        message: "Payment verification is disabled",
+      };
     }
 
     const data = {

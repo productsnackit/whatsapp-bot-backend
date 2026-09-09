@@ -204,6 +204,14 @@ const FINAL_MSG = "✅ Ticket has been raised, we will process your concern soon
 const MAX_RETRIES = 3;
 const AUTO_CLOSE_TICKET_MINUTES = 5; // Auto-close after 5 minutes of inactivity
 
+function isPaytmVerificationEnabled() {
+  return (
+    process.env.PAYTM_VERIFICATION_ENABLED === "true" &&
+    Boolean(process.env.PAYTM_MERCHANT_ID) &&
+    Boolean(process.env.PAYTM_MERCHANT_KEY)
+  );
+}
+
 async function closeInactiveTicket(ticket) {
   try {
     if (!ticket || !ticket.phone) return;
@@ -219,7 +227,7 @@ async function closeInactiveTicket(ticket) {
     await sendWhatsApp(phone, closeMessage);
 
     await db.query(
-      "UPDATE tickets SET status='closed', state='CLOSED', updated_at=NOW() WHERE id=$1",
+      "UPDATE tickets SET status='auto_closed', state='CLOSED', updated_at=NOW() WHERE id=$1",
       [ticket.id]
     );
 
@@ -569,6 +577,38 @@ Example: "1234567890566654" or "UTR123456789ABC"`
         if (state === "STEP2") {
           const retryKey = getRetryKey(ticketId, "STEP2_UPI");
 
+          const transactionId = text.trim();
+
+          if (!transactionId) {
+            return sendWhatsApp(
+              from,
+              `❌ Please enter a valid transaction ID.`
+            );
+          }
+
+          if (!isPaytmVerificationEnabled()) {
+            resetRetry(retryKey);
+            await updateTicket(ticketId, {
+              upi_id: transactionId,
+              transaction_verified: false,
+              state: "STEP3",
+            });
+
+            return sendWhatsApp(
+              from,
+              `✅ *Transaction ID received!*
+
+📸 *SEND UPI TRANSACTION SCREENSHOT*
+
+Please send a screenshot of the transaction from your payment app.
+
+⚠️ Make sure:
+✓ Screenshot shows date & time
+✓ Transaction amount is visible
+✓ Status is clear`
+            );
+          }
+
           // Check if it's alphabetic only
           if (isAlphabetOnly(text)) {
             incrementRetry(retryKey);
@@ -611,7 +651,28 @@ Example: "UTR123456789ABC" or "1234567890"`
 
           // ========== 🔥 PAYTM VERIFICATION STARTS HERE ==========
           resetRetry(retryKey);
-          const transactionId = text.trim();
+
+          if (!isPaytmVerificationEnabled()) {
+            await updateTicket(ticketId, {
+              upi_id: transactionId,
+              transaction_verified: false,
+              state: "STEP3",
+            });
+
+            return sendWhatsApp(
+              from,
+              `✅ *Transaction ID received!*
+
+📸 *SEND UPI TRANSACTION SCREENSHOT*
+
+Please send a screenshot of the transaction from your payment app.
+
+⚠️ Make sure:
+✓ Screenshot shows date & time
+✓ Transaction amount is visible
+✓ Status is clear`
+            );
+          }
 
           // Send "Verifying..." message
           await sendWhatsApp(
