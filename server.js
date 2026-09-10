@@ -2638,6 +2638,10 @@ app.post("/internal/chats", auth, (req, res) => {
 
 app.post("/internal/chats/:id/messages", auth, (req, res) => {
   try {
+    if (!Array.isArray(global.internalChats)) global.internalChats = [];
+    if (!Array.isArray(global.internalUsers)) global.internalUsers = [];
+    if (!Array.isArray(global.internalNotifications)) global.internalNotifications = [];
+
     const { id } = req.params;
     const { sender, text, tag, priority, sourceUser } = req.body || {};
     const attachments = Array.isArray(req.body?.attachments) ? req.body.attachments : [];
@@ -2717,8 +2721,8 @@ app.post("/internal/chats/:id/messages", auth, (req, res) => {
 
     res.json({ success: true, chat, notification });
   } catch (err) {
-    console.log("CREATE INTERNAL MESSAGE ERROR:", err.message);
-    res.status(500).json({ error: "Server error" });
+    console.error("CREATE INTERNAL MESSAGE ERROR:", err.stack || err.message);
+    res.status(500).json({ error: `Message could not be sent: ${err.message}` });
   }
 });
 
