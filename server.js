@@ -63,6 +63,10 @@ if (!global.internalUsers) {
   global.internalUsers = [];
 }
 
+if (!global.internalSessions) {
+  global.internalSessions = new Map();
+}
+
 if (!global.internalChats) {
   global.internalChats = [];
 }
@@ -1752,11 +1756,20 @@ function auth(req, res, next) {
       return res.status(401).json({ error: "Session expired" });
     }
 
-    if (token !== SECRET_TOKEN) {
-      return res.status(401).json({ error: "Invalid token" });
+    if (token === SECRET_TOKEN) {
+      req.user = { role: "admin", username: ADMIN_USER };
+      return next();
     }
 
-    next();
+    const employee = global.internalSessions.get(token);
+    if (!employee) return res.status(401).json({ error: "Invalid token" });
+
+    if (!req.path.startsWith("/internal/")) {
+      return res.status(403).json({ error: "Internal chat access only" });
+    }
+
+    req.user = { ...employee, role: "employee" };
+    return next();
   } catch (err) {
     console.log("AUTH ERROR:", err.message);
     res.status(500).json({ error: "Auth failure" });
@@ -1771,7 +1784,14 @@ app.post("/login", (req, res) => {
     const { username, password } = req.body;
 
     if (username === ADMIN_USER && password === ADMIN_PASS) {
-      return res.json({ token: SECRET_TOKEN });
+      return res.json({ token: SECRET_TOKEN, role: "admin", username: ADMIN_USER });
+    }
+
+    const employee = global.internalUsers.find((user) => user.username === String(username).trim());
+    if (employee && employee.password === password) {
+      const token = `employee-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      global.internalSessions.set(token, { userId: employee.id, username: employee.username, name: employee.name, department: employee.department });
+      return res.json({ token, role: "employee", username: employee.username, name: employee.name, department: employee.department });
     }
 
     res.status(401).json({ error: "Invalid credentials" });
@@ -2428,7 +2448,10 @@ app.get("/admin/messages/:ticketId", auth, async (req, res) => {
 
 app.get("/internal/users", auth, (req, res) => {
   try {
-    res.json(global.internalUsers);
+    const users = req.user?.role === "admin"
+      ? global.internalUsers
+      : global.internalUsers.filter((user) => user.department === req.user.department);
+    res.json(users);
   } catch (err) {
     console.log("INTERNAL USERS ERROR:", err.message);
     res.status(500).json({ error: "Server error" });
@@ -2437,6 +2460,7 @@ app.get("/internal/users", auth, (req, res) => {
 
 app.delete("/internal/users/:id", auth, (req, res) => {
   try {
+    if (req.user?.role !== "admin") return res.status(403).json({ error: "Admin access required" });
     const { id } = req.params;
     global.internalUsers = global.internalUsers.filter((user) => String(user.id) !== String(id));
     io.emit("internal-user-updated", { removedUserId: id });
@@ -2449,14 +2473,26 @@ app.delete("/internal/users/:id", auth, (req, res) => {
 
 app.post("/internal/users", auth, (req, res) => {
   try {
+    if (req.user?.role !== "admin") return res.status(403).json({ error: "Admin access required" });
     const { name, department, role, tags, isAdmin } = req.body || {};
 
     if (!name || !department || !role) {
       return res.status(400).json({ error: "Name, department and role are required" });
     }
 
+    const baseUsername = String(name).trim().toLowerCase().replace(/[^a-z0-9]+/g, ".").replace(/^\.|\.$/g, "") || "employee";
+    let username = baseUsername;
+    let suffix = 2;
+    while (global.internalUsers.some((user) => user.username === username)) {
+      username = `${baseUsername}${suffix}`;
+      suffix += 1;
+    }
+    const generatedPassword = `Snackit@${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
+
     const nextUser = {
       id: Date.now() + Math.random(),
+      username,
+      password: generatedPassword,
       name: String(name).trim(),
       department: String(department).trim(),
       role: String(role).trim(),
@@ -2466,7 +2502,7 @@ app.post("/internal/users", auth, (req, res) => {
 
     global.internalUsers.push(nextUser);
     io.emit("internal-user-updated", { user: nextUser });
-    res.json({ success: true, user: nextUser });
+    res.json({ success: true, user: nextUser, credentials: { username, password: generatedPassword } });
   } catch (err) {
     console.log("CREATE INTERNAL USER ERROR:", err.message);
     res.status(500).json({ error: "Server error" });
@@ -2475,7 +2511,10 @@ app.post("/internal/users", auth, (req, res) => {
 
 app.get("/internal/chats", auth, (req, res) => {
   try {
-    res.json(global.internalChats);
+    const chats = req.user?.role === "admin"
+      ? global.internalChats
+      : global.internalChats.filter((chat) => chat.department === req.user.department);
+    res.json(chats);
   } catch (err) {
     console.log("INTERNAL CHATS ERROR:", err.message);
     res.status(500).json({ error: "Server error" });
@@ -2497,6 +2536,10 @@ app.delete("/internal/chats/:id", auth, (req, res) => {
 app.post("/internal/chats", auth, (req, res) => {
   try {
     const { department, title, priority, participants } = req.body || {};
+
+    if (req.user?.role === "employee" && department !== req.user.department) {
+      return res.status(403).json({ error: "You can only use your department chat" });
+    }
 
     if (!department || !title) {
       return res.status(400).json({ error: "Department and title are required" });
@@ -2553,6 +2596,10 @@ app.post("/internal/chats/:id/messages", auth, (req, res) => {
         messages: [],
       };
       global.internalChats.unshift(chat);
+    }
+
+    if (req.user?.role === "employee" && chat.department !== req.user.department) {
+      return res.status(403).json({ error: "You can only message your department chat" });
     }
 
     const cleanText = String(text || "").trim();
