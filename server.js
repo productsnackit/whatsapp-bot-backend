@@ -32,6 +32,16 @@ const io = new Server(httpServer, {
 app.use(cors());
 app.use(express.json({ limit: "25mb" }));
 
+app.use((err, req, res, next) => {
+  if (err?.type === "entity.too.large") {
+    return res.status(413).json({ error: "Attachments are too large. Please send smaller files." });
+  }
+  if (err instanceof SyntaxError && err.status === 400 && err.body) {
+    return res.status(400).json({ error: "Invalid request data. Please try the attachment again." });
+  }
+  return next(err);
+});
+
 io.on("connection", (socket) => {
   socket.on("join-internal-room", ({ department }) => {
     if (department) {
