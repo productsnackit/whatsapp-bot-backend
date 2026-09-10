@@ -60,66 +60,11 @@ if (!global.botSettings) {
 }
 
 if (!global.internalUsers) {
-  global.internalUsers = [
-    { id: 1, name: "Aisha Khan", department: "Accounts", role: "Manager", tags: ["finance", "audit"], isAdmin: true },
-    { id: 2, name: "Rohit Nair", department: "Product", role: "Lead", tags: ["product", "roadmap"], isAdmin: true },
-    { id: 3, name: "Nandini Rao", department: "Audit", role: "Compliance", tags: ["audit", "risk"], isAdmin: true },
-    { id: 4, name: "Vikram Singh", department: "Technical", role: "Engineer", tags: ["backend", "api"], isAdmin: true },
-    { id: 5, name: "Priya Shah", department: "Orders", role: "Ops", tags: ["shipping", "dispatch"], isAdmin: true },
-    { id: 6, name: "Rahul Verma", department: "Accounts", role: "Analyst", tags: ["finance", "reconciliation"], isAdmin: false },
-    { id: 7, name: "Mehul Das", department: "Product", role: "Designer", tags: ["product", "ux"], isAdmin: false },
-    { id: 8, name: "Tanya Iyer", department: "Technical", role: "QA", tags: ["testing", "api"], isAdmin: false },
-  ];
+  global.internalUsers = [];
 }
 
 if (!global.internalChats) {
-  global.internalChats = [
-    {
-      id: 1,
-      department: "Accounts",
-      title: "Invoice follow-up",
-      priority: "urgent",
-      participants: ["Aisha Khan", "Rahul Verma"],
-      unread: 2,
-      messages: [
-        { id: 1, sender: "Aisha Khan", text: "Need immediate verification for invoice #4021", time: "09:18 AM", tag: "finance" },
-        { id: 2, sender: "Rahul Verma", text: "I have matched the bank proof and will send the final check in 10 min.", time: "09:22 AM", tag: "reconciliation" },
-      ],
-    },
-    {
-      id: 2,
-      department: "Product",
-      title: "Launch checklist",
-      priority: "medium",
-      participants: ["Rohit Nair", "Mehul Das"],
-      unread: 1,
-      messages: [
-        { id: 1, sender: "Rohit Nair", text: "Please confirm the release notes before traffic goes live.", time: "08:55 AM", tag: "product" },
-      ],
-    },
-    {
-      id: 3,
-      department: "Technical",
-      title: "API outage review",
-      priority: "urgent",
-      participants: ["Vikram Singh", "Tanya Iyer"],
-      unread: 3,
-      messages: [
-        { id: 1, sender: "Vikram Singh", text: "The payment callback API is failing with 502 errors.", time: "07:40 AM", tag: "backend" },
-      ],
-    },
-    {
-      id: 4,
-      department: "Orders",
-      title: "Dispatch conflict",
-      priority: "low",
-      participants: ["Priya Shah"],
-      unread: 0,
-      messages: [
-        { id: 1, sender: "Priya Shah", text: "Pending shipments are waiting for warehouse confirmation.", time: "Yesterday", tag: "shipping" },
-      ],
-    },
-  ];
+  global.internalChats = [];
 }
 
 if (!global.internalNotifications) {
@@ -2490,6 +2435,18 @@ app.get("/internal/users", auth, (req, res) => {
   }
 });
 
+app.delete("/internal/users/:id", auth, (req, res) => {
+  try {
+    const { id } = req.params;
+    global.internalUsers = global.internalUsers.filter((user) => String(user.id) !== String(id));
+    io.emit("internal-user-updated", { removedUserId: id });
+    res.json({ success: true });
+  } catch (err) {
+    console.log("DELETE INTERNAL USER ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
 app.post("/internal/users", auth, (req, res) => {
   try {
     const { name, department, role, tags, isAdmin } = req.body || {};
@@ -2521,6 +2478,18 @@ app.get("/internal/chats", auth, (req, res) => {
     res.json(global.internalChats);
   } catch (err) {
     console.log("INTERNAL CHATS ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.delete("/internal/chats/:id", auth, (req, res) => {
+  try {
+    const { id } = req.params;
+    global.internalChats = global.internalChats.filter((chat) => String(chat.id) !== String(id));
+    io.emit("internal-chat-deleted", { chatId: id });
+    res.json({ success: true });
+  } catch (err) {
+    console.log("DELETE INTERNAL CHAT ERROR:", err.message);
     res.status(500).json({ error: "Server error" });
   }
 });
@@ -2568,16 +2537,27 @@ app.post("/internal/chats", auth, (req, res) => {
 app.post("/internal/chats/:id/messages", auth, (req, res) => {
   try {
     const { id } = req.params;
-    const { sender, text, tag, priority, sourceUser } = req.body || {};
+    const { sender, text, tag, priority, sourceUser, attachments = [], recipientIds = [] } = req.body || {};
 
-    const chat = global.internalChats.find((item) => String(item.id) === String(id));
+    let chat = global.internalChats.find((item) => String(item.id) === String(id));
+
     if (!chat) {
-      return res.status(404).json({ error: "Chat not found" });
+      const fallbackDepartment = "Accounts";
+      chat = {
+        id: Number(id),
+        department: fallbackDepartment,
+        title: `${fallbackDepartment} chat`,
+        priority: "medium",
+        participants: [],
+        unread: 0,
+        messages: [],
+      };
+      global.internalChats.unshift(chat);
     }
 
     const cleanText = String(text || "").trim();
-    if (!cleanText) {
-      return res.status(400).json({ error: "Message text is required" });
+    if (!cleanText && !attachments.length) {
+      return res.status(400).json({ error: "Message text or attachment is required" });
     }
 
     const message = {
@@ -2586,13 +2566,21 @@ app.post("/internal/chats/:id/messages", auth, (req, res) => {
       text: cleanText,
       time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
       tag: tag || "general",
+      priority: ["low", "medium", "urgent"].includes(priority) ? priority : chat.priority || "medium",
+      attachments: Array.isArray(attachments) ? attachments : [],
+      recipientIds: Array.isArray(recipientIds) ? recipientIds : [],
     };
 
     chat.messages.push(message);
     chat.unread = 0;
-    chat.priority = ["low", "medium", "urgent"].includes(priority) ? priority : chat.priority;
+    chat.priority = message.priority;
+    chat.participants = Array.from(new Set([
+      ...chat.participants,
+      ...(recipientIds || []),
+      sender || "Admin",
+    ]));
 
-    const relatedUsers = global.internalUsers.filter((user) => user.department === chat.department || (tag && user.tags.includes(tag)));
+    const relatedUsers = global.internalUsers.filter((user) => user.department === chat.department || (recipientIds || []).includes(String(user.id)));
     const targetUsers = relatedUsers.map((user) => user.name);
 
     const notification = addInternalNotification({
@@ -2600,7 +2588,7 @@ app.post("/internal/chats/:id/messages", auth, (req, res) => {
       priority: chat.priority,
       title: chat.title,
       targetUsers,
-      message: cleanText,
+      message: cleanText || `Attachment sent (${attachments.length})`,
       sourceUser: sourceUser || sender || "Admin",
     });
 
