@@ -2902,7 +2902,7 @@ app.get("/internal/notifications", auth, (req, res) => {
 ========================================================= */
 app.get("/", (req, res) => {
   res.send("Snackit backend running");
-});logo
+});
 
 /* =========================================================
     START SERVER
@@ -2917,4 +2917,4 @@ setInterval(() => {
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(` Server running on port ${PORT}`);
-});1234
+});
