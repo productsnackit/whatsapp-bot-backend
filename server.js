@@ -38,6 +38,10 @@ io.on("connection", (socket) => {
       socket.join(department);
     }
   });
+
+  socket.on("join-internal-user", ({ userId }) => {
+    if (userId) socket.join(`internal-user-${String(userId)}`);
+  });
 });
 
 /* ================= FIX: SERVE UPLOADS ================= */
@@ -2691,8 +2695,15 @@ app.post("/internal/chats/:id/messages", auth, (req, res) => {
       sourceUser: sourceUser || sender || "Admin",
     });
 
-    io.to(chat.department).emit("internal-chat-updated", { chat, notification });
-    io.emit("internal-notification", notification);
+    if (recipientIds.length) {
+      recipientIds.forEach((userId) => {
+        io.to(`internal-user-${String(userId)}`).emit("internal-chat-updated", { chat, notification });
+        io.to(`internal-user-${String(userId)}`).emit("internal-notification", notification);
+      });
+    } else {
+      io.to(chat.department).emit("internal-chat-updated", { chat, notification });
+      io.to(chat.department).emit("internal-notification", notification);
+    }
 
     res.json({ success: true, chat, notification });
   } catch (err) {
