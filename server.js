@@ -2739,9 +2739,10 @@ app.post("/internal/chats/:id/messages", auth, (req, res) => {
       return res.status(400).json({ error: "Message text or attachment is required" });
     }
 
+    const senderName = req.user?.role === "admin" ? "Admin" : (req.user?.name || sender || "Employee");
     const message = {
       id: Date.now() + Math.random(),
-      sender: sender || "Admin",
+      sender: senderName,
       text: cleanText,
       time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
       tag: tag || null,
@@ -2774,7 +2775,7 @@ app.post("/internal/chats/:id/messages", auth, (req, res) => {
     chat.participants = Array.from(new Set([
       ...chat.participants,
       ...recipientIds,
-      sender || "Admin",
+      senderName,
     ]));
 
     const relatedUsers = global.internalUsers.filter((user) => user.department === chat.department || recipientIds.includes(String(user.id)));
@@ -2788,6 +2789,9 @@ app.post("/internal/chats/:id/messages", auth, (req, res) => {
       message: cleanText || `Attachment sent (${attachments.length})`,
       sourceUser: sourceUser || sender || "Admin",
     });
+    notification.mentionUserIds = message.mentions;
+    notification.recipientIds = recipientIds.map(String);
+    notification.notifyAll = req.body?.notifyAll === true;
 
     if (recipientIds.length) {
       recipientIds.forEach((userId) => {
