@@ -187,11 +187,13 @@ async function loadBotSettingsFromDb() {
     await ensurePaytmSettingTable();
     await ensureSupportColumns();
     const result = await db.query(
-      "SELECT key, value FROM app_settings WHERE key IN ('paytm_verification_enabled', 'auto_close_inactive_tickets', 'auto_close_minutes', 'premium_message_mode')"
+      "SELECT key, value FROM app_settings WHERE key IN ('paytm_verification_enabled', 'auto_close_inactive_tickets', 'auto_close_minutes', 'premium_message_mode', 'admin_logo')"
     );
 
     for (const row of result.rows) {
-      if (row.key === "auto_close_minutes") {
+      if (row.key === "admin_logo") {
+        global.botSettings.admin_logo = row.value;
+      } else if (row.key === "auto_close_minutes") {
         const minutes = Number(row.value);
         if (Number.isFinite(minutes) && minutes >= 1 && minutes <= 1440) {
           global.botSettings.auto_close_minutes = minutes;
@@ -244,7 +246,9 @@ async function savePaytmSettingToDb(enabled) {
 async function saveBotSetting(key, value) {
   try {
     await ensurePaytmSettingTable();
-    global.botSettings[key] = key === "auto_close_minutes" ? Number(value) : Boolean(value);
+    global.botSettings[key] = key === "auto_close_minutes"
+      ? Number(value)
+      : key === "admin_logo" ? String(value || "") : Boolean(value);
 
     await db.query(
       `INSERT INTO app_settings (key, value, updated_at)
@@ -2044,7 +2048,7 @@ app.get("/admin/settings", auth, async (req, res) => {
   try {
     await ensurePaytmSettingTable();
     const result = await db.query(
-      "SELECT key, value FROM app_settings WHERE key IN ('paytm_verification_enabled', 'auto_close_inactive_tickets', 'auto_close_minutes', 'premium_message_mode')"
+      "SELECT key, value FROM app_settings WHERE key IN ('paytm_verification_enabled', 'auto_close_inactive_tickets', 'auto_close_minutes', 'premium_message_mode', 'admin_logo')"
     );
 
     const settings = {
@@ -2052,10 +2056,13 @@ app.get("/admin/settings", auth, async (req, res) => {
       auto_close_inactive_tickets: true,
       auto_close_minutes: 5,
       premium_message_mode: true,
+      admin_logo: "",
     };
 
     for (const row of result.rows) {
-      settings[row.key] = row.key === "auto_close_minutes" ? Number(row.value) || 5 : row.value === "true";
+      settings[row.key] = row.key === "auto_close_minutes"
+        ? Number(row.value) || 5
+        : row.key === "admin_logo" ? row.value : row.value === "true";
     }
 
     global.botSettings = { ...global.botSettings, ...settings };
@@ -2068,7 +2075,8 @@ app.get("/admin/settings", auth, async (req, res) => {
 
 app.post("/admin/settings", auth, async (req, res) => {
   try {
-    const { paytm_verification_enabled, auto_close_inactive_tickets, auto_close_minutes, premium_message_mode } = req.body || {};
+    if (req.user?.role !== "admin") return res.status(403).json({ error: "Admin access required" });
+    const { paytm_verification_enabled, auto_close_inactive_tickets, auto_close_minutes, premium_message_mode, admin_logo } = req.body || {};
 
     if (typeof paytm_verification_enabled !== "undefined") {
       await savePaytmSettingToDb(paytm_verification_enabled);
@@ -2090,11 +2098,27 @@ app.post("/admin/settings", auth, async (req, res) => {
       await saveBotSetting("premium_message_mode", premium_message_mode);
     }
 
+    if (typeof admin_logo !== "undefined") {
+      const logo = String(admin_logo || "");
+      if (logo && (!logo.startsWith("data:image/") || logo.length > 3_000_000)) {
+        return res.status(400).json({ error: "Logo must be a valid image smaller than 2 MB" });
+      }
+      await ensurePaytmSettingTable();
+      await db.query(
+        `INSERT INTO app_settings (key, value, updated_at)
+         VALUES ($1, $2, NOW())
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+        ["admin_logo", logo]
+      );
+      global.botSettings.admin_logo = logo;
+    }
+
     const settings = {
       paytm_verification_enabled: Boolean(global.botSettings?.paytm_verification_enabled),
       auto_close_inactive_tickets: Boolean(global.botSettings?.auto_close_inactive_tickets),
       auto_close_minutes: Number(global.botSettings?.auto_close_minutes) || 5,
       premium_message_mode: Boolean(global.botSettings?.premium_message_mode),
+      admin_logo: String(global.botSettings?.admin_logo || ""),
     };
 
     res.json(settings);
@@ -2878,7 +2902,7 @@ app.get("/internal/notifications", auth, (req, res) => {
 ========================================================= */
 app.get("/", (req, res) => {
   res.send("Snackit backend running");
-});
+});logo
 
 /* =========================================================
     START SERVER
