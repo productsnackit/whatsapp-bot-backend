@@ -2625,7 +2625,9 @@ app.post("/internal/chats", auth, (req, res) => {
 app.post("/internal/chats/:id/messages", auth, (req, res) => {
   try {
     const { id } = req.params;
-    const { sender, text, tag, priority, sourceUser, attachments = [], recipientIds = [] } = req.body || {};
+    const { sender, text, tag, priority, sourceUser } = req.body || {};
+    const attachments = Array.isArray(req.body?.attachments) ? req.body.attachments : [];
+    const recipientIds = Array.isArray(req.body?.recipientIds) ? req.body.recipientIds : [];
 
     let chat = global.internalChats.find((item) => String(item.id) === String(id));
 
@@ -2643,6 +2645,9 @@ app.post("/internal/chats/:id/messages", auth, (req, res) => {
       global.internalChats.unshift(chat);
     }
 
+    chat.messages = Array.isArray(chat.messages) ? chat.messages : [];
+    chat.participants = Array.isArray(chat.participants) ? chat.participants : [];
+
     const cleanText = String(text || "").trim();
     if (!cleanText && !attachments.length) {
       return res.status(400).json({ error: "Message text or attachment is required" });
@@ -2656,13 +2661,13 @@ app.post("/internal/chats/:id/messages", auth, (req, res) => {
       tag: tag || null,
       priority: ["low", "medium", "urgent"].includes(priority) ? priority : chat.priority || "medium",
       status: "open",
-      attachments: Array.isArray(attachments) ? attachments.map((file) => ({
+      attachments: attachments.map((file) => ({
         name: String(file?.name || "attachment"),
         type: String(file?.type || "application/octet-stream"),
         size: Number(file?.size || 0),
         dataUrl: typeof file?.dataUrl === "string" && file.dataUrl.length <= 8_000_000 ? file.dataUrl : null,
-      })) : [],
-      recipientIds: Array.isArray(recipientIds) ? recipientIds : [],
+      })),
+      recipientIds,
     };
 
     chat.messages.push(message);
@@ -2670,11 +2675,11 @@ app.post("/internal/chats/:id/messages", auth, (req, res) => {
     chat.priority = message.priority;
     chat.participants = Array.from(new Set([
       ...chat.participants,
-      ...(recipientIds || []),
+      ...recipientIds,
       sender || "Admin",
     ]));
 
-    const relatedUsers = global.internalUsers.filter((user) => user.department === chat.department || (recipientIds || []).includes(String(user.id)));
+    const relatedUsers = global.internalUsers.filter((user) => user.department === chat.department || recipientIds.includes(String(user.id)));
     const targetUsers = relatedUsers.map((user) => user.name);
 
     const notification = addInternalNotification({
