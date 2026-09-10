@@ -2,8 +2,10 @@ import "dotenv/config";
 
 /* ================= IMPORTS ================= */
 import express from "express";
+import http from "http";
 import cors from "cors";
 import axios from "axios";
+import { Server } from "socket.io";
 import { v2 as cloudinary } from "cloudinary";
 
 import { getOrCreateTicket, verifyPaymentOnPaytm, storePaytmVerification } from "./ticketService.js";
@@ -19,8 +21,24 @@ cloudinary.config({
 
 /* ================= INIT ================= */
 const app = express();
+const httpServer = http.createServer(app);
+const io = new Server(httpServer, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST", "PATCH", "PUT", "DELETE"],
+  },
+});
+
 app.use(cors());
 app.use(express.json());
+
+io.on("connection", (socket) => {
+  socket.on("join-internal-room", ({ department }) => {
+    if (department) {
+      socket.join(department);
+    }
+  });
+});
 
 /* ================= FIX: SERVE UPLOADS ================= */
 app.use("/uploads", express.static("uploads"));
@@ -39,6 +57,95 @@ if (!global.botSettings) {
     auto_close_minutes: 5,
     premium_message_mode: true,
   };
+}
+
+if (!global.internalUsers) {
+  global.internalUsers = [
+    { id: 1, name: "Aisha Khan", department: "Accounts", role: "Manager", tags: ["finance", "audit"], isAdmin: true },
+    { id: 2, name: "Rohit Nair", department: "Product", role: "Lead", tags: ["product", "roadmap"], isAdmin: true },
+    { id: 3, name: "Nandini Rao", department: "Audit", role: "Compliance", tags: ["audit", "risk"], isAdmin: true },
+    { id: 4, name: "Vikram Singh", department: "Technical", role: "Engineer", tags: ["backend", "api"], isAdmin: true },
+    { id: 5, name: "Priya Shah", department: "Orders", role: "Ops", tags: ["shipping", "dispatch"], isAdmin: true },
+    { id: 6, name: "Rahul Verma", department: "Accounts", role: "Analyst", tags: ["finance", "reconciliation"], isAdmin: false },
+    { id: 7, name: "Mehul Das", department: "Product", role: "Designer", tags: ["product", "ux"], isAdmin: false },
+    { id: 8, name: "Tanya Iyer", department: "Technical", role: "QA", tags: ["testing", "api"], isAdmin: false },
+  ];
+}
+
+if (!global.internalChats) {
+  global.internalChats = [
+    {
+      id: 1,
+      department: "Accounts",
+      title: "Invoice follow-up",
+      priority: "urgent",
+      participants: ["Aisha Khan", "Rahul Verma"],
+      unread: 2,
+      messages: [
+        { id: 1, sender: "Aisha Khan", text: "Need immediate verification for invoice #4021", time: "09:18 AM", tag: "finance" },
+        { id: 2, sender: "Rahul Verma", text: "I have matched the bank proof and will send the final check in 10 min.", time: "09:22 AM", tag: "reconciliation" },
+      ],
+    },
+    {
+      id: 2,
+      department: "Product",
+      title: "Launch checklist",
+      priority: "medium",
+      participants: ["Rohit Nair", "Mehul Das"],
+      unread: 1,
+      messages: [
+        { id: 1, sender: "Rohit Nair", text: "Please confirm the release notes before traffic goes live.", time: "08:55 AM", tag: "product" },
+      ],
+    },
+    {
+      id: 3,
+      department: "Technical",
+      title: "API outage review",
+      priority: "urgent",
+      participants: ["Vikram Singh", "Tanya Iyer"],
+      unread: 3,
+      messages: [
+        { id: 1, sender: "Vikram Singh", text: "The payment callback API is failing with 502 errors.", time: "07:40 AM", tag: "backend" },
+      ],
+    },
+    {
+      id: 4,
+      department: "Orders",
+      title: "Dispatch conflict",
+      priority: "low",
+      participants: ["Priya Shah"],
+      unread: 0,
+      messages: [
+        { id: 1, sender: "Priya Shah", text: "Pending shipments are waiting for warehouse confirmation.", time: "Yesterday", tag: "shipping" },
+      ],
+    },
+  ];
+}
+
+if (!global.internalNotifications) {
+  global.internalNotifications = [];
+}
+
+function getInternalTagList(tags) {
+  return Array.isArray(tags)
+    ? tags.map((tag) => String(tag).trim()).filter(Boolean).filter((tag, index, arr) => arr.indexOf(tag) === index)
+    : [];
+}
+
+function addInternalNotification({ department, priority, title, targetUsers, message, sourceUser }) {
+  const notification = {
+    id: Date.now() + Math.random(),
+    department,
+    priority,
+    title,
+    targetUsers,
+    message,
+    sourceUser,
+    createdAt: new Date().toISOString(),
+  };
+
+  global.internalNotifications.unshift(notification);
+  return notification;
 }
 
 async function ensurePaytmSettingTable() {
@@ -2374,6 +2481,148 @@ app.get("/admin/messages/:ticketId", auth, async (req, res) => {
   }
 });
 
+app.get("/internal/users", auth, (req, res) => {
+  try {
+    res.json(global.internalUsers);
+  } catch (err) {
+    console.log("INTERNAL USERS ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.post("/internal/users", auth, (req, res) => {
+  try {
+    const { name, department, role, tags, isAdmin } = req.body || {};
+
+    if (!name || !department || !role) {
+      return res.status(400).json({ error: "Name, department and role are required" });
+    }
+
+    const nextUser = {
+      id: Date.now() + Math.random(),
+      name: String(name).trim(),
+      department: String(department).trim(),
+      role: String(role).trim(),
+      tags: getInternalTagList(tags ? String(tags).split(",") : []),
+      isAdmin: Boolean(isAdmin),
+    };
+
+    global.internalUsers.push(nextUser);
+    io.emit("internal-user-updated", { user: nextUser });
+    res.json({ success: true, user: nextUser });
+  } catch (err) {
+    console.log("CREATE INTERNAL USER ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.get("/internal/chats", auth, (req, res) => {
+  try {
+    res.json(global.internalChats);
+  } catch (err) {
+    console.log("INTERNAL CHATS ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.post("/internal/chats", auth, (req, res) => {
+  try {
+    const { department, title, priority, participants } = req.body || {};
+
+    if (!department || !title) {
+      return res.status(400).json({ error: "Department and title are required" });
+    }
+
+    const newChat = {
+      id: Date.now() + Math.random(),
+      department: String(department).trim(),
+      title: String(title).trim(),
+      priority: ["low", "medium", "urgent"].includes(priority) ? priority : "medium",
+      participants: Array.isArray(participants) && participants.length ? participants : ["Admin"],
+      unread: 0,
+      messages: [
+        {
+          id: Date.now(),
+          sender: "Admin",
+          text: `New ${String(department).trim()} team chat started.`,
+          time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+          tag: "general",
+        },
+      ],
+    };
+
+    global.internalChats.unshift(newChat);
+    io.to(newChat.department).emit("internal-chat-updated", { chat: newChat });
+    io.emit("internal-notification", {
+      title: `${newChat.department} thread created`,
+      priority: newChat.priority,
+      message: `${newChat.title} was started for ${newChat.department}.`,
+    });
+    res.json({ success: true, chat: newChat });
+  } catch (err) {
+    console.log("CREATE INTERNAL CHAT ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.post("/internal/chats/:id/messages", auth, (req, res) => {
+  try {
+    const { id } = req.params;
+    const { sender, text, tag, priority, sourceUser } = req.body || {};
+
+    const chat = global.internalChats.find((item) => String(item.id) === String(id));
+    if (!chat) {
+      return res.status(404).json({ error: "Chat not found" });
+    }
+
+    const cleanText = String(text || "").trim();
+    if (!cleanText) {
+      return res.status(400).json({ error: "Message text is required" });
+    }
+
+    const message = {
+      id: Date.now() + Math.random(),
+      sender: sender || "Admin",
+      text: cleanText,
+      time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+      tag: tag || "general",
+    };
+
+    chat.messages.push(message);
+    chat.unread = 0;
+    chat.priority = ["low", "medium", "urgent"].includes(priority) ? priority : chat.priority;
+
+    const relatedUsers = global.internalUsers.filter((user) => user.department === chat.department || (tag && user.tags.includes(tag)));
+    const targetUsers = relatedUsers.map((user) => user.name);
+
+    const notification = addInternalNotification({
+      department: chat.department,
+      priority: chat.priority,
+      title: chat.title,
+      targetUsers,
+      message: cleanText,
+      sourceUser: sourceUser || sender || "Admin",
+    });
+
+    io.to(chat.department).emit("internal-chat-updated", { chat, notification });
+    io.emit("internal-notification", notification);
+
+    res.json({ success: true, chat, notification });
+  } catch (err) {
+    console.log("CREATE INTERNAL MESSAGE ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.get("/internal/notifications", auth, (req, res) => {
+  try {
+    res.json(global.internalNotifications.slice(0, 8));
+  } catch (err) {
+    console.log("INTERNAL NOTIFICATIONS ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
 /* =========================================================
     HEALTH CHECK
 ========================================================= */
@@ -2394,4 +2643,4 @@ setInterval(() => {
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(` Server running on port ${PORT}`);
-});
+});1234
