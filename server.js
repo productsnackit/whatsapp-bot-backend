@@ -30,7 +30,7 @@ const io = new Server(httpServer, {
 });
 
 app.use(cors());
-app.use(express.json({ limit: "10mb" }));
+app.use(express.json({ limit: "25mb" }));
 
 io.on("connection", (socket) => {
   socket.on("join-internal-room", ({ department }) => {
