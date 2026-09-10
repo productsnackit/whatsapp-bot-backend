@@ -30,7 +30,7 @@ const io = new Server(httpServer, {
 });
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "10mb" }));
 
 io.on("connection", (socket) => {
   socket.on("join-internal-room", ({ department }) => {
@@ -1791,7 +1791,7 @@ app.post("/login", (req, res) => {
     if (employee && employee.password === password) {
       const token = `employee-${Date.now()}-${Math.random().toString(36).slice(2)}`;
       global.internalSessions.set(token, { userId: employee.id, username: employee.username, name: employee.name, department: employee.department });
-      return res.json({ token, role: "employee", username: employee.username, name: employee.name, department: employee.department });
+      return res.json({ token, role: "employee", userId: employee.id, username: employee.username, name: employee.name, department: employee.department });
     }
 
     res.status(401).json({ error: "Invalid credentials" });
@@ -2448,10 +2448,7 @@ app.get("/admin/messages/:ticketId", auth, async (req, res) => {
 
 app.get("/internal/users", auth, (req, res) => {
   try {
-    const users = req.user?.role === "admin"
-      ? global.internalUsers
-      : global.internalUsers.filter((user) => user.department === req.user.department);
-    res.json(users);
+    res.json(global.internalUsers.map(({ password, ...user }) => user));
   } catch (err) {
     console.log("INTERNAL USERS ERROR:", err.message);
     res.status(500).json({ error: "Server error" });
@@ -2511,10 +2508,7 @@ app.post("/internal/users", auth, (req, res) => {
 
 app.get("/internal/chats", auth, (req, res) => {
   try {
-    const chats = req.user?.role === "admin"
-      ? global.internalChats
-      : global.internalChats.filter((chat) => chat.department === req.user.department);
-    res.json(chats);
+    res.json(global.internalChats);
   } catch (err) {
     console.log("INTERNAL CHATS ERROR:", err.message);
     res.status(500).json({ error: "Server error" });
@@ -2523,6 +2517,7 @@ app.get("/internal/chats", auth, (req, res) => {
 
 app.delete("/internal/chats/:id", auth, (req, res) => {
   try {
+    if (req.user?.role !== "admin") return res.status(403).json({ error: "Admin access required" });
     const { id } = req.params;
     global.internalChats = global.internalChats.filter((chat) => String(chat.id) !== String(id));
     io.emit("internal-chat-deleted", { chatId: id });
@@ -2536,10 +2531,6 @@ app.delete("/internal/chats/:id", auth, (req, res) => {
 app.post("/internal/chats", auth, (req, res) => {
   try {
     const { department, title, priority, participants } = req.body || {};
-
-    if (req.user?.role === "employee" && department !== req.user.department) {
-      return res.status(403).json({ error: "You can only use your department chat" });
-    }
 
     if (!department || !title) {
       return res.status(400).json({ error: "Department and title are required" });
@@ -2558,7 +2549,9 @@ app.post("/internal/chats", auth, (req, res) => {
           sender: "Admin",
           text: `New ${String(department).trim()} team chat started.`,
           time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-          tag: "general",
+          tag: null,
+          priority: newChat.priority,
+          status: "open",
         },
       ],
     };
@@ -2598,10 +2591,6 @@ app.post("/internal/chats/:id/messages", auth, (req, res) => {
       global.internalChats.unshift(chat);
     }
 
-    if (req.user?.role === "employee" && chat.department !== req.user.department) {
-      return res.status(403).json({ error: "You can only message your department chat" });
-    }
-
     const cleanText = String(text || "").trim();
     if (!cleanText && !attachments.length) {
       return res.status(400).json({ error: "Message text or attachment is required" });
@@ -2612,9 +2601,15 @@ app.post("/internal/chats/:id/messages", auth, (req, res) => {
       sender: sender || "Admin",
       text: cleanText,
       time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-      tag: tag || "general",
+      tag: tag || null,
       priority: ["low", "medium", "urgent"].includes(priority) ? priority : chat.priority || "medium",
-      attachments: Array.isArray(attachments) ? attachments : [],
+      status: "open",
+      attachments: Array.isArray(attachments) ? attachments.map((file) => ({
+        name: String(file?.name || "attachment"),
+        type: String(file?.type || "application/octet-stream"),
+        size: Number(file?.size || 0),
+        dataUrl: typeof file?.dataUrl === "string" && file.dataUrl.length <= 8_000_000 ? file.dataUrl : null,
+      })) : [],
       recipientIds: Array.isArray(recipientIds) ? recipientIds : [],
     };
 
@@ -2645,6 +2640,35 @@ app.post("/internal/chats/:id/messages", auth, (req, res) => {
     res.json({ success: true, chat, notification });
   } catch (err) {
     console.log("CREATE INTERNAL MESSAGE ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.patch("/internal/chats/:chatId/messages/:messageId/status", auth, (req, res) => {
+  try {
+    const chat = global.internalChats.find((item) => String(item.id) === String(req.params.chatId));
+    if (!chat) return res.status(404).json({ error: "Chat not found" });
+
+    const message = chat.messages.find((item) => String(item.id) === String(req.params.messageId));
+    if (!message) return res.status(404).json({ error: "Message not found" });
+
+    const allowedStatuses = ["open", "in-progress", "resolved"];
+    if (!allowedStatuses.includes(req.body?.status)) {
+      return res.status(400).json({ error: "Invalid message status" });
+    }
+
+    const isAdmin = req.user?.role === "admin";
+    const isRecipient = Array.isArray(message.recipientIds) && message.recipientIds.map(String).includes(String(req.user?.userId));
+    const isSender = message.sender === req.user?.name;
+    if (!isAdmin && !isRecipient && !isSender) return res.status(403).json({ error: "You cannot update this message" });
+
+    message.status = req.body.status;
+    message.statusUpdatedBy = req.user?.name || "Admin";
+    message.statusUpdatedAt = new Date().toISOString();
+    io.emit("internal-chat-updated", { chat });
+    res.json({ success: true, chat });
+  } catch (err) {
+    console.log("UPDATE INTERNAL MESSAGE STATUS ERROR:", err.message);
     res.status(500).json({ error: "Server error" });
   }
 });
