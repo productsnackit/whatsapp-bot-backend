@@ -2602,11 +2602,12 @@ app.post("/internal/chats", auth, (req, res) => {
       return res.status(400).json({ error: "Department and title are required" });
     }
 
+    const chatPriority = ["low", "medium", "urgent"].includes(priority) ? priority : "medium";
     const newChat = {
       id: Date.now() + Math.random(),
       department: String(department).trim(),
       title: String(title).trim(),
-      priority: ["low", "medium", "urgent"].includes(priority) ? priority : "medium",
+      priority: chatPriority,
       participants: Array.isArray(participants) && participants.length ? participants : ["Admin"],
       unread: 0,
       messages: [
@@ -2616,7 +2617,7 @@ app.post("/internal/chats", auth, (req, res) => {
           text: `New ${String(department).trim()} team chat started.`,
           time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
           tag: null,
-          priority: newChat.priority,
+          priority: chatPriority,
           status: "open",
         },
       ],
@@ -2631,8 +2632,8 @@ app.post("/internal/chats", auth, (req, res) => {
     });
     res.json({ success: true, chat: newChat });
   } catch (err) {
-    console.log("CREATE INTERNAL CHAT ERROR:", err.message);
-    res.status(500).json({ error: "Server error" });
+    console.error("CREATE INTERNAL CHAT ERROR:", err.stack || err.message);
+    res.status(500).json({ error: `Chat could not be created: ${err.message}` });
   }
 });
 
