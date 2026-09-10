@@ -60,7 +60,36 @@ if (!global.botSettings) {
 }
 
 if (!global.internalUsers) {
-  global.internalUsers = [];
+  global.internalUsers = [
+    ["Deepika", "Accounts", "Accounts Head"],
+    ["Sushmitha", "Accounts", "Accounts executive"],
+    ["Bala Supriya M", "HR", "HR Manager"],
+    ["Yashmittha", "Operations", "Growth Officer"],
+    ["Praharsha", "Product", "Product Manager"],
+    ["Aparna", "Audit", "Audit Officer"],
+    ["Wilson", "Technical", "Technical Executive"],
+    ["Kushith", "Operations", "Operations Executive"],
+    ["Monish", "Operations", "Operations Executive"],
+    ["Srikanta", "Operations", "Operations Executive"],
+    ["Vikas", "Operations", "Executive"],
+    ["Tanu", "Operations", "Senior Executive"],
+    ["Ganesh", "Operations", "Senior Executive"],
+    ["Arun", "Operations", "Operations head"],
+    ["Yash vardhan", "Operations", "Operations head"],
+    ["Shantveer", "Operations", "Direct Sale Manager"],
+    ["Xavier", "Technical", "Oprations and Technical Head"],
+    ["Sujan", "Technical", "Technician"],
+    ["Darshan", "Logistics", "Logistics Executive"],
+  ].map(([name, department, role], index) => ({
+    id: Date.now() + index,
+    username: name.toLowerCase().replace(/[^a-z0-9]+/g, ".").replace(/^\.|\.$/g, ""),
+    password: `Snackit@${String(index + 1).padStart(3, "0")}`,
+    name,
+    department,
+    role,
+    tags: [],
+    isAdmin: false,
+  }));
 }
 
 if (!global.internalSessions) {
@@ -2448,6 +2477,7 @@ app.get("/admin/messages/:ticketId", auth, async (req, res) => {
 
 app.get("/internal/users", auth, (req, res) => {
   try {
+    if (req.user?.role === "admin") return res.json(global.internalUsers);
     res.json(global.internalUsers.map(({ password, ...user }) => user));
   } catch (err) {
     console.log("INTERNAL USERS ERROR:", err.message);
@@ -2502,6 +2532,28 @@ app.post("/internal/users", auth, (req, res) => {
     res.json({ success: true, user: nextUser, credentials: { username, password: generatedPassword } });
   } catch (err) {
     console.log("CREATE INTERNAL USER ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.patch("/internal/users/:id", auth, (req, res) => {
+  try {
+    if (req.user?.role !== "admin") return res.status(403).json({ error: "Admin access required" });
+    const user = global.internalUsers.find((item) => String(item.id) === String(req.params.id));
+    if (!user) return res.status(404).json({ error: "Employee not found" });
+
+    const { name, department, role, tags, username, password } = req.body || {};
+    if (name !== undefined) user.name = String(name).trim();
+    if (department !== undefined) user.department = String(department).trim();
+    if (role !== undefined) user.role = String(role).trim();
+    if (username !== undefined) user.username = String(username).trim();
+    if (password !== undefined && String(password).trim()) user.password = String(password).trim();
+    if (tags !== undefined) user.tags = getInternalTagList(Array.isArray(tags) ? tags : String(tags).split(","));
+
+    io.emit("internal-user-updated", { user });
+    res.json({ success: true, user });
+  } catch (err) {
+    console.log("UPDATE INTERNAL USER ERROR:", err.message);
     res.status(500).json({ error: "Server error" });
   }
 });
