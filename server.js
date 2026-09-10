@@ -118,6 +118,13 @@ if (!global.internalNotifications) {
   global.internalNotifications = [];
 }
 
+if (!global.internalSavedReplies) {
+  global.internalSavedReplies = [
+    { id: "reply-follow-up", title: "Follow-up", text: "I am checking this with the team and will share an update shortly." },
+    { id: "reply-resolved", title: "Resolved", text: "This has been resolved. Please reply here if anything else is needed." },
+  ];
+}
+
 function getInternalTagList(tags) {
   return Array.isArray(tags)
     ? tags.map((tag) => String(tag).trim()).filter(Boolean).filter((tag, index, arr) => arr.indexOf(tag) === index)
@@ -138,6 +145,11 @@ function addInternalNotification({ department, priority, title, targetUsers, mes
 
   global.internalNotifications.unshift(notification);
   return notification;
+}
+
+function getInternalUserKey(user) {
+  if (user?.role === "admin") return "admin";
+  return String(user?.userId || user?.id || user?.name || "user");
 }
 
 async function ensurePaytmSettingTable() {
@@ -2574,7 +2586,11 @@ app.patch("/internal/users/:id", auth, (req, res) => {
 
 app.get("/internal/chats", auth, (req, res) => {
   try {
-    res.json(global.internalChats);
+    const userKey = getInternalUserKey(req.user);
+    res.json(global.internalChats.map((chat) => ({
+      ...chat,
+      unread: Number(chat.unreadBy?.[userKey] || 0),
+    })));
   } catch (err) {
     console.log("INTERNAL CHATS ERROR:", err.message);
     res.status(500).json({ error: "Server error" });
@@ -2594,6 +2610,53 @@ app.delete("/internal/chats/:id", auth, (req, res) => {
   }
 });
 
+app.patch("/internal/chats/:id", auth, (req, res) => {
+  try {
+    const chat = global.internalChats.find((item) => String(item.id) === String(req.params.id));
+    if (!chat) return res.status(404).json({ error: "Chat not found" });
+    const { title, pinned, archived, favorite, priority } = req.body || {};
+    if (title !== undefined) {
+      const cleanTitle = String(title).trim();
+      if (!cleanTitle) return res.status(400).json({ error: "Chat title cannot be empty" });
+      chat.title = cleanTitle;
+    }
+    if (pinned !== undefined) chat.pinned = Boolean(pinned);
+    if (archived !== undefined) chat.archived = Boolean(archived);
+    if (favorite !== undefined) chat.favorite = Boolean(favorite);
+    if (priority !== undefined && ["low", "medium", "urgent"].includes(priority)) chat.priority = priority;
+    io.to(chat.department).emit("internal-chat-updated", { chat });
+    res.json({ success: true, chat });
+  } catch (err) {
+    console.log("UPDATE INTERNAL CHAT ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.patch("/internal/chats/:id/read", auth, (req, res) => {
+  try {
+    const chat = global.internalChats.find((item) => String(item.id) === String(req.params.id));
+    if (!chat) return res.status(404).json({ error: "Chat not found" });
+    chat.unreadBy = { ...(chat.unreadBy || {}), [getInternalUserKey(req.user)]: 0 };
+    res.json({ success: true, chat: { ...chat, unread: 0 } });
+  } catch (err) {
+    console.log("MARK INTERNAL CHAT READ ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.get("/internal/saved-replies", auth, (req, res) => {
+  res.json(global.internalSavedReplies);
+});
+
+app.post("/internal/saved-replies", auth, (req, res) => {
+  const title = String(req.body?.title || "").trim();
+  const text = String(req.body?.text || "").trim();
+  if (!title || !text) return res.status(400).json({ error: "Title and text are required" });
+  const reply = { id: `reply-${Date.now()}`, title, text };
+  global.internalSavedReplies.unshift(reply);
+  res.json({ success: true, reply });
+});
+
 app.post("/internal/chats", auth, (req, res) => {
   try {
     const { department, title, priority, participants } = req.body || {};
@@ -2610,6 +2673,10 @@ app.post("/internal/chats", auth, (req, res) => {
       priority: chatPriority,
       participants: Array.isArray(participants) && participants.length ? participants : ["Admin"],
       unread: 0,
+      unreadBy: {},
+      pinned: false,
+      archived: false,
+      favorite: false,
       messages: [
         {
           id: Date.now(),
@@ -2687,10 +2754,22 @@ app.post("/internal/chats/:id/messages", auth, (req, res) => {
         dataUrl: typeof file?.dataUrl === "string" && file.dataUrl.length <= 8_000_000 ? file.dataUrl : null,
       })),
       recipientIds,
+      replyTo: req.body?.replyTo ? String(req.body.replyTo) : null,
+      mentions: Array.isArray(req.body?.mentions) ? req.body.mentions.map(String) : [],
+      reactions: {},
+      assignedTo: null,
     };
 
     chat.messages.push(message);
-    chat.unread = 0;
+    chat.unreadBy = { ...(chat.unreadBy || {}) };
+    const senderKey = getInternalUserKey(req.user);
+    const recipientKeys = recipientIds.length ? recipientIds.map(String) : global.internalUsers
+      .filter((user) => user.department === chat.department)
+      .map((user) => String(user.id));
+    recipientKeys.forEach((userKey) => {
+      if (String(userKey) !== senderKey) chat.unreadBy[userKey] = Number(chat.unreadBy[userKey] || 0) + 1;
+    });
+    chat.unread = Number(chat.unreadBy[senderKey] || 0);
     chat.priority = message.priority;
     chat.participants = Array.from(new Set([
       ...chat.participants,
@@ -2752,6 +2831,31 @@ app.patch("/internal/chats/:chatId/messages/:messageId/status", auth, (req, res)
     res.json({ success: true, chat });
   } catch (err) {
     console.log("UPDATE INTERNAL MESSAGE STATUS ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.patch("/internal/chats/:chatId/messages/:messageId", auth, (req, res) => {
+  try {
+    const chat = global.internalChats.find((item) => String(item.id) === String(req.params.chatId));
+    if (!chat) return res.status(404).json({ error: "Chat not found" });
+    const message = chat.messages.find((item) => String(item.id) === String(req.params.messageId));
+    if (!message) return res.status(404).json({ error: "Message not found" });
+
+    if (req.body?.assignedTo !== undefined) message.assignedTo = req.body.assignedTo ? String(req.body.assignedTo) : null;
+    if (req.body?.reaction) {
+      const reaction = String(req.body.reaction);
+      const userKey = getInternalUserKey(req.user);
+      message.reactions = { ...(message.reactions || {}) };
+      message.reactions[reaction] = Array.isArray(message.reactions[reaction]) ? message.reactions[reaction] : [];
+      message.reactions[reaction] = message.reactions[reaction].includes(userKey)
+        ? message.reactions[reaction].filter((key) => key !== userKey)
+        : [...message.reactions[reaction], userKey];
+    }
+    io.to(chat.department).emit("internal-chat-updated", { chat });
+    res.json({ success: true, chat });
+  } catch (err) {
+    console.log("UPDATE INTERNAL MESSAGE ERROR:", err.message);
     res.status(500).json({ error: "Server error" });
   }
 });
