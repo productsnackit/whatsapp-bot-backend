@@ -216,8 +216,76 @@ async function ensureSupportColumns() {
     `);
     await db.query("UPDATE tickets SET last_customer_message_at = COALESCE(last_customer_message_at, updated_at, created_at)");
     await db.query("UPDATE tickets SET refund_stage = CASE WHEN LOWER(status) IN ('refunded', 'auto_refunded', 'resolved') THEN 'PROCESSED' WHEN state = 'DONE' THEN 'UNDER_REVIEW' ELSE COALESCE(refund_stage, 'RAISED') END WHERE refund_stage IS NULL");
+    await ensureOperationsTables();
   } catch (err) {
     console.log("SUPPORT COLUMNS ERROR:", err.message);
+  }
+}
+
+async function ensureOperationsTables() {
+  try {
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS host_sites (
+        id SERIAL PRIMARY KEY, company_name TEXT NOT NULL, contact_name TEXT, contact_phone TEXT,
+        contact_email TEXT, address TEXT, city TEXT, sector TEXT, contract_start DATE,
+        contract_end DATE, service_charge NUMERIC DEFAULT 0, status TEXT DEFAULT 'active',
+        created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS machine_slots (
+        id SERIAL PRIMARY KEY, machine_id INTEGER NOT NULL REFERENCES machines(id) ON DELETE CASCADE,
+        slot_number TEXT NOT NULL, sku_id INTEGER, capacity INTEGER DEFAULT 0, current_stock INTEGER DEFAULT 0,
+        low_stock_threshold INTEGER DEFAULT 2, created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(machine_id, slot_number)
+      )
+    `);
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS brands (
+        id SERIAL PRIMARY KEY, name TEXT NOT NULL UNIQUE, contact_email TEXT, contact_phone TEXT,
+        onboarded_at TIMESTAMPTZ DEFAULT NOW(), status TEXT DEFAULT 'active', created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS skus (
+        id SERIAL PRIMARY KEY, brand_id INTEGER REFERENCES brands(id) ON DELETE SET NULL, name TEXT NOT NULL,
+        category TEXT, unit_price NUMERIC DEFAULT 0, onboarded_at TIMESTAMPTZ DEFAULT NOW(),
+        created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS stock_movements (
+        id SERIAL PRIMARY KEY, machine_slot_id INTEGER REFERENCES machine_slots(id) ON DELETE CASCADE,
+        sku_id INTEGER REFERENCES skus(id) ON DELETE SET NULL, change_type TEXT NOT NULL,
+        quantity INTEGER NOT NULL, created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS site_notes (
+        id SERIAL PRIMARY KEY, host_site_id INTEGER NOT NULL REFERENCES host_sites(id) ON DELETE CASCADE,
+        note TEXT NOT NULL, created_by TEXT, created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS leads (
+        id SERIAL PRIMARY KEY, full_name TEXT NOT NULL, phone TEXT, email TEXT,
+        enquiry_type TEXT DEFAULT 'other', service_option TEXT, message TEXT, city TEXT,
+        stage TEXT DEFAULT 'new', assigned_to TEXT, created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    await db.query(`
+      ALTER TABLE machines
+        ADD COLUMN IF NOT EXISTS city TEXT,
+        ADD COLUMN IF NOT EXISTS sector TEXT,
+        ADD COLUMN IF NOT EXISTS install_date DATE,
+        ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active',
+        ADD COLUMN IF NOT EXISTS host_site_id INTEGER REFERENCES host_sites(id),
+        ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()
+    `);
+    await db.query("ALTER TABLE machine_slots ADD COLUMN IF NOT EXISTS sku_id INTEGER REFERENCES skus(id)");
+    await db.query("ALTER TABLE stock_movements ADD COLUMN IF NOT EXISTS sku_id INTEGER REFERENCES skus(id)");
+  } catch (err) {
+    console.log("OPERATIONS TABLES ERROR:", err.message);
   }
 }
 
@@ -2434,6 +2502,412 @@ app.delete("/tickets/:id", auth, async (req, res) => {
   }
 });
 
+function operationFilters(req, prefix = "") {
+  const values = [];
+  const clauses = [];
+  ["city", "sector", "status"].forEach((key) => {
+    if (req.query[key]) {
+      values.push(String(req.query[key]));
+      clauses.push(`${prefix}${key} = $${values.length}`);
+    }
+  });
+  return { values, where: clauses.length ? `WHERE ${clauses.join(" AND ")}` : "" };
+}
+
+async function emitOperationsEvent(event, payload) {
+  try {
+    io.emit(event, payload);
+  } catch (err) {
+    console.log("OPERATIONS SOCKET ERROR:", err.message);
+  }
+}
+
+async function recalculateInventoryAlerts() {
+  try {
+    const result = await db.query(`
+      SELECT ms.id, ms.machine_id, ms.slot_number, ms.current_stock,
+             COALESCE(SUM(sm.quantity) FILTER (WHERE sm.change_type = 'sale' AND sm.created_at >= NOW() - INTERVAL '7 days'), 0)::numeric / 7 AS daily_sales,
+             CASE WHEN COALESCE(SUM(sm.quantity) FILTER (WHERE sm.change_type = 'sale' AND sm.created_at >= NOW() - INTERVAL '7 days'), 0) > 0
+               THEN ms.current_stock / (COALESCE(SUM(sm.quantity) FILTER (WHERE sm.change_type = 'sale' AND sm.created_at >= NOW() - INTERVAL '7 days'), 0)::numeric / 7)
+               ELSE NULL END AS stockout_days
+      FROM machine_slots ms LEFT JOIN stock_movements sm ON sm.machine_slot_id = ms.id
+      GROUP BY ms.id
+      HAVING ms.current_stock <= ms.low_stock_threshold
+         OR (COALESCE(SUM(sm.quantity) FILTER (WHERE sm.change_type = 'sale' AND sm.created_at >= NOW() - INTERVAL '7 days'), 0) > 0
+             AND ms.current_stock / (COALESCE(SUM(sm.quantity) FILTER (WHERE sm.change_type = 'sale' AND sm.created_at >= NOW() - INTERVAL '7 days'), 0)::numeric / 7) <= 2)
+      ORDER BY stockout_days NULLS LAST, ms.current_stock ASC
+      LIMIT 25
+    `);
+    if (result.rows.length) await emitOperationsEvent("low-stock-alert", { slots: result.rows, generated_at: new Date().toISOString() });
+  } catch (err) {
+    console.log("INVENTORY ALERT ERROR:", err.message);
+  }
+}
+
+async function emitRenewalWarnings() {
+  try {
+    const result = await db.query("SELECT id, company_name, contract_end, (contract_end - CURRENT_DATE)::int AS days_to_renewal FROM host_sites WHERE contract_end IS NOT NULL AND contract_end BETWEEN CURRENT_DATE AND CURRENT_DATE + 60");
+    if (result.rows.length) await emitOperationsEvent("renewal-due", { sites: result.rows, generated_at: new Date().toISOString() });
+  } catch (err) {
+    console.log("RENEWAL WARNING ERROR:", err.message);
+  }
+}
+
+app.get("/machines", auth, async (req, res) => {
+  try {
+    const { values, where } = operationFilters(req, "m.");
+    const result = await db.query(
+      `SELECT m.*, hs.company_name AS host_site_name,
+              COUNT(ms.id)::int AS slot_count,
+              COUNT(ms.id) FILTER (WHERE ms.current_stock <= ms.low_stock_threshold)::int AS low_stock_slots
+       FROM machines m LEFT JOIN host_sites hs ON hs.id = m.host_site_id
+       LEFT JOIN machine_slots ms ON ms.machine_id = m.id
+       ${where} GROUP BY m.id, hs.company_name ORDER BY m.name`,
+      values
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.log("MACHINES ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.get("/machines/:id/slots", auth, async (req, res) => {
+  try {
+    const days = Math.max(1, Math.min(90, Number(req.query.days) || 14));
+    const result = await db.query(
+      `SELECT ms.*, s.name AS sku_name, s.category, s.unit_price,
+              COALESCE(SUM(sm.quantity) FILTER (WHERE sm.change_type = 'sale' AND sm.created_at >= NOW() - ($1 * INTERVAL '1 day')), 0)::int AS sales_in_window,
+              COALESCE(SUM(sm.quantity) FILTER (WHERE sm.change_type = 'sale' AND sm.created_at >= NOW() - ($1 * INTERVAL '1 day')), 0)::numeric / $1 AS daily_sales
+       FROM machine_slots ms LEFT JOIN skus s ON s.id = ms.sku_id
+       LEFT JOIN stock_movements sm ON sm.machine_slot_id = ms.id
+       WHERE ms.machine_id=$2 GROUP BY ms.id, s.name, s.category, s.unit_price ORDER BY ms.slot_number`,
+      [days, req.params.id]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.log("MACHINE SLOTS ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.post("/machines/:id/slots/:slotId/restock", auth, async (req, res) => {
+  try {
+    const quantity = Math.round(Number(req.body?.quantity));
+    if (!Number.isFinite(quantity) || quantity <= 0) return res.status(400).json({ error: "Quantity must be positive" });
+    const result = await db.query(
+      `UPDATE machine_slots SET current_stock = current_stock + $1, updated_at=NOW()
+       WHERE id=$2 AND machine_id=$3 RETURNING *`,
+      [quantity, req.params.slotId, req.params.id]
+    );
+    if (!result.rows.length) return res.status(404).json({ error: "Slot not found" });
+    await db.query("INSERT INTO stock_movements (machine_slot_id, sku_id, change_type, quantity) VALUES ($1, $2, 'restock', $3)", [result.rows[0].id, result.rows[0].sku_id, quantity]);
+    await emitOperationsEvent("inventory-updated", { machine_id: req.params.id, slot: result.rows[0] });
+    res.json({ success: true, slot: result.rows[0] });
+  } catch (err) {
+    console.log("RESTOCK ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.post("/machines/:id/slots/:slotId/sale", auth, async (req, res) => {
+  try {
+    const quantity = Math.round(Number(req.body?.quantity || 1));
+    if (!Number.isFinite(quantity) || quantity <= 0) return res.status(400).json({ error: "Quantity must be positive" });
+    const result = await db.query(
+      `UPDATE machine_slots SET current_stock = GREATEST(0, current_stock - $1), updated_at=NOW()
+       WHERE id=$2 AND machine_id=$3 AND current_stock >= $1 RETURNING *`,
+      [quantity, req.params.slotId, req.params.id]
+    );
+    if (!result.rows.length) return res.status(409).json({ error: "Slot not found or insufficient stock" });
+    await db.query("INSERT INTO stock_movements (machine_slot_id, sku_id, change_type, quantity) VALUES ($1, $2, 'sale', $3)", [result.rows[0].id, result.rows[0].sku_id, quantity]);
+    await emitOperationsEvent("inventory-updated", { machine_id: req.params.id, slot: result.rows[0], change_type: "sale" });
+    res.json({ success: true, slot: result.rows[0] });
+  } catch (err) {
+    console.log("SALE MOVEMENT ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.get("/inventory/low-stock", auth, async (req, res) => {
+  try {
+    const { values, where } = operationFilters(req, "m.");
+    const days = Math.max(1, Math.min(90, Number(req.query.days) || 7));
+    const result = await db.query(
+      `WITH slot_velocity AS (
+        SELECT ms.id AS slot_id, ms.slot_number, ms.current_stock, ms.low_stock_threshold,
+              m.id AS machine_id, m.name AS machine_name, m.location, m.city, m.sector,
+              s.name AS sku_name, COALESCE(SUM(sm.quantity) FILTER (WHERE sm.change_type='sale' AND sm.created_at >= NOW() - ($${values.length + 1} * INTERVAL '1 day')), 0)::numeric / $${values.length + 1} AS daily_sales,
+              CASE WHEN COALESCE(SUM(sm.quantity) FILTER (WHERE sm.change_type='sale' AND sm.created_at >= NOW() - ($${values.length + 1} * INTERVAL '1 day')), 0) > 0 THEN ms.current_stock / (COALESCE(SUM(sm.quantity) FILTER (WHERE sm.change_type='sale' AND sm.created_at >= NOW() - ($${values.length + 1} * INTERVAL '1 day')), 0)::numeric / $${values.length + 1}) ELSE NULL END AS stockout_days
+       FROM machine_slots ms JOIN machines m ON m.id=ms.machine_id LEFT JOIN skus s ON s.id=ms.sku_id
+       LEFT JOIN stock_movements sm ON sm.machine_slot_id=ms.id
+       ${where} GROUP BY ms.id, m.id, s.name
+      ) SELECT * FROM slot_velocity
+        WHERE current_stock <= low_stock_threshold OR (daily_sales > 0 AND stockout_days <= 2)
+        ORDER BY stockout_days NULLS FIRST, current_stock ASC`,
+      [...values, days]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.log("LOW STOCK ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.get("/inventory/velocity", auth, async (req, res) => {
+  try {
+    const days = Math.max(1, Math.min(365, Number(req.query.days) || 30));
+    const result = await db.query(
+      `SELECT m.id AS machine_id, m.name AS machine_name, m.city, m.sector, s.id AS sku_id, s.name AS sku_name,
+              COALESCE(SUM(sm.quantity), 0)::int AS units_sold, ROUND((COALESCE(SUM(sm.quantity), 0)::numeric / $1), 2) AS average_daily_sales,
+              CASE WHEN COALESCE(SUM(sm.quantity), 0) > 0 THEN ROUND((MAX(ms.current_stock)::numeric / (SUM(sm.quantity)::numeric / $1))::numeric, 2) ELSE NULL END AS predicted_stockout_days
+       FROM stock_movements sm JOIN machine_slots ms ON ms.id=sm.machine_slot_id JOIN machines m ON m.id=ms.machine_id LEFT JOIN skus s ON s.id=COALESCE(sm.sku_id, ms.sku_id)
+       WHERE sm.change_type='sale' AND sm.created_at >= NOW() - ($1 * INTERVAL '1 day')
+       GROUP BY m.id, m.name, m.city, m.sector, s.id, s.name ORDER BY units_sold DESC`,
+      [days]
+    );
+    res.json({ window_days: days, rows: result.rows });
+  } catch (err) {
+    console.log("INVENTORY VELOCITY ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.get("/host-sites/renewals-due", auth, async (req, res) => {
+  try {
+    const days = Math.max(1, Math.min(365, Number(req.query.days) || 60));
+    const result = await db.query("SELECT *, (contract_end - CURRENT_DATE)::int AS days_to_renewal, (contract_end <= CURRENT_DATE + $1) AS renewal_risk FROM host_sites WHERE contract_end IS NOT NULL AND contract_end <= CURRENT_DATE + $1 ORDER BY contract_end", [days]);
+    res.json(result.rows);
+  } catch (err) {
+    console.log("RENEWALS ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.get("/host-sites", auth, async (req, res) => {
+  try {
+    const { values, where } = operationFilters(req, "hs.");
+    const result = await db.query(`SELECT hs.*, COUNT(m.id)::int AS machine_count, (hs.contract_end IS NOT NULL AND hs.contract_end <= CURRENT_DATE + INTERVAL '60 days') AS renewal_risk FROM host_sites hs LEFT JOIN machines m ON m.host_site_id=hs.id ${where} GROUP BY hs.id ORDER BY hs.contract_end NULLS LAST, hs.company_name`, values);
+    res.json(result.rows);
+  } catch (err) {
+    console.log("HOST SITES ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.get("/host-sites/:id", auth, async (req, res) => {
+  try {
+    const site = await db.query("SELECT *, (contract_end IS NOT NULL AND contract_end <= CURRENT_DATE + INTERVAL '60 days') AS renewal_risk FROM host_sites WHERE id=$1", [req.params.id]);
+    if (!site.rows.length) return res.status(404).json({ error: "Host site not found" });
+    const [machines, notes, tickets] = await Promise.all([
+      db.query("SELECT m.*, CASE WHEN LOWER(COALESCE(m.status, 'active')) = 'active' THEN 100 ELSE 0 END AS uptime_pct FROM machines m WHERE m.host_site_id=$1 ORDER BY m.name", [req.params.id]),
+      db.query("SELECT * FROM site_notes WHERE host_site_id=$1 ORDER BY created_at DESC", [req.params.id]),
+      db.query("SELECT COUNT(*)::int AS ticket_count FROM tickets t JOIN machines m ON m.id=t.machine_id WHERE m.host_site_id=$1", [req.params.id]),
+    ]);
+    res.json({ ...site.rows[0], machines: machines.rows, notes: notes.rows, ticket_count: tickets.rows[0]?.ticket_count || 0 });
+  } catch (err) {
+    console.log("HOST SITE DETAIL ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.post("/host-sites/:id/notes", auth, async (req, res) => {
+  try {
+    const note = String(req.body?.note || "").trim();
+    if (!note) return res.status(400).json({ error: "Note is required" });
+    const result = await db.query("INSERT INTO site_notes (host_site_id, note, created_by) VALUES ($1, $2, $3) RETURNING *", [req.params.id, note, req.user?.name || req.user?.username || "Admin"]);
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.log("SITE NOTE ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.patch("/host-sites/:id", auth, async (req, res) => {
+  try {
+    const allowed = ["company_name", "contact_name", "contact_phone", "contact_email", "address", "city", "sector", "contract_start", "contract_end", "service_charge", "status"];
+    const fields = allowed.filter((key) => req.body?.[key] !== undefined);
+    if (!fields.length) return res.status(400).json({ error: "No fields to update" });
+    const values = fields.map((key) => req.body[key]);
+    const result = await db.query(`UPDATE host_sites SET ${fields.map((key, index) => `${key}=$${index + 1}`).join(", ")}, updated_at=NOW() WHERE id=$${fields.length + 1} RETURNING *`, [...values, req.params.id]);
+    if (!result.rows.length) return res.status(404).json({ error: "Host site not found" });
+    if (result.rows[0].contract_end && new Date(result.rows[0].contract_end) <= new Date(Date.now() + 60 * 86400000)) await emitOperationsEvent("renewal-due", result.rows[0]);
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.log("HOST SITE UPDATE ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.get("/brands", auth, async (req, res) => {
+  try {
+    const result = await db.query(`SELECT b.*, COUNT(DISTINCT s.id)::int AS sku_count, COALESCE(SUM(sm.quantity) FILTER (WHERE sm.change_type='sale'), 0)::int AS units_sold, COALESCE(SUM(sm.quantity * s.unit_price) FILTER (WHERE sm.change_type='sale'), 0)::numeric AS revenue FROM brands b LEFT JOIN skus s ON s.brand_id=b.id LEFT JOIN stock_movements sm ON sm.sku_id=s.id GROUP BY b.id ORDER BY b.name`);
+    res.json(result.rows);
+  } catch (err) {
+    console.log("BRANDS ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.post("/brands", auth, async (req, res) => {
+  try {
+    if (req.user?.role !== "admin") return res.status(403).json({ error: "Admin access required" });
+    const { name, contact_email, contact_phone, status = "active" } = req.body || {};
+    if (!String(name || "").trim()) return res.status(400).json({ error: "Brand name is required" });
+    const result = await db.query("INSERT INTO brands (name, contact_email, contact_phone, status) VALUES ($1, $2, $3, $4) RETURNING *", [String(name).trim(), contact_email || null, contact_phone || null, status]);
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.log("BRAND CREATE ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.post("/skus", auth, async (req, res) => {
+  try {
+    if (req.user?.role !== "admin") return res.status(403).json({ error: "Admin access required" });
+    const { brand_id, name, category, unit_price = 0 } = req.body || {};
+    if (!String(name || "").trim()) return res.status(400).json({ error: "SKU name is required" });
+    const result = await db.query("INSERT INTO skus (brand_id, name, category, unit_price) VALUES ($1, $2, $3, $4) RETURNING *", [brand_id || null, String(name).trim(), category || null, unit_price]);
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.log("SKU CREATE ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.get("/brands/:id/performance", auth, async (req, res) => {
+  try {
+    const days = Math.max(1, Math.min(365, Number(req.query.days) || 30));
+    const result = await db.query(`SELECT s.id, s.name, s.category, s.unit_price, COALESCE(SUM(sm.quantity), 0)::int AS units_sold, COALESCE(SUM(sm.quantity * s.unit_price), 0)::numeric AS revenue, ROUND((COALESCE(SUM(sm.quantity), 0)::numeric / NULLIF(SUM(CASE WHEN sm.change_type IN ('sale','restock') THEN ABS(sm.quantity) ELSE 0 END), 0) * 100)::numeric, 2) AS sell_through_rate FROM skus s LEFT JOIN stock_movements sm ON sm.sku_id=s.id AND sm.created_at >= NOW() - ($1 * INTERVAL '1 day') AND sm.change_type='sale' WHERE s.brand_id=$2 GROUP BY s.id ORDER BY revenue DESC`, [days, req.params.id]);
+    res.json({ window_days: days, rows: result.rows });
+  } catch (err) {
+    console.log("BRAND PERFORMANCE ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+async function skuRanking(req, res, direction) {
+  try {
+    const days = Math.max(1, Math.min(365, Number(req.query.days) || 30));
+    const values = [days];
+    const clauses = ["sm.change_type='sale'", "sm.created_at >= NOW() - ($1 * INTERVAL '1 day')"];
+    ["city", "sector"].forEach((key) => { if (req.query[key]) { values.push(req.query[key]); clauses.push(`m.${key}=$${values.length}`); } });
+    const result = await db.query(`SELECT s.id, s.name, b.name AS brand_name, COALESCE(SUM(sm.quantity), 0)::int AS units_sold, COALESCE(SUM(sm.quantity * s.unit_price), 0)::numeric AS revenue FROM stock_movements sm JOIN machine_slots ms ON ms.id=sm.machine_slot_id JOIN machines m ON m.id=ms.machine_id JOIN skus s ON s.id=COALESCE(sm.sku_id, ms.sku_id) LEFT JOIN brands b ON b.id=s.brand_id WHERE ${clauses.join(" AND ")} GROUP BY s.id, b.name ORDER BY units_sold ${direction} LIMIT 25`, values);
+    res.json({ window_days: days, rows: result.rows });
+  } catch (err) {
+    console.log("SKU RANKING ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+}
+app.get("/skus/top-performers", auth, (req, res) => skuRanking(req, res, "DESC"));
+app.get("/skus/underperformers", auth, (req, res) => skuRanking(req, res, "ASC"));
+
+const leadAttempts = new Map();
+app.post("/leads", async (req, res) => {
+  try {
+    const ip = req.ip || "unknown";
+    const now = Date.now();
+    const recent = (leadAttempts.get(ip) || []).filter((time) => now - time < 3600000);
+    if (recent.length >= 10) return res.status(429).json({ error: "Too many enquiries. Please try again later." });
+    recent.push(now); leadAttempts.set(ip, recent);
+    const { full_name, phone, email, enquiry_type = "other", service_option, message, city } = req.body || {};
+    if (!String(full_name || "").trim()) return res.status(400).json({ error: "Full name is required" });
+    const result = await db.query("INSERT INTO leads (full_name, phone, email, enquiry_type, service_option, message, city) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *", [String(full_name).trim(), phone || null, email || null, enquiry_type, service_option || null, message || null, city || null]);
+    await emitOperationsEvent("lead-created", result.rows[0]);
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.log("LEAD INTAKE ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.get("/leads", auth, async (req, res) => {
+  try {
+    const keys = ["stage", "enquiry_type", "city", "assigned_to"];
+    const values = []; const clauses = [];
+    keys.forEach((key) => { if (req.query[key]) { values.push(req.query[key]); clauses.push(`${key}=$${values.length}`); } });
+    const result = await db.query(`SELECT * FROM leads ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""} ORDER BY updated_at DESC`, values);
+    res.json(result.rows);
+  } catch (err) {
+    console.log("LEADS ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.patch("/leads/:id", auth, async (req, res) => {
+  try {
+    const allowed = ["stage", "assigned_to", "full_name", "phone", "email", "message", "city", "enquiry_type", "service_option"];
+    const fields = allowed.filter((key) => req.body?.[key] !== undefined);
+    if (!fields.length) return res.status(400).json({ error: "No fields to update" });
+    const values = fields.map((key) => req.body[key]);
+    const result = await db.query(`UPDATE leads SET ${fields.map((key, index) => `${key}=$${index + 1}`).join(", ")}, updated_at=NOW() WHERE id=$${fields.length + 1} RETURNING *`, [...values, req.params.id]);
+    if (!result.rows.length) return res.status(404).json({ error: "Lead not found" });
+    await emitOperationsEvent("lead-updated", result.rows[0]);
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.log("LEAD UPDATE ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.get("/analytics/pipeline", auth, async (req, res) => {
+  try {
+    const [funnel, city, type] = await Promise.all([
+      db.query("SELECT stage, COUNT(*)::int AS count FROM leads GROUP BY stage ORDER BY stage"),
+      db.query("SELECT COALESCE(city, 'Unknown') AS city, COUNT(*)::int AS total, COUNT(*) FILTER (WHERE stage='won')::int AS won FROM leads GROUP BY 1 ORDER BY total DESC"),
+      db.query("SELECT enquiry_type, COUNT(*)::int AS total, COUNT(*) FILTER (WHERE stage='won')::int AS won FROM leads GROUP BY enquiry_type ORDER BY total DESC"),
+    ]);
+    const totals = await db.query("SELECT COUNT(*)::int AS total, COUNT(*) FILTER (WHERE stage='won')::int AS won FROM leads");
+    const total = totals.rows[0]?.total || 0;
+    res.json({ funnel: funnel.rows, by_city: city.rows, by_type: type.rows, win_rate: total ? Math.round((Number(totals.rows[0].won) / total) * 100) : 0 });
+  } catch (err) {
+    console.log("PIPELINE ANALYTICS ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.get("/analytics/demand-heatmap", auth, async (req, res) => {
+  try {
+    const days = Math.max(1, Math.min(365, Number(req.query.days) || 30));
+    const result = await db.query("SELECT EXTRACT(DOW FROM sm.created_at)::int AS day_of_week, EXTRACT(HOUR FROM sm.created_at)::int AS hour_of_day, SUM(sm.quantity)::int AS sales_volume FROM stock_movements sm WHERE sm.change_type='sale' AND sm.created_at >= NOW() - ($1 * INTERVAL '1 day') GROUP BY 1,2 ORDER BY 1,2", [days]);
+    res.json({ window_days: days, rows: result.rows });
+  } catch (err) {
+    console.log("DEMAND HEATMAP ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.get("/analytics/demand-by-sector", auth, async (req, res) => {
+  try {
+    const days = Math.max(1, Math.min(365, Number(req.query.days) || 30));
+    const result = await db.query("SELECT COALESCE(m.sector, 'unknown') AS sector, SUM(sm.quantity)::int AS sales_volume, COUNT(DISTINCT m.id)::int AS machine_count FROM stock_movements sm JOIN machine_slots ms ON ms.id=sm.machine_slot_id JOIN machines m ON m.id=ms.machine_id WHERE sm.change_type='sale' AND sm.created_at >= NOW() - ($1 * INTERVAL '1 day') GROUP BY 1 ORDER BY sales_volume DESC", [days]);
+    res.json({ window_days: days, rows: result.rows });
+  } catch (err) {
+    console.log("DEMAND SECTOR ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.get("/analytics/refill-routes", auth, async (req, res) => {
+  try {
+    const result = await db.query(`WITH slot_velocity AS (
+      SELECT ms.machine_id, ms.id, ms.current_stock, ms.low_stock_threshold,
+             COALESCE(SUM(sm.quantity), 0)::numeric / 7 AS daily_sales
+      FROM machine_slots ms LEFT JOIN stock_movements sm ON sm.machine_slot_id=ms.id
+        AND sm.change_type='sale' AND sm.created_at >= NOW() - INTERVAL '7 days'
+      GROUP BY ms.id
+    )
+    SELECT m.id, m.name, m.location, m.city, m.lat, m.lng, COUNT(sv.id)::int AS urgent_slots
+    FROM machines m JOIN slot_velocity sv ON sv.machine_id=m.id
+    WHERE sv.current_stock <= sv.low_stock_threshold OR (sv.daily_sales > 0 AND sv.current_stock / sv.daily_sales <= 2)
+    GROUP BY m.id ORDER BY m.lat NULLS LAST, m.lng NULLS LAST, m.city, m.name`);
+    res.json({ stop_count: result.rows.length, route: result.rows });
+  } catch (err) {
+    console.log("REFILL ROUTE ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
 app.get("/tickets/:id/status", auth, async (req, res) => {
   try {
     const result = await db.query(
@@ -3129,6 +3603,11 @@ loadBotSettingsFromDb();
 setInterval(() => {
   autoCloseInactiveTickets();
 }, 60 * 1000);
+
+setInterval(() => {
+  recalculateInventoryAlerts();
+  emitRenewalWarnings();
+}, 15 * 60 * 1000);
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(` Server running on port ${PORT}`);
