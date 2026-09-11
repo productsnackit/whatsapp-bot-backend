@@ -5,6 +5,8 @@ import express from "express";
 import http from "http";
 import cors from "cors";
 import axios from "axios";
+import multer from "multer";
+import XLSX from "xlsx";
 import { Server } from "socket.io";
 import { v2 as cloudinary } from "cloudinary";
 
@@ -32,7 +34,19 @@ const io = new Server(httpServer, {
 app.use(cors());
 app.use(express.json({ limit: "25mb" }));
 
+const operationsUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: (req, file, callback) => {
+    const allowed = /\.(xlsx|xls)$/i.test(file.originalname || "");
+    callback(allowed ? null : new Error("Only .xlsx and .xls files are allowed"), allowed);
+  },
+});
+
 app.use((err, req, res, next) => {
+  if (err instanceof multer.MulterError || err?.message === "Only .xlsx and .xls files are allowed") {
+    return res.status(400).json({ error: err.message || "Invalid spreadsheet upload" });
+  }
   if (err?.type === "entity.too.large") {
     return res.status(413).json({ error: "Attachments are too large. Please send smaller files." });
   }
@@ -271,6 +285,21 @@ async function ensureOperationsTables() {
         id SERIAL PRIMARY KEY, full_name TEXT NOT NULL, phone TEXT, email TEXT,
         enquiry_type TEXT DEFAULT 'other', service_option TEXT, message TEXT, city TEXT,
         stage TEXT DEFAULT 'new', assigned_to TEXT, created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS import_batches (
+        id SERIAL PRIMARY KEY,
+        filename TEXT NOT NULL,
+        cloudinary_url TEXT,
+        uploaded_by TEXT,
+        sheet_type TEXT NOT NULL,
+        total_rows INTEGER DEFAULT 0,
+        success_count INTEGER DEFAULT 0,
+        error_count INTEGER DEFAULT 0,
+        status TEXT DEFAULT 'processing',
+        error_report JSONB DEFAULT '[]'::jsonb,
+        created_at TIMESTAMPTZ DEFAULT NOW()
       )
     `);
     await db.query(`
@@ -2007,7 +2036,8 @@ function auth(req, res, next) {
     const employee = global.internalSessions.get(token);
     if (!employee) return res.status(401).json({ error: "Invalid token" });
 
-    if (!req.path.startsWith("/internal/")) {
+    const operationsPath = req.path.startsWith("/operations/") || req.path.startsWith("/machines") || req.path.startsWith("/inventory/") || req.path.startsWith("/host-sites") || req.path.startsWith("/brands") || req.path.startsWith("/skus/") || req.path.startsWith("/analytics/");
+    if (!req.path.startsWith("/internal/") && !(operationsPath && employee.department === "Operations")) {
       return res.status(403).json({ error: "Internal chat access only" });
     }
 
@@ -2905,6 +2935,245 @@ app.get("/analytics/refill-routes", auth, async (req, res) => {
   } catch (err) {
     console.log("REFILL ROUTE ERROR:", err.message);
     res.status(500).json({ error: "Server error" });
+  }
+});
+
+const importSchemas = {
+  machines: ["name", "location", "city", "sector", "host_site_company_name", "lat", "lng", "install_date"],
+  slots: ["machine_location", "slot_number", "sku_name", "capacity", "current_stock", "low_stock_threshold"],
+  host_sites: ["company_name", "contact_name", "contact_phone", "contact_email", "address", "city", "sector", "contract_start", "contract_end", "service_charge"],
+  brands: ["name", "contact_email", "contact_phone", "status"],
+  skus: ["brand_name", "name", "category", "unit_price"],
+};
+
+function importUserCanAccess(req) {
+  return req.user?.role === "admin" || req.user?.department === "Operations";
+}
+
+function normalizeImportRow(row) {
+  return Object.fromEntries(Object.entries(row).map(([key, value]) => [
+    String(key).trim().toLowerCase().replace(/[^a-z0-9]+/g, "_"),
+    typeof value === "string" ? value.trim() : value,
+  ]));
+}
+
+function importValue(row, key) {
+  const value = row[key];
+  return value === undefined || value === null ? "" : value;
+}
+
+function importNumber(value, label, rowNumber, errors, { integer = false, required = true } = {}) {
+  if (value === "" && !required) return null;
+  const number = Number(value);
+  if (!Number.isFinite(number) || (integer && !Number.isInteger(number))) {
+    errors.push({ row: rowNumber, status: "error", message: `${label} must be a valid ${integer ? "integer" : "number"}` });
+    return null;
+  }
+  return number;
+}
+
+function importRequired(value, label, rowNumber, errors) {
+  if (String(value ?? "").trim() === "") errors.push({ row: rowNumber, status: "error", message: `${label} is required` });
+  return String(value ?? "").trim();
+}
+
+function importDate(value, label, rowNumber, errors) {
+  if (value === "" || value === null || value === undefined) return null;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) errors.push({ row: rowNumber, status: "error", message: `${label} must be a valid date` });
+  return value;
+}
+
+function importEmail(value, label, rowNumber, errors) {
+  if (!value) return null;
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(value))) errors.push({ row: rowNumber, status: "error", message: `${label} must be a valid email` });
+  return value;
+}
+
+async function uploadImportFile(file) {
+  return new Promise((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream(
+      { resource_type: "raw", folder: "snackit/imports", use_filename: true, unique_filename: true },
+      (error, result) => error ? reject(error) : resolve(result?.secure_url || result?.url)
+    );
+    stream.end(file.buffer);
+  });
+}
+
+async function updateImportBatch(id, fields) {
+  const keys = Object.keys(fields);
+  const values = keys.map((key) => fields[key]);
+  await db.query(`UPDATE import_batches SET ${keys.map((key, index) => `${key}=$${index + 1}`).join(", ")} WHERE id=$${keys.length + 1}`, [...values, id]);
+}
+
+async function resolveImportReferences(type, rows) {
+  for (const item of rows) {
+    const { rowNumber, row, errors } = item;
+    if (type === "machines") {
+      const company = importValue(row, "host_site_company_name");
+      if (company) {
+        const result = await db.query("SELECT id FROM host_sites WHERE LOWER(company_name)=LOWER($1) LIMIT 1", [company]);
+        if (!result.rows.length) errors.push({ row: rowNumber, status: "error", message: `Host site '${company}' not found` });
+        else item.hostSiteId = result.rows[0].id;
+      }
+    }
+    if (type === "slots") {
+      const location = importRequired(importValue(row, "machine_location"), "machine_location", rowNumber, errors);
+      const machine = await db.query("SELECT id FROM machines WHERE LOWER(location)=LOWER($1) LIMIT 1", [location]);
+      if (!machine.rows.length) errors.push({ row: rowNumber, status: "error", message: `Machine at '${location}' not found` });
+      else item.machineId = machine.rows[0].id;
+      const sku = importRequired(importValue(row, "sku_name"), "sku_name", rowNumber, errors);
+      const skuResult = await db.query("SELECT id FROM skus WHERE LOWER(name)=LOWER($1) LIMIT 1", [sku]);
+      if (!skuResult.rows.length) errors.push({ row: rowNumber, status: "error", message: `SKU '${sku}' not found` });
+      else item.skuId = skuResult.rows[0].id;
+    }
+    if (type === "skus") {
+      const brand = importRequired(importValue(row, "brand_name"), "brand_name", rowNumber, errors);
+      const brandResult = await db.query("SELECT id FROM brands WHERE LOWER(name)=LOWER($1) LIMIT 1", [brand]);
+      if (!brandResult.rows.length) errors.push({ row: rowNumber, status: "error", message: `Brand '${brand}' not found` });
+      else item.brandId = brandResult.rows[0].id;
+    }
+  }
+}
+
+async function validateImportRows(type, rawRows) {
+  const expected = importSchemas[type];
+  const prepared = [];
+  const report = [];
+  rawRows.forEach((source, index) => {
+    const rowNumber = index + 2;
+    const row = normalizeImportRow(source);
+    const errors = [];
+    expected.forEach((column) => {
+      if (column !== "host_site_company_name" && column !== "category" && column !== "contact_name" && column !== "contact_phone" && column !== "contact_email" && column !== "address" && column !== "city" && column !== "sector" && column !== "install_date" && column !== "contract_start" && column !== "contract_end" && column !== "service_charge" && column !== "status" && column !== "lat" && column !== "lng") importRequired(importValue(row, column), column, rowNumber, errors);
+    });
+    if (type === "machines") {
+      importRequired(row.name, "name", rowNumber, errors); importRequired(row.location, "location", rowNumber, errors);
+      importNumber(row.lat, "lat", rowNumber, errors, { required: false }); importNumber(row.lng, "lng", rowNumber, errors, { required: false });
+      importDate(row.install_date, "install_date", rowNumber, errors);
+    }
+    if (type === "slots") {
+      importRequired(row.slot_number, "slot_number", rowNumber, errors); importNumber(row.capacity, "capacity", rowNumber, errors, { integer: true }); importNumber(row.current_stock, "current_stock", rowNumber, errors, { integer: true }); importNumber(row.low_stock_threshold, "low_stock_threshold", rowNumber, errors, { integer: true });
+    }
+    if (type === "host_sites") { importRequired(row.company_name, "company_name", rowNumber, errors); importNumber(row.service_charge, "service_charge", rowNumber, errors, { required: false }); importEmail(row.contact_email, "contact_email", rowNumber, errors); importDate(row.contract_start, "contract_start", rowNumber, errors); importDate(row.contract_end, "contract_end", rowNumber, errors); }
+    if (type === "brands") { importRequired(row.name, "name", rowNumber, errors); importEmail(row.contact_email, "contact_email", rowNumber, errors); if (row.status && !["active", "pending", "inactive"].includes(String(row.status).toLowerCase())) errors.push({ row: rowNumber, status: "error", message: "status must be active, pending, or inactive" }); }
+    if (type === "skus") { importRequired(row.name, "name", rowNumber, errors); importNumber(row.unit_price, "unit_price", rowNumber, errors, { required: false }); }
+    prepared.push({ rowNumber, row, errors });
+  });
+  await resolveImportReferences(type, prepared);
+  report.push(...prepared.flatMap((item) => item.errors));
+  return { prepared, report };
+}
+
+async function writeImportRow(type, item) {
+  const { row, hostSiteId, machineId, skuId, brandId } = item;
+  if (type === "machines") {
+    const result = await db.query(`INSERT INTO machines (name, location, city, sector, host_site_id, lat, lng, install_date) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (location) DO UPDATE SET name=EXCLUDED.name, city=EXCLUDED.city, sector=EXCLUDED.sector, host_site_id=EXCLUDED.host_site_id, lat=EXCLUDED.lat, lng=EXCLUDED.lng, install_date=EXCLUDED.install_date, updated_at=NOW() RETURNING id`, [row.name, row.location, row.city || null, row.sector || null, hostSiteId || null, row.lat === "" ? null : Number(row.lat), row.lng === "" ? null : Number(row.lng), row.install_date || null]);
+    return result.rows[0].id;
+  }
+  if (type === "slots") {
+    const result = await db.query(`INSERT INTO machine_slots (machine_id, slot_number, sku_id, capacity, current_stock, low_stock_threshold) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (machine_id, slot_number) DO UPDATE SET sku_id=EXCLUDED.sku_id, capacity=EXCLUDED.capacity, current_stock=EXCLUDED.current_stock, low_stock_threshold=EXCLUDED.low_stock_threshold, updated_at=NOW() RETURNING id`, [machineId, row.slot_number, skuId, Number(row.capacity), Number(row.current_stock), Number(row.low_stock_threshold)]);
+    return result.rows[0].id;
+  }
+  if (type === "host_sites") {
+    const existing = await db.query("SELECT id FROM host_sites WHERE LOWER(company_name)=LOWER($1) LIMIT 1", [row.company_name]);
+    const result = existing.rows.length
+      ? await db.query(`UPDATE host_sites SET contact_name=$1, contact_phone=$2, contact_email=$3, address=$4, city=$5, sector=$6, contract_start=$7, contract_end=$8, service_charge=$9, updated_at=NOW() WHERE id=$10 RETURNING id`, [row.contact_name || null, row.contact_phone || null, row.contact_email || null, row.address || null, row.city || null, row.sector || null, row.contract_start || null, row.contract_end || null, row.service_charge === "" ? 0 : Number(row.service_charge), existing.rows[0].id])
+      : await db.query(`INSERT INTO host_sites (company_name, contact_name, contact_phone, contact_email, address, city, sector, contract_start, contract_end, service_charge) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`, [row.company_name, row.contact_name || null, row.contact_phone || null, row.contact_email || null, row.address || null, row.city || null, row.sector || null, row.contract_start || null, row.contract_end || null, row.service_charge === "" ? 0 : Number(row.service_charge)]);
+    return result.rows[0].id;
+  }
+  if (type === "brands") {
+    const result = await db.query(`INSERT INTO brands (name, contact_email, contact_phone, status) VALUES ($1,$2,$3,$4) ON CONFLICT (name) DO UPDATE SET contact_email=EXCLUDED.contact_email, contact_phone=EXCLUDED.contact_phone, status=EXCLUDED.status, updated_at=NOW() RETURNING id`, [row.name, row.contact_email || null, row.contact_phone || null, row.status || "active"]);
+    return result.rows[0].id;
+  }
+  const result = await db.query(`INSERT INTO skus (brand_id, name, category, unit_price) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING RETURNING id`, [brandId, row.name, row.category || null, row.unit_price === "" ? 0 : Number(row.unit_price)]);
+  if (result.rows.length) return result.rows[0].id;
+  const existing = await db.query("SELECT id FROM skus WHERE brand_id=$1 AND LOWER(name)=LOWER($2) LIMIT 1", [brandId, row.name]);
+  if (!existing.rows.length) throw new Error(`SKU '${row.name}' could not be saved`);
+  await db.query("UPDATE skus SET category=$1, unit_price=$2, updated_at=NOW() WHERE id=$3", [row.category || null, row.unit_price === "" ? 0 : Number(row.unit_price), existing.rows[0].id]);
+  return existing.rows[0].id;
+}
+
+app.post("/operations/import", auth, operationsUpload.single("file"), async (req, res) => {
+  let batchId = null;
+  try {
+    if (!importUserCanAccess(req)) return res.status(403).json({ error: "Admin or Operations access required" });
+    const type = String(req.body?.type || "").trim().toLowerCase();
+    if (!importSchemas[type]) return res.status(400).json({ error: "Invalid import type" });
+    if (!req.file) return res.status(400).json({ error: "Spreadsheet file is required" });
+    const cloudinaryUrl = await uploadImportFile(req.file);
+    const batch = await db.query("INSERT INTO import_batches (filename, cloudinary_url, uploaded_by, sheet_type, status) VALUES ($1,$2,$3,$4,'processing') RETURNING *", [req.file.originalname, cloudinaryUrl, req.user?.name || req.user?.username || "Admin", type]);
+    batchId = batch.rows[0].id;
+    let rawRows;
+    try {
+      const workbook = XLSX.read(req.file.buffer, { type: "buffer", cellDates: true });
+      const sheet = workbook.Sheets[workbook.SheetNames[0]];
+      rawRows = XLSX.utils.sheet_to_json(sheet, { defval: "", raw: false });
+    } catch (err) {
+      await updateImportBatch(batchId, { status: "failed", error_count: 1, error_report: JSON.stringify([{ row: 0, status: "error", message: "Could not parse spreadsheet" }]) });
+      return res.status(400).json({ error: "Could not parse spreadsheet", batch_id: batchId });
+    }
+    if (!rawRows.length) throw new Error("Spreadsheet has no data rows");
+    const { prepared, report } = await validateImportRows(type, rawRows);
+    let successCount = 0;
+    for (const item of prepared) {
+      if (item.errors.length) continue;
+      try {
+        const id = await writeImportRow(type, item);
+        report.push({ row: item.rowNumber, status: "success", id }); successCount += 1;
+      } catch (err) {
+        report.push({ row: item.rowNumber, status: "error", message: err.message });
+      }
+    }
+    const errorCount = report.filter((item) => item.status === "error").length;
+    const status = successCount === 0 ? "failed" : "completed";
+    await updateImportBatch(batchId, { total_rows: rawRows.length, success_count: successCount, error_count: errorCount, status, error_report: JSON.stringify(report) });
+    const summary = { id: batchId, filename: req.file.originalname, sheet_type: type, total_rows: rawRows.length, success_count: successCount, error_count: errorCount, status, cloudinary_url: cloudinaryUrl };
+    await emitOperationsEvent("import-completed", summary);
+    res.status(201).json({ ...summary, error_report: report });
+  } catch (err) {
+    console.log("IMPORT ERROR:", err.message);
+    if (batchId) await updateImportBatch(batchId, { status: "failed", error_count: 1, error_report: JSON.stringify([{ row: 0, status: "error", message: err.message }]) });
+    res.status(500).json({ error: err.message || "Import failed", batch_id: batchId });
+  }
+});
+
+app.get("/operations/imports", auth, async (req, res) => {
+  try {
+    const values = []; let filter = "";
+    if (req.query.type && importSchemas[String(req.query.type)]) { values.push(String(req.query.type)); filter = "WHERE sheet_type=$1"; }
+    const result = await db.query(`SELECT id, filename, cloudinary_url, uploaded_by, sheet_type, total_rows, success_count, error_count, status, created_at FROM import_batches ${filter} ORDER BY created_at DESC`, values);
+    res.json(result.rows);
+  } catch (err) {
+    console.log("IMPORT HISTORY ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.get("/operations/imports/:id", auth, async (req, res) => {
+  try {
+    const result = await db.query("SELECT * FROM import_batches WHERE id=$1", [req.params.id]);
+    if (!result.rows.length) return res.status(404).json({ error: "Import batch not found" });
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.log("IMPORT DETAIL ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.get("/operations/import-template/:type", auth, async (req, res) => {
+  try {
+    const type = String(req.params.type || "").toLowerCase();
+    if (!importSchemas[type]) return res.status(400).json({ error: "Invalid import type" });
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet([importSchemas[type]]), type);
+    const buffer = XLSX.write(workbook, { type: "buffer", bookType: "xlsx" });
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", `attachment; filename="snackit-${type}-template.xlsx"`);
+    res.send(buffer);
+  } catch (err) {
+    console.log("IMPORT TEMPLATE ERROR:", err.message);
+    res.status(500).json({ error: "Could not generate template" });
   }
 });
 
