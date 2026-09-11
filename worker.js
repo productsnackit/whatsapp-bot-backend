@@ -550,8 +550,8 @@ How can we help you today?
           const rating = global.feedbackActive?.[from] || null;
 
           await db.query(
-            "INSERT INTO feedback (phone, rating, comment) VALUES ($1, $2, $3)",
-            [from, rating, text || ""]
+            "INSERT INTO feedback (phone, ticket_id, rating, comment) VALUES ($1, $2, $3, $4)",
+            [from, ticketId, rating, text || ""]
           );
 
           if (global.feedbackActive) {

@@ -59,6 +59,7 @@ app.use("/uploads", express.static("uploads"));
 
 /* ================= GLOBAL STATE ================= */
 if (!global.feedbackActive) global.feedbackActive = {};
+if (!global.feedbackTargetTicket) global.feedbackTargetTicket = {};
 if (!global.upiActive) global.upiActive = {};
 if (!global.adminTakeover) global.adminTakeover = {};
 if (!global.retryCount) global.retryCount = {}; // Track retry attempts
@@ -169,14 +170,52 @@ async function ensurePaytmSettingTable() {
 async function ensureSupportColumns() {
   try {
     await db.query(`
+      CREATE TABLE IF NOT EXISTS machines (
+        id SERIAL PRIMARY KEY,
+        name TEXT NOT NULL,
+        location TEXT NOT NULL UNIQUE,
+        lat NUMERIC,
+        lng NUMERIC,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS customer_risk (
+        id SERIAL PRIMARY KEY,
+        phone TEXT NOT NULL UNIQUE,
+        risk_score INTEGER NOT NULL DEFAULT 0,
+        ticket_count INTEGER NOT NULL DEFAULT 0,
+        last_ticket_at TIMESTAMPTZ,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    await db.query(`
       ALTER TABLE tickets
         ADD COLUMN IF NOT EXISTS priority TEXT DEFAULT 'normal',
         ADD COLUMN IF NOT EXISTS assigned_to TEXT,
         ADD COLUMN IF NOT EXISTS admin_notes TEXT DEFAULT '',
         ADD COLUMN IF NOT EXISTS reopened_at TIMESTAMPTZ,
-        ADD COLUMN IF NOT EXISTS last_customer_message_at TIMESTAMPTZ
+        ADD COLUMN IF NOT EXISTS last_customer_message_at TIMESTAMPTZ,
+        ADD COLUMN IF NOT EXISTS machine_id INTEGER REFERENCES machines(id),
+        ADD COLUMN IF NOT EXISTS refund_stage TEXT DEFAULT 'RAISED',
+        ADD COLUMN IF NOT EXISTS risk_score INTEGER DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ
+    `);
+    await db.query("ALTER TABLE feedback ADD COLUMN IF NOT EXISTS ticket_id INTEGER REFERENCES tickets(id)");
+    await db.query(`
+      INSERT INTO machines (name, location)
+      SELECT DISTINCT LEFT(TRIM(location), 200), TRIM(location)
+      FROM tickets
+      WHERE NULLIF(TRIM(location), '') IS NOT NULL
+      ON CONFLICT (location) DO NOTHING
+    `);
+    await db.query(`
+      UPDATE tickets t SET machine_id = m.id
+      FROM machines m
+      WHERE t.machine_id IS NULL AND LOWER(TRIM(t.location)) = LOWER(m.location)
     `);
     await db.query("UPDATE tickets SET last_customer_message_at = COALESCE(last_customer_message_at, updated_at, created_at)");
+    await db.query("UPDATE tickets SET refund_stage = CASE WHEN LOWER(status) IN ('refunded', 'auto_refunded', 'resolved') THEN 'PROCESSED' WHEN state = 'DONE' THEN 'UNDER_REVIEW' ELSE COALESCE(refund_stage, 'RAISED') END WHERE refund_stage IS NULL");
   } catch (err) {
     console.log("SUPPORT COLUMNS ERROR:", err.message);
   }
@@ -382,8 +421,30 @@ async function saveMessage(ticketId, sender, message) {
 }
 
 async function updateTicket(id, fields) {
-  const keys = Object.keys(fields);
-  const values = Object.values(fields);
+  const currentResult = await db.query("SELECT phone, state, refund_stage FROM tickets WHERE id=$1", [id]);
+  const current = currentResult.rows[0];
+  const nextFields = { ...fields };
+
+  if (nextFields.location && !nextFields.machine_id) {
+    const location = String(nextFields.location).trim().replace(/\s+/g, " ");
+    const machine = await db.query(
+      `INSERT INTO machines (name, location) VALUES ($1, $2)
+       ON CONFLICT (location) DO UPDATE SET name = EXCLUDED.name
+       RETURNING id`,
+      [location.slice(0, 200), location]
+    );
+    nextFields.machine_id = machine.rows[0]?.id || null;
+    nextFields.location = location;
+  }
+
+  const nextStage = getRefundStage(nextFields.refund_stage || nextFields.status, nextFields.state || current?.state, current?.refund_stage);
+  if (nextStage && nextStage !== current?.refund_stage) nextFields.refund_stage = nextStage;
+  if (["resolved", "refunded", "auto_refunded"].includes(String(nextFields.status || "").toLowerCase())) {
+    nextFields.resolved_at = new Date();
+  }
+
+  const keys = Object.keys(nextFields);
+  const values = Object.values(nextFields);
 
   keys.push("updated_at");
   values.push(new Date());
@@ -394,6 +455,51 @@ async function updateTicket(id, fields) {
     `UPDATE tickets SET ${setQuery} WHERE id=$${keys.length + 1}`,
     [...values, id]
   );
+
+  await refreshCustomerRisk(id, current?.phone);
+
+  if (current?.phone && nextFields.refund_stage && nextFields.refund_stage !== current.refund_stage && nextFields.refund_stage !== "PROCESSED") {
+    const stageMessages = {
+      RAISED: "Your Snackit support request has been raised.",
+      VERIFYING: "Your Snackit request is being verified.",
+      UNDER_REVIEW: "Your Snackit request is under review by our team.",
+      PROCESSED: "Your Snackit request has been processed.",
+    };
+    await sendWhatsApp(current.phone, stageMessages[nextFields.refund_stage]);
+  }
+}
+
+function getRefundStage(value, state, currentStage = "RAISED") {
+  const normalized = String(value || "").toLowerCase();
+  if (["refunded", "auto_refunded", "resolved", "closed"].includes(normalized)) return "PROCESSED";
+  if (state === "DONE" || normalized === "processing") return "UNDER_REVIEW";
+  if (["STEP1", "STEP2", "STEP2_RETRY", "STEP3", "EXP_IMG", "EXP_UPI", "EXP_UPI_IMG", "PRICE_IMG", "PRICE_UPI", "PRICE_UPI_IMG", "DAM_IMG", "DAM_UPI", "DAM_UPI_IMG"].includes(state)) return "VERIFYING";
+  return currentStage || "RAISED";
+}
+
+async function refreshCustomerRisk(ticketId, phone) {
+  try {
+    if (!phone) return;
+    const result = await db.query(
+      `SELECT COUNT(*)::int AS count,
+              COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '7 days')::int AS weekly_count,
+              COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '30 days')::int AS monthly_count
+       FROM tickets WHERE phone=$1`,
+      [phone]
+    );
+    const row = result.rows[0];
+    const riskScore = Math.min(100, Number(row.weekly_count) * 15 + Number(row.monthly_count) * 2);
+    await db.query(
+      `INSERT INTO customer_risk (phone, risk_score, ticket_count, last_ticket_at, updated_at)
+       VALUES ($1, $2, $3, NOW(), NOW())
+       ON CONFLICT (phone) DO UPDATE SET risk_score=EXCLUDED.risk_score,
+         ticket_count=EXCLUDED.ticket_count, last_ticket_at=EXCLUDED.last_ticket_at, updated_at=NOW()`,
+      [phone, riskScore, row.count]
+    );
+    await db.query("UPDATE tickets SET risk_score=$1 WHERE id=$2", [riskScore, ticketId]);
+  } catch (err) {
+    console.log("CUSTOMER RISK ERROR:", err.message);
+  }
 }
 
 /* ================= VALIDATION FUNCTIONS ================= */
@@ -559,6 +665,10 @@ async function processMessage(jobData) {
 
     const existingTicket = res.rows[0];
 
+    if (global.feedbackTargetTicket[from] && !["FEEDBACK", "RATING", "COMMENT"].includes(existingTicket.state)) {
+      await updateTicket(ticketId, { category: "FEEDBACK", state: "RATING", main_issue: "Feedback" });
+    }
+
     // ADMIN TAKEOVER CHECK
     if (existingTicket.takeover === true || existingTicket.takeover === "true") {
       console.log("Admin handling this chat");
@@ -568,6 +678,11 @@ async function processMessage(jobData) {
     let state = existingTicket.state || "START";
     let category = existingTicket.category || null;
     let subIssue = existingTicket.sub_issue || null;
+
+    if (global.feedbackTargetTicket[from]) {
+      category = "FEEDBACK";
+      state = "RATING";
+    }
 
     state = typeof state === "string" ? state.trim().toUpperCase() : "START";
     category = typeof category === "string" ? category.trim().toUpperCase() : null;
@@ -1769,13 +1884,14 @@ Tell us what we can improve. Any comments or suggestions?`
         }
 
         await db.query(
-          "INSERT INTO feedback (phone, rating, comment) VALUES ($1, $2, $3)",
-          [from, rating, text || ""]
+          "INSERT INTO feedback (phone, ticket_id, rating, comment) VALUES ($1, $2, $3, $4)",
+          [from, global.feedbackTargetTicket[from] || ticketId, rating, text || ""]
         );
 
         if (global.feedbackActive) {
           delete global.feedbackActive[from];
         }
+        delete global.feedbackTargetTicket[from];
 
         await updateTicket(ticketId, {
           state: "CLOSED",
@@ -1880,6 +1996,9 @@ app.get("/tickets", auth, async (req, res) => {
         paytm_status,
         status,
         state,
+        refund_stage,
+        machine_id,
+        risk_score,
         takeover,
         priority,
         assigned_to,
@@ -1894,6 +2013,7 @@ app.get("/tickets", auth, async (req, res) => {
 
     const rows = result.rows.map((t) => ({
       ...t,
+      risk_flag: Number(t.risk_score || 0) >= 50 ? "high" : Number(t.risk_score || 0) >= 25 ? "medium" : "low",
       image: t.image
         ? t.image.startsWith("http")
           ? t.image
@@ -1920,7 +2040,7 @@ app.get("/tickets", auth, async (req, res) => {
 app.get("/feedback", auth, async (req, res) => {
   try {
     const result = await db.query(`
-      SELECT id, phone, rating, comment, created_at
+      SELECT id, ticket_id, phone, rating, comment, created_at
       FROM feedback
       ORDER BY id DESC
     `);
@@ -2021,19 +2141,16 @@ app.post("/ticket/action", auth, async (req, res) => {
     if (phone) {
       console.log("📲 Sending WhatsApp to:", phone);
       await sendWhatsApp(phone, message);
+      if (["REFUNDED", "RESOLVED"].includes(action)) {
+        global.feedbackTargetTicket[phone] = ticketId;
+        await sendWhatsApp(phone, "Please rate your support experience from 1 to 5 by replying with a number.");
+      }
       console.log("✅ WhatsApp sent");
     } else {
       console.log("❌ No phone found");
     }
 
-    await db.query(
-      `
-      UPDATE tickets 
-      SET status=$1, state='CLOSED', updated_at=NOW()
-      WHERE id=$2
-      `,
-      [status, ticketId]
-    );
+    await updateTicket(ticketId, { status, state: "CLOSED", refund_stage: "PROCESSED" });
 
     console.log("✅ DONE");
 
@@ -2317,9 +2434,107 @@ app.delete("/tickets/:id", auth, async (req, res) => {
   }
 });
 
+app.get("/tickets/:id/status", auth, async (req, res) => {
+  try {
+    const result = await db.query(
+      "SELECT id, status, state, refund_stage, updated_at FROM tickets WHERE id=$1",
+      [req.params.id]
+    );
+    if (!result.rows.length) return res.status(404).json({ error: "Ticket not found" });
+    res.json({ ...result.rows[0], stages: ["RAISED", "VERIFYING", "UNDER_REVIEW", "PROCESSED"] });
+  } catch (err) {
+    console.log("TICKET STATUS ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
 /* =========================================================
    ANALYTICS
 ========================================================= */
+app.get("/analytics/machine-health", auth, async (req, res) => {
+  try {
+    const days = Math.max(1, Math.min(90, Number(req.query.days) || 7));
+    const threshold = Math.max(1, Number(req.query.threshold) || 5);
+    const result = await db.query(
+      `SELECT m.id, m.name, m.location, m.lat, m.lng,
+              COUNT(t.id)::int AS complaint_count,
+              (COUNT(t.id) >= $2) AS needs_maintenance
+       FROM machines m
+       LEFT JOIN tickets t ON t.machine_id = m.id AND t.created_at >= NOW() - ($1 * INTERVAL '1 day')
+       GROUP BY m.id
+       ORDER BY complaint_count DESC, m.name`,
+      [days, threshold]
+    );
+    res.json({ window_days: days, threshold, machines: result.rows });
+  } catch (err) {
+    console.log("MACHINE HEALTH ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.get("/analytics/sla", auth, async (req, res) => {
+  try {
+    const slaHours = Math.max(1, Number(req.query.sla_hours) || 24);
+    const result = await db.query(
+      `SELECT COALESCE(NULLIF(main_issue, ''), NULLIF(category, ''), 'Unknown') AS category,
+              COUNT(*)::int AS ticket_count,
+              ROUND(AVG(EXTRACT(EPOCH FROM (COALESCE(resolved_at, updated_at) - created_at)) / 3600)::numeric, 2) AS average_resolution_hours
+       FROM tickets
+       WHERE LOWER(COALESCE(status, '')) IN ('resolved', 'refunded', 'auto_refunded', 'closed')
+       GROUP BY 1 ORDER BY 1`,
+    );
+    const breaching = await db.query(
+      `SELECT id, phone, category, main_issue, sub_issue, priority, assigned_to, created_at,
+              ROUND((EXTRACT(EPOCH FROM (NOW() - created_at)) / 3600)::numeric, 2) AS age_hours
+       FROM tickets
+       WHERE LOWER(COALESCE(status, '')) NOT IN ('resolved', 'refunded', 'auto_refunded', 'closed')
+         AND created_at < NOW() - ($1 * INTERVAL '1 hour')
+       ORDER BY created_at ASC`,
+      [slaHours]
+    );
+    res.json({ sla_hours: slaHours, by_category: result.rows, breaching: breaching.rows });
+  } catch (err) {
+    console.log("SLA ANALYTICS ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.get("/analytics/agent-performance", auth, async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT COALESCE(NULLIF(assigned_to, ''), 'Unassigned') AS agent,
+              COUNT(*) FILTER (WHERE LOWER(COALESCE(status, '')) IN ('resolved', 'refunded', 'auto_refunded', 'closed'))::int AS tickets_closed,
+              ROUND(AVG(EXTRACT(EPOCH FROM (COALESCE(resolved_at, updated_at) - created_at)) FILTER (WHERE LOWER(COALESCE(status, '')) IN ('resolved', 'refunded', 'auto_refunded', 'closed')) / 3600)::numeric, 2) AS average_resolution_hours
+       FROM tickets GROUP BY 1 ORDER BY tickets_closed DESC, agent`
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.log("AGENT ANALYTICS ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.get("/analytics/csat", auth, async (req, res) => {
+  try {
+    const byCategory = await db.query(
+      `SELECT COALESCE(NULLIF(t.main_issue, ''), NULLIF(t.category, ''), 'Unknown') AS category,
+              ROUND(AVG(f.rating::numeric), 2) AS average_rating, COUNT(*)::int AS response_count
+       FROM feedback f LEFT JOIN tickets t ON t.id = f.ticket_id
+       WHERE f.rating IS NOT NULL GROUP BY 1 ORDER BY 1`
+    );
+    const byMachine = await db.query(
+      `SELECT m.id AS machine_id, m.name, m.location,
+              ROUND(AVG(f.rating::numeric), 2) AS average_rating, COUNT(*)::int AS response_count
+       FROM feedback f JOIN tickets t ON t.id = f.ticket_id JOIN machines m ON m.id = t.machine_id
+       WHERE f.rating IS NOT NULL GROUP BY m.id ORDER BY m.name`
+    );
+    res.json({ by_category: byCategory.rows, by_machine: byMachine.rows });
+  } catch (err) {
+    console.log("CSAT ANALYTICS ERROR:", err.message);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
 app.get("/analytics/product-not-dispensed", auth, async (req, res) => {
   try {
     const result = await db.query(`
