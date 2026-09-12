@@ -7,7 +7,8 @@ function sanitizeWhatsAppBody(message) {
   return String(message || "")
     .replace(/[❌✅💳💸🔒📸⚠️📍🔄⏳📦📷🚫💰🧾₹₹]/g, "")
     .replace(/\*\*/g, "")
-    .replace(/\s{2,}/g, " ")
+    .replace(/[ \t]{2,}/g, " ")     // only collapse repeated spaces/tabs, not newlines
+    .replace(/\n{3,}/g, "\n\n")     // optional: cap 3+ blank lines down to 1 blank line
     .trim();
 }
 
