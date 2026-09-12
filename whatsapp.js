@@ -5,10 +5,10 @@ const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 
 function sanitizeWhatsAppBody(message) {
   return String(message || "")
-    .replace(/[❌✅💳💸🔒📸⚠️📍🔄⏳📦📷🚫💰🧾₹₹]/g, "")
+    .replace(/[❌✅💳💸🔒📸⚠️📍🔄⏳📦📷🚫💰🧾₹]/gu, "")   // 👈 added u flag
     .replace(/\*\*/g, "")
-    .replace(/[ \t]{2,}/g, " ")     // only collapse repeated spaces/tabs, not newlines
-    .replace(/\n{3,}/g, "\n\n")     // optional: cap 3+ blank lines down to 1 blank line
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
     .trim();
 }
 

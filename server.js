@@ -399,9 +399,9 @@ async function saveBotSetting(key, value) {
 
 function premiumMessage(text) {
   return String(text || "")
-    .replace(/[❌✅💳💸🔒📸⚠️📍🔄⏳📦📷🚫💰]/g, "")
-    .replace(/[ \t]{2,}/g, " ")   // only squash repeated spaces/tabs
-    .replace(/\n{3,}/g, "\n\n")   // optional: cap accidental triple+ blank lines
+    .replace(/[❌✅💳💸🔒📸⚠️📍🔄⏳📦📷🚫💰]/gu, "")   // 👈 added u flag
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
     .trim();
 }
 
