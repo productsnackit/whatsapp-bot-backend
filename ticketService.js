@@ -138,7 +138,7 @@ export async function getOrCreateTicket(phone) {
   const existing = await db.query(
     `SELECT * FROM tickets 
      WHERE phone = $1 
-     AND state NOT IN ('DONE', 'CLOSED') 
+     AND state NOT IN ('CLOSED') 
       ORDER BY takeover DESC, updated_at DESC NULLS LAST, id DESC
       LIMIT 1`,
     [phone]

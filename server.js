@@ -3401,6 +3401,8 @@ app.get("/webhook", (req, res) => {
 /* =========================================================
    WEBHOOK RECEIVE
 ========================================================= */
+if (!global.processedMessageIds) global.processedMessageIds = new Set();
+
 app.post("/webhook", async (req, res) => {
   try {
     const entry = req.body?.entry?.[0];
@@ -3409,6 +3411,20 @@ app.post("/webhook", async (req, res) => {
     const msg = value?.messages?.[0];
 
     if (!msg) return res.sendStatus(200);
+
+    // De-dupe: WhatsApp can redeliver the same webhook (e.g. slow ack, cold start)
+    if (msg.id) {
+      if (global.processedMessageIds.has(msg.id)) {
+        console.log("DUPLICATE WEBHOOK IGNORED:", msg.id);
+        return res.sendStatus(200);
+      }
+      global.processedMessageIds.add(msg.id);
+      // keep the set from growing forever
+      if (global.processedMessageIds.size > 5000) {
+        const [oldest] = global.processedMessageIds;
+        global.processedMessageIds.delete(oldest);
+      }
+    }
 
     const from = msg.from;
     const type = msg.type;
