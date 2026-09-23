@@ -770,11 +770,7 @@ async function processMessage(jobData) {
       await updateTicket(ticketId, { category: "FEEDBACK", state: "RATING", main_issue: "Feedback" });
     }
 
-    // ADMIN TAKEOVER CHECK
-    if (existingTicket.takeover === true || existingTicket.takeover === "true") {
-      console.log("Admin handling this chat");
-      return;
-    }
+    
 
     let state = existingTicket.state || "START";
     let category = existingTicket.category || null;
@@ -803,7 +799,7 @@ async function processMessage(jobData) {
       return sendWhatsApp(from, "Main menu\n\n1. Refund support\n2. Product enquiry\n3. Share feedback\n\nReply with 1, 2, or 3.");
     }
 
-    if (message === "restart" || message === "reset") {
+        if (message === "restart" || message === "reset") {
       await updateTicket(ticketId, {
         category: null,
         main_issue: null,
@@ -813,6 +809,20 @@ async function processMessage(jobData) {
         takeover: false,
       });
       return sendWhatsApp(from, "Let us start again. Please reply with 1 for refund support, 2 for product enquiry, or 3 to share feedback.");
+    }
+
+    // ADMIN TAKEOVER CHECK — after recovery commands, so users are never permanently stuck
+    if (existingTicket.takeover === true || existingTicket.takeover === "true") {
+      console.log("Admin handling this chat");
+      return;
+    }
+
+        // Recover tickets stuck after max retries — otherwise these get zero replies forever
+    if (["FAILED_STEP1", "FAILED_STEP2", "FAILED_STEP3"].includes(state)) {
+      return sendWhatsApp(
+        from,
+        `❌ We couldn't process your last request after multiple attempts.\n\nType *restart* to start over, or type *agent* to talk to a support specialist.`
+      );
     }
 
     // Already closed or done states
