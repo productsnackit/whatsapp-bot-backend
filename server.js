@@ -15,6 +15,7 @@ import db from "./db.js";
 import { sendWhatsApp } from "./whatsapp.js";
 import { registerAuditRoutes, AUDIT_DEPARTMENTS } from "./auditRoutes.js";
 import { registerPushRoutes, sendPushToUsers, pushUserKey } from "./pushNotifications.js";
+import { handleRefillerWhatsApp } from "./refillerTasks.js";
 
 /* ================= CLOUDINARY ================= */
 cloudinary.config({
@@ -3460,6 +3461,14 @@ app.post("/webhook", async (req, res) => {
         const [oldest] = global.processedMessageIds;
         global.processedMessageIds.delete(oldest);
       }
+    }
+
+    // Refillers answer their CAPA tasks here; they never get the customer menu or a ticket.
+    try {
+      if (await handleRefillerWhatsApp(db, msg)) return res.sendStatus(200);
+    } catch (err) {
+      // Never lose a customer's message because of this check; carry on to the normal bot.
+      console.log("REFILLER MESSAGE ERROR:", err.message);
     }
 
     const from = msg.from;

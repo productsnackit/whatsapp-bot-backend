@@ -4,6 +4,8 @@
     Access: admin, plus employees in the Operations or Audit department.
 ========================================================= */
 
+import { ensureCapaWhatsAppColumns, sendCapaToRefiller } from "./refillerTasks.js";
+
 export const AUDIT_DEPARTMENTS = ["Operations", "Audit"];
 
 // Initial roster and sites, inserted only when the tables are empty.
@@ -75,6 +77,7 @@ async function ensureAuditTables(db) {
       resolved_by TEXT, resolved_at TIMESTAMPTZ, created_at TIMESTAMPTZ DEFAULT NOW()
     )
   `);
+  await ensureCapaWhatsAppColumns(db);
 
   const refillerCount = await db.query("SELECT COUNT(*)::int AS count FROM audit_refillers");
   if (refillerCount.rows[0].count === 0) {
@@ -271,16 +274,31 @@ export function registerAuditRoutes(app, { db, auth, uploadImage }) {
     );
 
     // One CAPA ticket per failed checklist point.
+    const capaIds = [];
     for (const item of checklist) {
       if (Number(item.score) !== 0) continue;
-      await db.query(
-        `INSERT INTO audit_capa (audit_id, location, refiller, severity, defect) VALUES ($1,$2,$3,$4,$5)`,
-        [auditId, location, body.refiller || null, item.critical ? "P1 - Critical SOP defect" : "P2 - Routine defect", `${item.text}${item.notes ? ` - ${item.notes}` : ""}`]
+      const capa = await db.query(
+        `INSERT INTO audit_capa (audit_id, location, refiller, refiller_phone, severity, defect) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+        [auditId, location, body.refiller || null, body.refillerPhone || null, item.critical ? "P1 - Critical SOP defect" : "P2 - Routine defect", `${item.text}${item.notes ? ` - ${item.notes}` : ""}`]
       );
+      capaIds.push(capa.rows[0].id);
     }
     await db.query("UPDATE audit_capa SET ref = 'CAPA-' || LPAD(id::text, 5, '0') WHERE ref IS NULL");
 
-    res.status(201).json(audit.rows[0]);
+    // Send each task to the refiller on WhatsApp so they can fix it and reply Yes / No.
+    const whatsapp = { sent: 0, failed: 0, error: null };
+    if (body.sendToRefiller !== false) {
+      for (const id of capaIds) {
+        const result = await sendCapaToRefiller(db, id);
+        if (result.ok) whatsapp.sent += 1;
+        else {
+          whatsapp.failed += 1;
+          whatsapp.error = whatsapp.error || result.error;
+        }
+      }
+    }
+
+    res.status(201).json({ ...audit.rows[0], capaCount: capaIds.length, whatsapp });
   }));
 
   // Import past audits (e.g. the old standalone tool's CSV export). Rows whose audit ID already exists are skipped.
@@ -340,6 +358,12 @@ export function registerAuditRoutes(app, { db, auth, uploadImage }) {
       ORDER BY (c.status = 'OPEN') DESC, c.created_at DESC LIMIT 1000
     `);
     res.json(result.rows);
+  }));
+
+  app.post("/audit/capa/:id/send", auth, guard, handle("AUDIT CAPA SEND", async (req, res) => {
+    const result = await sendCapaToRefiller(db, req.params.id);
+    if (!result.ok) return res.status(result.error === "CAPA ticket not found" ? 404 : 502).json({ error: result.error });
+    res.json({ ok: true });
   }));
 
   app.patch("/audit/capa/:id", auth, guard, handle("AUDIT CAPA UPDATE", async (req, res) => {
