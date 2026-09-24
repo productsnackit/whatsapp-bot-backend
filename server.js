@@ -13,6 +13,7 @@ import { v2 as cloudinary } from "cloudinary";
 import { getOrCreateTicket, verifyPaymentOnPaytm, storePaytmVerification } from "./ticketService.js";
 import db from "./db.js";
 import { sendWhatsApp } from "./whatsapp.js";
+import { registerAuditRoutes, AUDIT_DEPARTMENTS } from "./auditRoutes.js";
 
 /* ================= CLOUDINARY ================= */
 cloudinary.config({
@@ -2077,7 +2078,12 @@ function auth(req, res, next) {
     if (!employee) return res.status(401).json({ error: "Invalid token" });
 
     const operationsPath = req.path.startsWith("/operations/") || req.path.startsWith("/machines") || req.path.startsWith("/inventory/") || req.path.startsWith("/host-sites") || req.path.startsWith("/brands") || req.path.startsWith("/skus/") || req.path.startsWith("/analytics/");
-    if (!req.path.startsWith("/internal/") && !(operationsPath && employee.department === "Operations")) {
+    const auditPath = req.path.startsWith("/audit");
+    if (
+      !req.path.startsWith("/internal/") &&
+      !(operationsPath && employee.department === "Operations") &&
+      !(auditPath && AUDIT_DEPARTMENTS.includes(employee.department))
+    ) {
       return res.status(403).json({ error: "Internal chat access only" });
     }
 
@@ -2742,6 +2748,8 @@ app.get("/inventory/velocity", auth, async (req, res) => {
     res.status(500).json({ error: "Server error" });
   }
 });
+
+registerAuditRoutes(app, { db, auth, uploadImage: (dataUrl) => uploadToCloudinary(dataUrl) });
 
 app.get("/host-sites/renewals-due", auth, async (req, res) => {
   try {
