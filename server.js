@@ -3734,17 +3734,7 @@ app.post("/internal/chats", auth, (req, res) => {
       pinned: false,
       archived: false,
       favorite: false,
-      messages: [
-        {
-          id: Date.now(),
-          sender: "Admin",
-          text: `New ${String(department).trim()} team chat started.`,
-          time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-          tag: null,
-          priority: chatPriority,
-          status: "open",
-        },
-      ],
+      messages: [],
     };
 
     global.internalChats.unshift(newChat);
