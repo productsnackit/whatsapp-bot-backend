@@ -1450,7 +1450,7 @@ Try again.`
 
 Our team will review and process your refund within 24 hours.
 
-Thank you for choosing Snackit! 🙏`
+Thank you for choosing Snackit!`
           );
         }
       }
@@ -1658,7 +1658,7 @@ Show the product with its price tag clearly visible.`
 
           return sendWhatsApp(
             from,
-            `✅ Image received!
+            `Image received!
 
 💳 *ENTER TRANSACTION ID*`
           );
@@ -1883,7 +1883,7 @@ Show the damage clearly in the photo.`
 
 We regret the inconvenience. Our team will process this within 24 hours.
 
-Thank you for your patience! 🙏`
+Thank you for your patience!`
           );
         }
       }
@@ -2013,7 +2013,7 @@ Tell us what we can improve. Any comments or suggestions?`
           from,
           `✅ *THANK YOU FOR YOUR FEEDBACK!*
 
-Your feedback helps us improve. We appreciate it! 🙏
+Your feedback helps us improve. We appreciate it!
 
 Keep using Snackit! 🎉`
         );
@@ -2216,19 +2216,19 @@ app.post("/ticket/action", auth, async (req, res) => {
     switch (action) {
       case "REFUNDED":
         message =
-          "✅ *Refund Processed!*\n\nYour amount has been processed. Check your bank account in 5-10 minutes.\n\nThank you for your patience! 🙏";
+          "✅ *Refund Processed!*\n\nYour amount has been processed. Check your bank account in 5-10 minutes.\n\nThank you for your patience!";
         status = "refunded";
         break;
 
       case "AUTO_REFUNDED":
         message =
-          "ℹ️ *Auto-Refund Detected*\n\nYour amount was already credited to your account. Please check your bank statement.\n\nThank you for your patience! 🙏";
+          "ℹ️ *Auto-Refund Detected*\n\nYour amount was already credited to your account. Please check your bank statement.\n\nThank you for your patience!";
         status = "auto_refunded";
         break;
 
       case "RESOLVED":
         message =
-          "✅ *Issue Resolved!*\n\nYour concern has been resolved. Thank you for contacting Snackit!\n\nThank you for your patience! 🙏";
+          "✅ *Issue Resolved!*\n\nYour concern has been resolved. Thank you for contacting Snackit!\n\nThank you for your patience!";
         status = "resolved";
         break;
 
