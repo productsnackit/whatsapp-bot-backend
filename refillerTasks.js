@@ -95,11 +95,9 @@ export async function sendCapaToRefiller(db, capaId) {
 async function findRefiller(db, from) {
   const phone = phoneDigits(from);
   const { rows } = await db.query("SELECT name, phone FROM audit_refillers WHERE phone IS NOT NULL AND phone <> ''");
+  // Only numbers in the Refillers list; anyone removed from it is a normal customer again.
   const refiller = rows.find((row) => phoneDigits(row.phone) === phone);
-  if (refiller) return { name: refiller.name, phone };
-  // Someone who was sent a task directly (e.g. phone typed on the audit) also counts.
-  const sent = await db.query("SELECT refiller FROM audit_capa WHERE refiller_phone = $1 LIMIT 1", [phone]);
-  return sent.rows[0] ? { name: sent.rows[0].refiller, phone } : null;
+  return refiller ? { name: refiller.name, phone } : null;
 }
 
 async function pendingTasks(db, phone) {
