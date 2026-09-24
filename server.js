@@ -659,6 +659,22 @@ async function isDuplicateTransaction(transactionId, ticketId) {
 
 const FINAL_MSG = "✅ Ticket has been raised, we will process your concern soon.";
 const MAX_RETRIES = 3;
+
+const BANK_CHECK_MSG = `Sorry for inconvenience caused , usually the refunds will be automatically refunded in your source account , please check your bank statement ,and come back to us raise a ticket , so our team will sort your concerns in short time
+Have you checked your bank account statement ?
+1.yes
+2.no`;
+
+const REFUND_OPTIONS_MSG = `💰 *REFUND OPTIONS*
+
+What's your refund issue?
+
+1️⃣ Product Not Dispensed
+2️⃣ Product Issue
+3️⃣ Charged Higher Price
+4️⃣ Received Damaged Product
+
+Please reply with the number (1-4)`;
 const AUTO_CLOSE_TICKET_MINUTES = 5; // Auto-close after 5 minutes of inactivity
 
 function isPaytmVerificationEnabled() {
@@ -874,22 +890,10 @@ Please reply with the number (1, 2, or 3)`
       if (message === "1") {
         await updateTicket(ticketId, {
           category: "REFUND",
-          state: "MAIN",
+          state: "BANK_CHECK",
         });
 
-        return sendWhatsApp(
-          from,
-          `💰 *REFUND OPTIONS*
-
-What's your refund issue?
-
-1️⃣ Product Not Dispensed
-2️⃣ Product Issue
-3️⃣ Charged Higher Price
-4️⃣ Received Damaged Product
-
-Please reply with the number (1-4)`
-        );
+        return sendWhatsApp(from, BANK_CHECK_MSG);
       }
 
       if (message === "2") {
@@ -940,6 +944,24 @@ Reply with your rating (1-5)`
 
     // ===== REFUND LOGIC =====
     if (category === "REFUND") {
+      // Ask whether the customer checked their bank statement before showing refund options.
+      // On "No" the ticket stays open, so autoCloseInactiveTickets closes it if they don't reply.
+      if (state === "BANK_CHECK") {
+        if (message === "1") {
+          await updateTicket(ticketId, { state: "MAIN" });
+          return sendWhatsApp(from, REFUND_OPTIONS_MSG);
+        }
+
+        if (message === "2") {
+          return sendWhatsApp(
+            from,
+            "Please check your bank account statement and come back to us. If the amount is not refunded, reply with 1 to raise a ticket."
+          );
+        }
+
+        return sendWhatsApp(from, `❌ Invalid option. Please reply with *1* or *2* only.`);
+      }
+
       if (state === "MAIN") {
         const map = {
           "1": "Product Not Dispensed",
@@ -3910,4 +3932,4 @@ setInterval(() => {
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(` Server running on port ${PORT}`);
-});
+});j
