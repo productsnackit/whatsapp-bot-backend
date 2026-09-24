@@ -12,7 +12,7 @@ import { v2 as cloudinary } from "cloudinary";
 
 import { getOrCreateTicket, verifyPaymentOnPaytm, storePaytmVerification } from "./ticketService.js";
 import db from "./db.js";
-import { sendWhatsApp, sendWhatsAppImage } from "./whatsapp.js";
+import { sendWhatsApp } from "./whatsapp.js";
 
 /* ================= CLOUDINARY ================= */
 cloudinary.config({
@@ -70,12 +70,6 @@ io.on("connection", (socket) => {
 
 /* ================= FIX: SERVE UPLOADS ================= */
 app.use("/uploads", express.static("uploads"));
-app.use("/public", express.static("public"));
-
-// Logo shown with the welcome menu. RENDER_EXTERNAL_URL is set automatically on Render.
-const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || process.env.RENDER_EXTERNAL_URL || "";
-const WELCOME_LOGO_URL =
-  process.env.WELCOME_LOGO_URL || (PUBLIC_BASE_URL ? `${PUBLIC_BASE_URL.replace(/\/$/, "")}/public/snackit-logo.jpg` : "");
 
 /* ================= GLOBAL STATE ================= */
 if (!global.feedbackActive) global.feedbackActive = {};
@@ -877,7 +871,9 @@ async function processMessage(jobData) {
     if (!category) {
       await updateTicket(ticketId, { category: "MENU" });
 
-      const welcomeText = `*WELCOME TO SNACKIT!*
+      return sendWhatsApp(
+        from,
+        `👋 *WELCOME TO SNACKIT!*
 
 How can we help you today?
 
@@ -885,14 +881,8 @@ How can we help you today?
 2️⃣ Product Enquiry
 3️⃣ Share Feedback
 
-Please reply with the number (1, 2, or 3)`;
-
-      // Show the Snackit logo with the menu as its caption; fall back to the old text if the image can't be sent
-      if (WELCOME_LOGO_URL && (await sendWhatsAppImage(from, WELCOME_LOGO_URL, welcomeText))) {
-        return;
-      }
-
-      return sendWhatsApp(from, `👋 ${welcomeText}`);
+Please reply with the number (1, 2, or 3)`
+      );
     }
 
     // CATEGORY SELECTION
