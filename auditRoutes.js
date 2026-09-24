@@ -62,6 +62,12 @@ async function ensureAuditTables(db) {
       created_at TIMESTAMPTZ DEFAULT NOW()
     )
   `);
+  // Audits imported from CSV only carry totals; the expired-item count replaces the item list
+  await db.query(`
+    ALTER TABLE audits
+      ADD COLUMN IF NOT EXISTS imported BOOLEAN DEFAULT FALSE,
+      ADD COLUMN IF NOT EXISTS imported_expired_count INTEGER DEFAULT 0
+  `);
   await db.query(`
     CREATE TABLE IF NOT EXISTS audit_capa (
       id SERIAL PRIMARY KEY, ref TEXT UNIQUE, audit_id INTEGER REFERENCES audits(id) ON DELETE CASCADE,
@@ -275,6 +281,51 @@ export function registerAuditRoutes(app, { db, auth, uploadImage }) {
     await db.query("UPDATE audit_capa SET ref = 'CAPA-' || LPAD(id::text, 5, '0') WHERE ref IS NULL");
 
     res.status(201).json(audit.rows[0]);
+  }));
+
+  // Import past audits (e.g. the old standalone tool's CSV export). Rows whose audit ID already exists are skipped.
+  app.post("/audits/import", auth, guard, adminOnly, handle("AUDIT IMPORT", async (req, res) => {
+    const rows = Array.isArray(req.body?.rows) ? req.body.rows.slice(0, 5000) : [];
+    if (!rows.length) return res.status(400).json({ error: "No rows to import" });
+
+    let inserted = 0;
+    let skipped = 0;
+    const errors = [];
+    for (const [index, row] of rows.entries()) {
+      const line = index + 2; // CSV line number, after the header
+      const ref = String(row.ref || "").trim();
+      const location = String(row.location || "").trim();
+      const scope = String(row.scope || "").trim().toLowerCase();
+      const date = new Date(row.date);
+      const earned = Number(row.earned);
+      const total = Number(row.total);
+      const percentage = Number(row.percentage);
+
+      if (!ref) { errors.push(`Line ${line}: missing audit ID`); continue; }
+      if (!location) { errors.push(`Line ${line} (${ref}): missing location`); continue; }
+      if (!["daily", "weekly", "monthly"].includes(scope)) { errors.push(`Line ${line} (${ref}): unknown scope "${row.scope}"`); continue; }
+      if (Number.isNaN(date.getTime())) { errors.push(`Line ${line} (${ref}): invalid date`); continue; }
+      if (![earned, total, percentage].every(Number.isFinite) || total < 0 || earned < 0 || earned > total) {
+        errors.push(`Line ${line} (${ref}): invalid score`);
+        continue;
+      }
+
+      const result = await db.query(
+        `INSERT INTO audits (ref, location, machine_code, refiller, refiller_phone, auditor, created_by, scope,
+           percentage, earned_points, total_points, critical_breach, imported, imported_expired_count, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,TRUE,$13,$14)
+         ON CONFLICT (ref) DO NOTHING RETURNING id`,
+        [
+          ref, location, String(row.machine || "").trim() || null, String(row.refiller || "").trim() || null,
+          String(row.phone || "").trim() || null, String(row.auditor || "").trim() || null, userName(req.user), scope,
+          Math.round(percentage), Math.round(earned), Math.round(total), /^(yes|true|1)$/i.test(String(row.critical || "").trim()),
+          Math.max(0, Math.round(Number(row.expiredCount) || 0)), date.toISOString(),
+        ]
+      );
+      if (result.rows.length) inserted += 1;
+      else skipped += 1;
+    }
+    res.json({ inserted, skipped, errors });
   }));
 
   app.delete("/audits/:id", auth, guard, adminOnly, handle("AUDIT DELETE", async (req, res) => {
