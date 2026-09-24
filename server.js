@@ -14,6 +14,7 @@ import { getOrCreateTicket, verifyPaymentOnPaytm, storePaytmVerification } from 
 import db from "./db.js";
 import { sendWhatsApp } from "./whatsapp.js";
 import { registerAuditRoutes, AUDIT_DEPARTMENTS } from "./auditRoutes.js";
+import { registerPushRoutes, sendPushToUsers, pushUserKey } from "./pushNotifications.js";
 
 /* ================= CLOUDINARY ================= */
 cloudinary.config({
@@ -2750,6 +2751,7 @@ app.get("/inventory/velocity", auth, async (req, res) => {
 });
 
 registerAuditRoutes(app, { db, auth, uploadImage: (dataUrl) => uploadToCloudinary(dataUrl) });
+registerPushRoutes(app, { db, auth });
 
 app.get("/host-sites/renewals-due", auth, async (req, res) => {
   try {
@@ -3848,6 +3850,19 @@ app.post("/internal/chats/:id/messages", auth, (req, res) => {
       io.to(chat.department).emit("internal-chat-updated", { chat, notification });
       io.to(chat.department).emit("internal-notification", notification);
     }
+
+    // Phone notifications: the people this message went to, plus admin, never the sender.
+    const pushRecipients = recipientIds.length
+      ? global.internalUsers.filter((user) => recipientIds.map(String).includes(String(user.id)))
+      : global.internalUsers.filter((user) => user.department === chat.department);
+    const senderPushKey = pushUserKey(req.user);
+    sendPushToUsers(db, [...pushRecipients.map((user) => user.username), "admin"].filter((key) => key !== senderPushKey), {
+      title: chat.title || `${chat.department} chat`,
+      body: `${senderName}: ${cleanText || `📎 ${attachments.length} attachment${attachments.length === 1 ? "" : "s"}`}`.slice(0, 180),
+      chatId: String(chat.id),
+      department: chat.department,
+      priority: message.priority,
+    });
 
     res.json({ success: true, chat, notification });
   } catch (err) {
