@@ -660,10 +660,18 @@ async function isDuplicateTransaction(transactionId, ticketId) {
 const FINAL_MSG = "✅ Ticket has been raised, we will process your concern soon.";
 const MAX_RETRIES = 3;
 
-const BANK_CHECK_MSG = `Sorry for inconvenience caused , usually the refunds will be automatically refunded in your source account , please check your bank statement ,and come back to us to raise a ticket , so our team will sort your concerns in short time
-Have you checked your bank account statement ?
+const BANK_CHECK_MSG = `🙏 *Sorry for the inconvenience caused*
+
+Usually, refunds are credited *automatically* to your source account.
+
+🏦 Please check your bank statement first. If the amount is not refunded, come back to us to raise a ticket and our team will sort out your concern in a short time.
+
+*Have you checked your bank account statement?*
+
 1️⃣ YES
-2️⃣ NO`;
+2️⃣ NO
+
+Please reply with the number (1 or 2)`;
 
 const REFUND_OPTIONS_MSG = `💰 *REFUND OPTIONS*
 
@@ -955,7 +963,11 @@ Reply with your rating (1-5)`
         if (message === "2") {
           return sendWhatsApp(
             from,
-            "Please check your bank account statement and come back to us. If the amount is not refunded, reply with 1 to raise a ticket."
+            `🏦 *Please check your bank statement*
+
+Kindly check your bank account statement and come back to us.
+
+If the amount is not refunded, reply with *1* to raise a ticket.`
           );
         }
 
