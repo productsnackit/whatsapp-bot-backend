@@ -86,6 +86,15 @@ export function registerPushRoutes(app, { db, auth }) {
     }
   });
 
+  // Lets someone check that notifications (and their sound) reach this phone.
+  app.post("/internal/push/test", auth, async (req, res) => {
+    const userKey = pushUserKey(req.user);
+    const { rows } = await db.query("SELECT COUNT(*)::int AS count FROM push_subscriptions WHERE user_key = $1", [userKey]).catch(() => ({ rows: [{ count: 0 }] }));
+    if (!rows[0].count) return res.status(404).json({ error: "Notifications are not turned on for this login yet" });
+    await sendPushToUsers(db, [userKey], { title: "Snackit Chat", body: "Test notification: new messages will look and sound like this." });
+    res.json({ success: true });
+  });
+
   app.post("/internal/push/unsubscribe", auth, async (req, res) => {
     try {
       if (req.body?.endpoint) await db.query("DELETE FROM push_subscriptions WHERE endpoint = $1", [req.body.endpoint]);
