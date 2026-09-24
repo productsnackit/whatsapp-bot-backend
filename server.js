@@ -660,10 +660,10 @@ async function isDuplicateTransaction(transactionId, ticketId) {
 const FINAL_MSG = "✅ Ticket has been raised, we will process your concern soon.";
 const MAX_RETRIES = 3;
 
-const BANK_CHECK_MSG = `Sorry for inconvenience caused , usually the refunds will be automatically refunded in your source account , please check your bank statement ,and come back to us raise a ticket , so our team will sort your concerns in short time
+const BANK_CHECK_MSG = `Sorry for inconvenience caused , usually the refunds will be automatically refunded in your source account , please check your bank statement ,and come back to us to raise a ticket , so our team will sort your concerns in short time
 Have you checked your bank account statement ?
-1.yes
-2.no`;
+1️⃣ YES
+2️⃣ NO`;
 
 const REFUND_OPTIONS_MSG = `💰 *REFUND OPTIONS*
 
@@ -877,7 +877,7 @@ async function processMessage(jobData) {
 
 How can we help you today?
 
-1️⃣ Refund Issues
+1️⃣ Refund Need
 2️⃣ Product Enquiry
 3️⃣ Share Feedback
 
@@ -1636,7 +1636,7 @@ Thank you! 🙏`
           if (!text || text.length < 5) {
             return sendWhatsApp(
               from,
-              `❌ Please provide a valid location.`
+              `Please provide a valid location.`
             );
           }
 
@@ -1765,7 +1765,7 @@ Show the product with its price tag clearly visible.`
 
 We've received your complaint. Expected resolution: 24 hours.
 
-Thank you! 🙏`
+Thank you!`
           );
         }
       }
