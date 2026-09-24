@@ -16,6 +16,7 @@ import { sendWhatsApp } from "./whatsapp.js";
 import { registerAuditRoutes, AUDIT_DEPARTMENTS } from "./auditRoutes.js";
 import { registerPushRoutes, sendPushToUsers, pushUserKey } from "./pushNotifications.js";
 import { handleRefillerWhatsApp } from "./refillerTasks.js";
+import { loadInternalState, internalSaveMiddleware } from "./internalStore.js";
 
 /* ================= CLOUDINARY ================= */
 cloudinary.config({
@@ -36,6 +37,8 @@ const io = new Server(httpServer, {
 
 app.use(cors());
 app.use(express.json({ limit: "25mb" }));
+// Internal chat, employees and logins are saved to the database after each change.
+app.use(["/internal", "/login"], internalSaveMiddleware);
 
 const operationsUpload = multer({
   storage: multer.memoryStorage(),
@@ -168,6 +171,30 @@ function addInternalNotification({ department, priority, title, targetUsers, mes
 function getInternalUserKey(user) {
   if (user?.role === "admin") return "admin";
   return String(user?.userId || user?.id || user?.name || "user");
+}
+
+/* Direct (one-to-one) chats: department "Direct", visible only to its two members.
+   Members are user keys: an employee's id, or "admin". */
+function isDirectChat(chat) {
+  return chat?.type === "direct";
+}
+
+function canSeeInternalChat(chat, user) {
+  return !isDirectChat(chat) || (chat.members || []).includes(getInternalUserKey(user));
+}
+
+function internalUserNameForKey(key) {
+  if (key === "admin") return "Admin";
+  return global.internalUsers.find((user) => String(user.id) === String(key))?.name || "Former employee";
+}
+
+// Department chats go to the department room; direct chats only to their two members.
+function emitInternalChat(chat, event, payload) {
+  if (isDirectChat(chat)) {
+    (chat.members || []).forEach((key) => io.to(`internal-user-${key}`).emit(event, payload));
+  } else {
+    io.to(chat.department).emit(event, payload);
+  }
 }
 
 async function ensurePaytmSettingTable() {
@@ -3644,7 +3671,7 @@ app.patch("/internal/users/:id", auth, (req, res) => {
 app.get("/internal/chats", auth, (req, res) => {
   try {
     const userKey = getInternalUserKey(req.user);
-    res.json(global.internalChats.map((chat) => ({
+    res.json(global.internalChats.filter((chat) => canSeeInternalChat(chat, req.user)).map((chat) => ({
       ...chat,
       unread: Number(chat.unreadBy?.[userKey] || 0),
     })));
@@ -3658,8 +3685,10 @@ app.delete("/internal/chats/:id", auth, (req, res) => {
   try {
     if (req.user?.role !== "admin") return res.status(403).json({ error: "Admin access required" });
     const { id } = req.params;
+    const deleted = global.internalChats.find((chat) => String(chat.id) === String(id));
     global.internalChats = global.internalChats.filter((chat) => String(chat.id) !== String(id));
-    io.emit("internal-chat-deleted", { chatId: id });
+    if (deleted && isDirectChat(deleted)) emitInternalChat(deleted, "internal-chat-deleted", { chatId: id });
+    else io.emit("internal-chat-deleted", { chatId: id });
     res.json({ success: true });
   } catch (err) {
     console.log("DELETE INTERNAL CHAT ERROR:", err.message);
@@ -3670,7 +3699,7 @@ app.delete("/internal/chats/:id", auth, (req, res) => {
 app.patch("/internal/chats/:id", auth, (req, res) => {
   try {
     const chat = global.internalChats.find((item) => String(item.id) === String(req.params.id));
-    if (!chat) return res.status(404).json({ error: "Chat not found" });
+    if (!chat || !canSeeInternalChat(chat, req.user)) return res.status(404).json({ error: "Chat not found" });
     const { title, pinned, archived, favorite, priority } = req.body || {};
     if (title !== undefined) {
       const cleanTitle = String(title).trim();
@@ -3681,7 +3710,7 @@ app.patch("/internal/chats/:id", auth, (req, res) => {
     if (archived !== undefined) chat.archived = Boolean(archived);
     if (favorite !== undefined) chat.favorite = Boolean(favorite);
     if (priority !== undefined && ["low", "medium", "urgent"].includes(priority)) chat.priority = priority;
-    io.to(chat.department).emit("internal-chat-updated", { chat });
+    emitInternalChat(chat, "internal-chat-updated", { chat });
     res.json({ success: true, chat });
   } catch (err) {
     console.log("UPDATE INTERNAL CHAT ERROR:", err.message);
@@ -3692,7 +3721,7 @@ app.patch("/internal/chats/:id", auth, (req, res) => {
 app.patch("/internal/chats/:id/read", auth, (req, res) => {
   try {
     const chat = global.internalChats.find((item) => String(item.id) === String(req.params.id));
-    if (!chat) return res.status(404).json({ error: "Chat not found" });
+    if (!chat || !canSeeInternalChat(chat, req.user)) return res.status(404).json({ error: "Chat not found" });
     chat.unreadBy = { ...(chat.unreadBy || {}), [getInternalUserKey(req.user)]: 0 };
     res.json({ success: true, chat: { ...chat, unread: 0 } });
   } catch (err) {
@@ -3712,6 +3741,42 @@ app.post("/internal/saved-replies", auth, (req, res) => {
   const reply = { id: `reply-${Date.now()}`, title, text };
   global.internalSavedReplies.unshift(reply);
   res.json({ success: true, reply });
+});
+
+// Open (or create) the one-to-one chat between the signed-in person and another person.
+app.post("/internal/direct", auth, (req, res) => {
+  try {
+    const me = getInternalUserKey(req.user);
+    const other = String(req.body?.userKey || "").trim();
+    const otherExists = other === "admin" || global.internalUsers.some((user) => String(user.id) === other);
+    if (!other || !otherExists) return res.status(404).json({ error: "That person was not found" });
+    if (other === me) return res.status(400).json({ error: "You can't start a chat with yourself" });
+
+    let chat = global.internalChats.find((item) => isDirectChat(item) && item.members?.includes(me) && item.members?.includes(other));
+    if (!chat) {
+      chat = {
+        id: Date.now() + Math.random(),
+        type: "direct",
+        department: "Direct",
+        title: "Direct chat",
+        members: [me, other],
+        priority: "medium",
+        participants: [internalUserNameForKey(me), internalUserNameForKey(other)],
+        unread: 0,
+        unreadBy: {},
+        pinned: false,
+        archived: false,
+        favorite: false,
+        messages: [],
+      };
+      global.internalChats.unshift(chat);
+      emitInternalChat(chat, "internal-chat-updated", { chat });
+    }
+    res.json({ success: true, chat: { ...chat, unread: Number(chat.unreadBy?.[me] || 0) } });
+  } catch (err) {
+    console.error("DIRECT CHAT ERROR:", err.stack || err.message);
+    res.status(500).json({ error: "Could not open the chat" });
+  }
 });
 
 app.post("/internal/chats", auth, (req, res) => {
@@ -3763,6 +3828,7 @@ app.post("/internal/chats/:id/messages", auth, (req, res) => {
     const recipientIds = Array.isArray(req.body?.recipientIds) ? req.body.recipientIds : [];
 
     let chat = global.internalChats.find((item) => String(item.id) === String(id));
+    if (chat && !canSeeInternalChat(chat, req.user)) return res.status(404).json({ error: "Chat not found" });
 
     if (!chat) {
       const fallbackDepartment = "Accounts";
@@ -3811,7 +3877,7 @@ app.post("/internal/chats/:id/messages", auth, (req, res) => {
     chat.messages.push(message);
     chat.unreadBy = { ...(chat.unreadBy || {}) };
     const senderKey = getInternalUserKey(req.user);
-    const recipientKeys = recipientIds.length ? recipientIds.map(String) : global.internalUsers
+    const recipientKeys = isDirectChat(chat) ? chat.members.map(String) : recipientIds.length ? recipientIds.map(String) : global.internalUsers
       .filter((user) => user.department === chat.department)
       .map((user) => String(user.id));
     recipientKeys.forEach((userKey) => {
@@ -3819,11 +3885,39 @@ app.post("/internal/chats/:id/messages", auth, (req, res) => {
     });
     chat.unread = Number(chat.unreadBy[senderKey] || 0);
     chat.priority = message.priority;
+    // Names only (older chats also stored employee ids here).
     chat.participants = Array.from(new Set([
       ...chat.participants,
-      ...recipientIds,
+      ...recipientIds.map((userId) => internalUserNameForKey(String(userId))),
       senderName,
-    ]));
+    ])).filter((name) => !/^\d+(\.\d+)?$/.test(String(name)));
+
+    if (isDirectChat(chat)) {
+      // Private: no shared notification feed, only the two members hear about it.
+      const notification = {
+        id: Date.now() + Math.random(),
+        department: "Direct",
+        priority: message.priority,
+        title: senderName,
+        message: cleanText || `Attachment sent (${attachments.length})`,
+        sourceUser: sourceUser || sender || senderName,
+        recipientIds: chat.members.filter((key) => key !== senderKey),
+        createdAt: new Date().toISOString(),
+      };
+      emitInternalChat(chat, "internal-chat-updated", { chat, notification });
+      emitInternalChat(chat, "internal-notification", notification);
+      const pushKeys = chat.members
+        .filter((key) => key !== senderKey)
+        .map((key) => (key === "admin" ? "admin" : global.internalUsers.find((user) => String(user.id) === key)?.username));
+      sendPushToUsers(db, pushKeys, {
+        title: senderName,
+        body: (cleanText || `📎 ${attachments.length} attachment${attachments.length === 1 ? "" : "s"}`).slice(0, 180),
+        chatId: String(chat.id),
+        department: "Direct",
+        priority: message.priority,
+      });
+      return res.json({ success: true, chat, notification });
+    }
 
     const relatedUsers = global.internalUsers.filter((user) => user.department === chat.department || recipientIds.includes(String(user.id)));
     const targetUsers = relatedUsers.map((user) => user.name);
@@ -3873,7 +3967,7 @@ app.post("/internal/chats/:id/messages", auth, (req, res) => {
 app.patch("/internal/chats/:chatId/messages/:messageId/status", auth, (req, res) => {
   try {
     const chat = global.internalChats.find((item) => String(item.id) === String(req.params.chatId));
-    if (!chat) return res.status(404).json({ error: "Chat not found" });
+    if (!chat || !canSeeInternalChat(chat, req.user)) return res.status(404).json({ error: "Chat not found" });
 
     const message = chat.messages.find((item) => String(item.id) === String(req.params.messageId));
     if (!message) return res.status(404).json({ error: "Message not found" });
@@ -3891,7 +3985,7 @@ app.patch("/internal/chats/:chatId/messages/:messageId/status", auth, (req, res)
     message.status = req.body.status;
     message.statusUpdatedBy = req.user?.name || "Admin";
     message.statusUpdatedAt = new Date().toISOString();
-    io.emit("internal-chat-updated", { chat });
+    emitInternalChat(chat, "internal-chat-updated", { chat });
     res.json({ success: true, chat });
   } catch (err) {
     console.log("UPDATE INTERNAL MESSAGE STATUS ERROR:", err.message);
@@ -3902,7 +3996,7 @@ app.patch("/internal/chats/:chatId/messages/:messageId/status", auth, (req, res)
 app.patch("/internal/chats/:chatId/messages/:messageId", auth, (req, res) => {
   try {
     const chat = global.internalChats.find((item) => String(item.id) === String(req.params.chatId));
-    if (!chat) return res.status(404).json({ error: "Chat not found" });
+    if (!chat || !canSeeInternalChat(chat, req.user)) return res.status(404).json({ error: "Chat not found" });
     const message = chat.messages.find((item) => String(item.id) === String(req.params.messageId));
     if (!message) return res.status(404).json({ error: "Message not found" });
 
@@ -3916,7 +4010,7 @@ app.patch("/internal/chats/:chatId/messages/:messageId", auth, (req, res) => {
         ? message.reactions[reaction].filter((key) => key !== userKey)
         : [...message.reactions[reaction], userKey];
     }
-    io.to(chat.department).emit("internal-chat-updated", { chat });
+    emitInternalChat(chat, "internal-chat-updated", { chat });
     res.json({ success: true, chat });
   } catch (err) {
     console.log("UPDATE INTERNAL MESSAGE ERROR:", err.message);
@@ -3956,6 +4050,13 @@ setInterval(() => {
   emitRenewalWarnings();
 }, 15 * 60 * 1000);
 
-app.listen(PORT, "0.0.0.0", () => {
+try {
+  await loadInternalState(db);
+} catch (err) {
+  console.error("INTERNAL CHAT LOAD ERROR (starting with defaults):", err.message);
+}
+
+// httpServer (not app) so the socket.io live updates are served on the same port.
+httpServer.listen(PORT, "0.0.0.0", () => {
   console.log(` Server running on port ${PORT}`);
 });
