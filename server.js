@@ -660,18 +660,10 @@ async function isDuplicateTransaction(transactionId, ticketId) {
 const FINAL_MSG = "✅ Ticket has been raised, we will process your concern soon.";
 const MAX_RETRIES = 3;
 
-const BANK_CHECK_MSG = `🙏 *Sorry for the inconvenience caused*
-
-Usually, refunds are credited *automatically* to your source account.
-
-🏦 Please check your bank statement first. If the amount is not refunded, come back to us to raise a ticket and our team will sort out your concern in a short time.
-
-*Have you checked your bank account statement?*
+const BANK_CHECK_MSG = `*Have you checked your bank account statement?*
 
 1️⃣ YES
-2️⃣ NO
-
-Please reply with the number (1 or 2)`;
+2️⃣ NO`;
 
 const REFUND_OPTIONS_MSG = `💰 *REFUND OPTIONS*
 
