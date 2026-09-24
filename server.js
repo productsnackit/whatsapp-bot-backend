@@ -3867,9 +3867,13 @@ app.post("/internal/chats/:id/messages", auth, (req, res) => {
         size: Number(file?.size || 0),
         dataUrl: typeof file?.dataUrl === "string" && file.dataUrl.length <= 8_000_000 ? file.dataUrl : null,
       })),
-      recipientIds,
+      // Everyone in a group sees every message; tags (mentions) highlight who must act.
+      recipientIds: isDirectChat(chat) ? recipientIds : [],
       replyTo: req.body?.replyTo ? String(req.body.replyTo) : null,
-      mentions: Array.isArray(req.body?.mentions) ? req.body.mentions.map(String) : [],
+      // In a department group only that department's people can be tagged.
+      mentions: isDirectChat(chat) ? [] : (Array.isArray(req.body?.mentions) ? req.body.mentions.map(String) : [])
+        .filter((userId, index, all) => all.indexOf(userId) === index)
+        .filter((userId) => global.internalUsers.some((user) => String(user.id) === userId && user.department === chat.department)),
       reactions: {},
       assignedTo: null,
     };
@@ -3877,9 +3881,8 @@ app.post("/internal/chats/:id/messages", auth, (req, res) => {
     chat.messages.push(message);
     chat.unreadBy = { ...(chat.unreadBy || {}) };
     const senderKey = getInternalUserKey(req.user);
-    const recipientKeys = isDirectChat(chat) ? chat.members.map(String) : recipientIds.length ? recipientIds.map(String) : global.internalUsers
-      .filter((user) => user.department === chat.department)
-      .map((user) => String(user.id));
+    // Department groups include everyone (plus admin); direct chats just their two members.
+    const recipientKeys = isDirectChat(chat) ? chat.members.map(String) : ["admin", ...global.internalUsers.map((user) => String(user.id))];
     recipientKeys.forEach((userKey) => {
       if (String(userKey) !== senderKey) chat.unreadBy[userKey] = Number(chat.unreadBy[userKey] || 0) + 1;
     });
@@ -3931,27 +3934,27 @@ app.post("/internal/chats/:id/messages", auth, (req, res) => {
       sourceUser: sourceUser || sender || "Admin",
     });
     notification.mentionUserIds = message.mentions;
-    notification.recipientIds = recipientIds.map(String);
+    notification.recipientIds = [];
     notification.notifyAll = req.body?.notifyAll === true;
 
-    if (recipientIds.length) {
-      recipientIds.forEach((userId) => {
-        io.to(`internal-user-${String(userId)}`).emit("internal-chat-updated", { chat, notification });
-        io.to(`internal-user-${String(userId)}`).emit("internal-notification", notification);
-      });
-    } else {
-      io.to(chat.department).emit("internal-chat-updated", { chat, notification });
-      io.to(chat.department).emit("internal-notification", notification);
-    }
+    io.emit("internal-chat-updated", { chat, notification });
+    io.emit("internal-notification", notification);
 
-    // Phone notifications: the people this message went to, plus admin, never the sender.
-    const pushRecipients = recipientIds.length
-      ? global.internalUsers.filter((user) => recipientIds.map(String).includes(String(user.id)))
-      : global.internalUsers.filter((user) => user.department === chat.department);
+    // Phone notifications to every member but the sender; tagged people get a "tagged you" alert.
     const senderPushKey = pushUserKey(req.user);
-    sendPushToUsers(db, [...pushRecipients.map((user) => user.username), "admin"].filter((key) => key !== senderPushKey), {
+    const pushBody = `${senderName}: ${cleanText || `📎 ${attachments.length} attachment${attachments.length === 1 ? "" : "s"}`}`.slice(0, 180);
+    const taggedUsers = global.internalUsers.filter((user) => message.mentions.includes(String(user.id)));
+    const taggedKeys = taggedUsers.map((user) => user.username);
+    sendPushToUsers(db, taggedKeys.filter((key) => key !== senderPushKey), {
+      title: `${senderName} tagged you in ${chat.title || chat.department}`,
+      body: pushBody,
+      chatId: String(chat.id),
+      department: chat.department,
+      priority: message.priority,
+    });
+    sendPushToUsers(db, ["admin", ...global.internalUsers.map((user) => user.username)].filter((key) => key !== senderPushKey && !taggedKeys.includes(key)), {
       title: chat.title || `${chat.department} chat`,
-      body: `${senderName}: ${cleanText || `📎 ${attachments.length} attachment${attachments.length === 1 ? "" : "s"}`}`.slice(0, 180),
+      body: pushBody,
       chatId: String(chat.id),
       department: chat.department,
       priority: message.priority,
@@ -3977,10 +3980,9 @@ app.patch("/internal/chats/:chatId/messages/:messageId/status", auth, (req, res)
       return res.status(400).json({ error: "Invalid message status" });
     }
 
-    const isAdmin = req.user?.role === "admin";
-    const isRecipient = Array.isArray(message.recipientIds) && message.recipientIds.map(String).includes(String(req.user?.userId));
-    const isSender = message.sender === req.user?.name;
-    if (!isAdmin && !isRecipient && !isSender) return res.status(403).json({ error: "You cannot update this message" });
+    // Only the people tagged in the message can move it to In progress / Resolved.
+    const isTagged = Array.isArray(message.mentions) && message.mentions.map(String).includes(getInternalUserKey(req.user));
+    if (!isTagged) return res.status(403).json({ error: "Only the people tagged in this message can update its status" });
 
     message.status = req.body.status;
     message.statusUpdatedBy = req.user?.name || "Admin";
