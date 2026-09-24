@@ -39,3 +39,33 @@ console.log("✅ WhatsApp sent to:", to);
     console.log("❌ WhatsApp send error:", err.response?.data || err.message);
   }
 }
+
+// Sends an image with a caption. Returns false on failure so callers can fall back to text.
+export async function sendWhatsAppImage(to, imageUrl, caption) {
+  try {
+    const url = `https://graph.facebook.com/v19.0/${PHONE_NUMBER_ID}/messages`;
+
+    const data = {
+      messaging_product: "whatsapp",
+      to: to,
+      type: "image",
+      image: {
+        link: imageUrl,
+        caption: sanitizeWhatsAppBody(caption),
+      },
+    };
+
+    const response = await axios.post(url, data, {
+      headers: {
+        Authorization: `Bearer ${WHATSAPP_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+    });
+
+    console.log("✅ WhatsApp image sent to:", to, response.data);
+    return true;
+  } catch (err) {
+    console.log("❌ WhatsApp image send error:", err.response?.data || err.message);
+    return false;
+  }
+}
