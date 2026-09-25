@@ -44,6 +44,19 @@ function toApi(row) {
   return row && { ...row, observed_on: plainDate(row.observed_on), due_date: plainDate(row.due_date) };
 }
 
+// Accepts 2026-09-20, 20/09/2026, 20-09-2026, 20.09.2026 or "20 Sept 2026"; returns "YYYY-MM-DD" or null.
+function importDate(value) {
+  const text = String(value || "").trim();
+  if (!text) return null;
+  const pad = (n) => String(n).padStart(2, "0");
+  let match = /^(\d{4})-(\d{1,2})-(\d{1,2})/.exec(text);
+  if (match) return `${match[1]}-${pad(match[2])}-${pad(match[3])}`;
+  match = /^(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})$/.exec(text);
+  if (match) return `${match[3]}-${pad(match[2])}-${pad(match[1])}`;
+  const parsed = new Date(text.replace(/Sept/i, "Sep"));
+  return Number.isNaN(parsed.getTime()) ? null : `${parsed.getFullYear()}-${pad(parsed.getMonth() + 1)}-${pad(parsed.getDate())}`;
+}
+
 function userName(user) {
   return user?.role === "admin" ? "Admin" : user?.name || user?.username || "Employee";
 }
@@ -134,6 +147,62 @@ export function registerFindingsRoutes(app, { db, auth }) {
     )).rows[0]);
     notifyAssignee(db, finding, by, false);
     res.status(201).json(finding);
+  }));
+
+  // Import findings from CSV (the Export CSV format). Rows whose ref already exists are skipped.
+  app.post("/findings/import", auth, handle("FINDINGS IMPORT", async (req, res) => {
+    if (req.user?.role !== "admin") return res.status(403).json({ error: "Only admin can import findings" });
+    const rows = Array.isArray(req.body?.rows) ? req.body.rows.slice(0, 2000) : [];
+    if (!rows.length) return res.status(400).json({ error: "No rows to import" });
+    const by = userName(req.user);
+    const pick = (list, value, fallback) => list.find((item) => item.toLowerCase() === String(value || "").trim().toLowerCase()) || fallback;
+    let inserted = 0;
+    let skipped = 0;
+    const errors = [];
+
+    for (const [index, row] of rows.entries()) {
+      const line = index + 2; // CSV line number after the header
+      const ref = String(row.ref || "").trim();
+      const label = ref ? `Line ${line} (${ref})` : `Line ${line}`;
+      const title = String(row.title || "").trim();
+      const department = String(row.department || "").trim();
+      const observedOn = importDate(row.observed_on) || importDate(new Date().toISOString());
+      const dueDate = importDate(row.due_date);
+      const riskText = String(row.risk || "").trim();
+      const statusText = String(row.status || "").trim();
+      const risk = pick(FINDING_RISKS, riskText, null);
+      const status = pick(FINDING_STATUSES, statusText, null);
+
+      if (!title) { errors.push(`${label}: missing finding title`); continue; }
+      if (!department) { errors.push(`${label}: missing department`); continue; }
+      if (!dueDate) { errors.push(`${label}: missing or invalid due date "${row.due_date || ""}"`); continue; }
+      if (riskText && !risk) { errors.push(`${label}: unknown risk "${riskText}" (use Critical, Major, Minor or Observation)`); continue; }
+      if (statusText && !status) { errors.push(`${label}: unknown status "${statusText}" (use Open, In Progress, Under Review or Closed)`); continue; }
+
+      // Owner by employee name; kept as plain text if they're not in the employee list.
+      const ownerName = String(row.assignee_name || "").trim();
+      const owner = (global.internalUsers || []).find((user) => user.name.toLowerCase() === ownerName.toLowerCase());
+
+      // Already imported? Same ref, or (for rows without a ref) same finding, department and date.
+      const duplicate = ref
+        ? await db.query("SELECT 1 FROM audit_findings WHERE ref = $1", [ref])
+        : await db.query(
+          "SELECT 1 FROM audit_findings WHERE lower(title) = lower($1) AND lower(department) = lower($2) AND observed_on = $3",
+          [title.slice(0, 300), department, observedOn]
+        );
+      if (duplicate.rows.length) { skipped += 1; continue; }
+      const result = await db.query(
+        `INSERT INTO audit_findings (ref, department, observed_on, title, description, risk, status, root_cause, action_plan, assignee_id, assignee_name, due_date, created_by)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id`,
+        [ref || null, department, observedOn, title.slice(0, 300), String(row.description || "").trim() || title,
+          risk || "Observation", status || "Open", String(row.root_cause || "").trim() || null,
+          String(row.action_plan || "").trim() || "Not recorded", owner ? String(owner.id) : null, owner?.name || ownerName || null,
+          dueDate, String(row.created_by || "").trim() || `${by} (import)`]
+      );
+      if (!ref) await db.query("UPDATE audit_findings SET ref = 'FND-' || LPAD(id::text, 5, '0') WHERE id = $1", [result.rows[0].id]);
+      inserted += 1;
+    }
+    res.json({ inserted, skipped, errors });
   }));
 
   app.patch("/findings/:id", auth, handle("FINDING UPDATE", async (req, res) => {
