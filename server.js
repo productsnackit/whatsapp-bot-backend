@@ -18,6 +18,7 @@ import { registerPushRoutes, sendPushToUsers, pushUserKey } from "./pushNotifica
 import { handleRefillerWhatsApp } from "./refillerTasks.js";
 import { loadInternalState, internalSaveMiddleware } from "./internalStore.js";
 import { registerFindingsRoutes } from "./findingsRoutes.js";
+import { registerExpiryRoutes } from "./expiryRoutes.js";
 
 /* ================= CLOUDINARY ================= */
 cloudinary.config({
@@ -2109,8 +2110,8 @@ function auth(req, res, next) {
 
     const operationsPath = req.path.startsWith("/operations/") || req.path.startsWith("/machines") || req.path.startsWith("/inventory/") || req.path.startsWith("/host-sites") || req.path.startsWith("/brands") || req.path.startsWith("/skus/") || req.path.startsWith("/analytics/");
     const auditPath = req.path.startsWith("/audit");
-    // Internal Audit findings are open to every employee.
-    const findingsPath = req.path.startsWith("/findings");
+    // Internal Audit findings and Expiry Tracking are open to every employee.
+    const findingsPath = req.path.startsWith("/findings") || req.path.startsWith("/expiry");
     if (
       !req.path.startsWith("/internal/") &&
       !findingsPath &&
@@ -2785,6 +2786,7 @@ app.get("/inventory/velocity", auth, async (req, res) => {
 registerAuditRoutes(app, { db, auth, uploadImage: (dataUrl) => uploadToCloudinary(dataUrl) });
 registerPushRoutes(app, { db, auth });
 registerFindingsRoutes(app, { db, auth });
+registerExpiryRoutes(app, { db, auth });
 
 app.get("/host-sites/renewals-due", auth, async (req, res) => {
   try {
