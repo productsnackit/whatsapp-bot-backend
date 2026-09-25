@@ -19,6 +19,7 @@ import { handleRefillerWhatsApp } from "./refillerTasks.js";
 import { loadInternalState, internalSaveMiddleware } from "./internalStore.js";
 import { registerFindingsRoutes } from "./findingsRoutes.js";
 import { registerExpiryRoutes } from "./expiryRoutes.js";
+import { ensureUpiScanColumns, scanUpiScreenshot, registerUpiScanRoutes } from "./upiScanner.js";
 
 /* ================= CLOUDINARY ================= */
 cloudinary.config({
@@ -248,6 +249,7 @@ async function ensureSupportColumns() {
         ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ
     `);
     await db.query("ALTER TABLE feedback ADD COLUMN IF NOT EXISTS ticket_id INTEGER REFERENCES tickets(id)");
+    await ensureUpiScanColumns(db);
     await db.query(`
       INSERT INTO machines (name, location)
       SELECT DISTINCT LEFT(TRIM(location), 200), TRIM(location)
@@ -590,6 +592,9 @@ async function updateTicket(id, fields) {
   );
 
   await refreshCustomerRisk(id, current?.phone);
+
+  // Read the payment screenshot in the background; the customer's reply isn't delayed.
+  if (nextFields.upi_image) scanUpiScreenshot(id).catch(() => {});
 
   if (current?.phone && nextFields.refund_stage && nextFields.refund_stage !== current.refund_stage && nextFields.refund_stage !== "PROCESSED") {
     const stageMessages = {
@@ -2169,6 +2174,8 @@ app.get("/tickets", auth, async (req, res) => {
         upi_id,
         image,
         upi_image,
+        upi_scan,
+        upi_utr,
         refund_amount,
         transaction_verified,
         paytm_status,
@@ -2787,6 +2794,7 @@ registerAuditRoutes(app, { db, auth, uploadImage: (dataUrl) => uploadToCloudinar
 registerPushRoutes(app, { db, auth });
 registerFindingsRoutes(app, { db, auth });
 registerExpiryRoutes(app, { db, auth });
+registerUpiScanRoutes(app, { auth });
 
 app.get("/host-sites/renewals-due", auth, async (req, res) => {
   try {
