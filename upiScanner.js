@@ -15,20 +15,13 @@ let idleTimer = null;
 let queue = Promise.resolve();
 const IDLE_MS = 5 * 60 * 1000;
 
-// Snackit's own UPI IDs (comma separated), used to confirm the payment went to us.
-function merchantUpiIds() {
-  return String(process.env.SNACKIT_UPI_IDS || "")
-    .split(",")
-    .map((id) => id.trim().toLowerCase())
-    .filter(Boolean);
-}
-
 export async function ensureUpiScanColumns(database) {
   db = database;
   await db.query(`
     ALTER TABLE tickets
       ADD COLUMN IF NOT EXISTS upi_scan JSONB,
       ADD COLUMN IF NOT EXISTS upi_utr TEXT,
+      ADD COLUMN IF NOT EXISTS screenshot_upi_id TEXT,
       ADD COLUMN IF NOT EXISTS upi_scanned_at TIMESTAMPTZ
   `);
   await db.query("CREATE INDEX IF NOT EXISTS tickets_upi_utr_idx ON tickets (upi_utr)");
@@ -89,7 +82,7 @@ function findUpiIds(lines) {
 
 // Decides whether a UPI ID belongs to the payer or the payee from the words just above it.
 function roleOf(lines, index) {
-  const context = lines.slice(Math.max(0, index - 3), index + 1).join(" ").toLowerCase();
+  const context = ` ${lines.slice(Math.max(0, index - 3), index + 1).join(" ").toLowerCase()}`;
   const fromAt = Math.max(context.lastIndexOf("from"), context.lastIndexOf("debited"), context.lastIndexOf("sender"), context.lastIndexOf("your upi"));
   const toAt = Math.max(context.lastIndexOf(" to "), context.lastIndexOf("paid to"), context.lastIndexOf("to:"), context.lastIndexOf("received by"), context.lastIndexOf("merchant"), context.lastIndexOf("banking name"));
   if (fromAt === -1 && toAt === -1) return null;
@@ -142,24 +135,21 @@ function findDate(text) {
 
 export function parseUpiText(text) {
   const lines = String(text || "").split(/\n+/).map((line) => line.trim()).filter(Boolean);
-  const merchants = merchantUpiIds();
   const upiIds = findUpiIds(lines);
+  // The screenshot shows both sides of the payment; only the customer's (payer's) UPI ID is kept.
   let payer = null;
   let payee = null;
   for (const { id, index } of upiIds) {
-    const role = merchants.includes(id) ? "payee" : roleOf(lines, index);
+    const role = roleOf(lines, index);
     if (role === "payee" && !payee) payee = id;
     else if (role === "payer" && !payer) payer = id;
   }
-  // With no labels, a non-Snackit ID is most likely the customer's.
-  if (!payer) payer = upiIds.map((item) => item.id).find((id) => id !== payee && !merchants.includes(id)) || null;
-  if (!payee) payee = upiIds.map((item) => item.id).find((id) => id !== payer) || null;
+  if (!payer) payer = upiIds.map((item) => item.id).find((id) => id !== payee) || null;
 
   return {
     utr: findUtr(text),
     amount: findAmount(lines),
     payer_upi: payer,
-    payee_upi: payee,
     upi_ids: upiIds.map((item) => item.id),
     status: findStatus(text),
     paid_at: findDate(text),
@@ -172,10 +162,8 @@ async function buildFlags(ticket, result) {
   if (!result.utr && !result.amount && !result.upi_ids.length) flags.push("Could not read payment details. Check the screenshot yourself.");
   if (result.status === "FAILED") flags.push("Screenshot shows a FAILED payment.");
   if (result.status === "PENDING") flags.push("Screenshot shows a PENDING payment.");
-  const merchants = merchantUpiIds();
-  if (merchants.length && result.payee_upi && !merchants.includes(result.payee_upi)) flags.push(`Paid to ${result.payee_upi}, which is not a Snackit UPI ID.`);
   const typed = String(ticket.upi_id || "").trim().toLowerCase();
-  if (typed.includes("@") && result.payer_upi && typed !== result.payer_upi) flags.push(`Customer typed UPI ID ${typed}, screenshot shows ${result.payer_upi}.`);
+  if (typed.includes("@") && result.payer_upi && typed !== result.payer_upi && typed !== result.payer_upi.replace(/@.*/, "")) flags.push(`Customer typed UPI ID ${typed}, screenshot shows ${result.payer_upi}.`);
   if (result.utr) {
     const duplicate = await db.query(
       "SELECT id, phone FROM tickets WHERE upi_utr = $1 AND id <> $2 ORDER BY id LIMIT 3",
@@ -215,9 +203,13 @@ async function scanNow(ticketId) {
     image: ticket.upi_image,
     ms: Date.now() - started,
   };
+  // The customer's UPI ID from the screenshot is shown on the dashboard; it also
+  // fills the ticket's UPI ID when the customer didn't type a proper one.
   await db.query(
-    "UPDATE tickets SET upi_scan = $1, upi_utr = $2, upi_scanned_at = NOW() WHERE id = $3",
-    [JSON.stringify(scan), result.utr, ticketId]
+    `UPDATE tickets SET upi_scan = $1, upi_utr = $2, screenshot_upi_id = $3, upi_scanned_at = NOW(),
+       upi_id = CASE WHEN $3::text IS NOT NULL AND COALESCE(upi_id, '') NOT LIKE '%@%' THEN $3::text ELSE upi_id END
+     WHERE id = $4`,
+    [JSON.stringify(scan), result.utr, result.payer_upi, ticketId]
   );
   console.log(`🔎 UPI scan ticket #${ticketId}: UTR ${result.utr || "-"}, ₹${result.amount ?? "-"}, ${result.payer_upi || "no UPI ID"} (${scan.ms}ms)`);
   return scan;

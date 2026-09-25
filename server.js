@@ -2176,6 +2176,7 @@ app.get("/tickets", auth, async (req, res) => {
         upi_image,
         upi_scan,
         upi_utr,
+        screenshot_upi_id,
         refund_amount,
         transaction_verified,
         paytm_status,
