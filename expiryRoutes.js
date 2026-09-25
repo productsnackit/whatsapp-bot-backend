@@ -109,7 +109,7 @@ export function registerExpiryRoutes(app, { db, auth }) {
     }
   };
   const adminOnly = (req, res, next) => {
-    if (req.user?.role !== "admin") return res.status(403).json({ error: "Only admin can do this" });
+    if (!req.user?.isAdmin) return res.status(403).json({ error: "Only admin can do this" });
     next();
   };
 

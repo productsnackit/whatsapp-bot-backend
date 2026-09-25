@@ -13,10 +13,12 @@ import { v2 as cloudinary } from "cloudinary";
 import { getOrCreateTicket, verifyPaymentOnPaytm, storePaytmVerification } from "./ticketService.js";
 import db from "./db.js";
 import { sendWhatsApp } from "./whatsapp.js";
-import { registerAuditRoutes, AUDIT_DEPARTMENTS } from "./auditRoutes.js";
+import { registerAuditRoutes } from "./auditRoutes.js";
 import { registerPushRoutes, sendPushToUsers, pushUserKey } from "./pushNotifications.js";
 import { handleRefillerWhatsApp } from "./refillerTasks.js";
-import { loadInternalState, internalSaveMiddleware } from "./internalStore.js";
+import { loadInternalState, internalSaveMiddleware, scheduleInternalSave } from "./internalStore.js";
+import { accessFor, canUsePath, hasPage, hashPassword, verifyPassword, generatePassword, newSessionToken, migrateUserPasswords, publicUser, PAGES, ROLE_PRESETS } from "./accessControl.js";
+import { ensureActivityLog, activityMiddleware, registerActivityRoutes, logActivity } from "./activityLog.js";
 import { registerFindingsRoutes } from "./findingsRoutes.js";
 import { registerExpiryRoutes } from "./expiryRoutes.js";
 import { ensureUpiScanColumns, scanUpiScreenshot, registerUpiScanRoutes } from "./upiScanner.js";
@@ -42,7 +44,8 @@ const io = new Server(httpServer, {
 app.use(cors());
 app.use(express.json({ limit: "25mb" }));
 // Internal chat, employees and logins are saved to the database after each change.
-app.use(["/internal", "/login"], internalSaveMiddleware);
+app.use(["/internal", "/login", "/me"], internalSaveMiddleware);
+app.use(activityMiddleware);
 
 const operationsUpload = multer({
   storage: multer.memoryStorage(),
@@ -447,9 +450,12 @@ async function sendPremiumWhatsApp(phone, message) {
 }
 
 /* ================= AUTH CONFIG ================= */
-const SECRET_TOKEN = process.env.ADMIN_SECRET_TOKEN || "mysecrettoken123";
+// The shared owner login only works when ADMIN_PASS is set on the server (no admin/admin fallback).
+// ADMIN_SECRET_TOKEN, if set, is still accepted as a fixed owner token for scripts.
+const SECRET_TOKEN = process.env.ADMIN_SECRET_TOKEN || "";
 const ADMIN_USER = process.env.ADMIN_USER || "admin";
-const ADMIN_PASS = process.env.ADMIN_PASS || "admin";
+const ADMIN_PASS = process.env.ADMIN_PASS || "";
+const SESSION_DAYS = 30;
 
 /* ================= HELPERS ================= */
 function cleanText(text) {
@@ -2096,6 +2102,23 @@ Keep using Snackit! 🎉`
 /* =========================================================
     AUTH MIDDLEWARE
 ========================================================= */
+const OWNER_USER = { role: "admin", owner: true, isAdmin: true, username: ADMIN_USER, name: "Admin", roleLabel: "Owner", pages: Object.keys(PAGES), readOnly: false };
+
+// The person behind a session, with their current access (so changes apply straight away).
+function sessionUser(token) {
+  const session = global.internalSessions.get(token);
+  if (!session) return null;
+  if (session.createdAt && Date.now() - session.createdAt > SESSION_DAYS * 24 * 60 * 60 * 1000) {
+    global.internalSessions.delete(token);
+    return null;
+  }
+  if (session.owner) return OWNER_USER;
+  const employee = global.internalUsers.find((user) => String(user.id) === String(session.userId));
+  if (!employee) return null; // deleted people are logged out
+  const { password, ...profile } = employee;
+  return { ...profile, userId: employee.id, role: "employee", ...accessFor(employee) };
+}
+
 function auth(req, res, next) {
   try {
     const header = req.headers.authorization;
@@ -2110,28 +2133,17 @@ function auth(req, res, next) {
       return res.status(401).json({ error: "Session expired" });
     }
 
-    if (token === SECRET_TOKEN) {
-      req.user = { role: "admin", username: ADMIN_USER };
-      return next();
+    const user = SECRET_TOKEN && token === SECRET_TOKEN ? OWNER_USER : sessionUser(token);
+    if (!user) return res.status(401).json({ error: "Session expired. Please log in again." });
+
+    if (!canUsePath(user, req.method, req.path)) {
+      return res.status(403).json({ error: "You don't have access to this page. Ask an admin." });
+    }
+    if (user.readOnly && !["GET", "HEAD"].includes(req.method) && !req.path.startsWith("/internal/") && !req.path.startsWith("/me")) {
+      return res.status(403).json({ error: "View-only access: you can't make changes." });
     }
 
-    const employee = global.internalSessions.get(token);
-    if (!employee) return res.status(401).json({ error: "Invalid token" });
-
-    const operationsPath = req.path.startsWith("/operations/") || req.path.startsWith("/machines") || req.path.startsWith("/inventory/") || req.path.startsWith("/host-sites") || req.path.startsWith("/brands") || req.path.startsWith("/skus/") || req.path.startsWith("/analytics/");
-    const auditPath = req.path.startsWith("/audit");
-    // Internal Audit findings and Expiry Tracking are open to every employee.
-    const findingsPath = req.path.startsWith("/findings") || req.path.startsWith("/expiry");
-    if (
-      !req.path.startsWith("/internal/") &&
-      !findingsPath &&
-      !(operationsPath && employee.department === "Operations") &&
-      !(auditPath && AUDIT_DEPARTMENTS.includes(employee.department))
-    ) {
-      return res.status(403).json({ error: "Internal chat access only" });
-    }
-
-    req.user = { ...employee, role: "employee" };
+    req.user = user;
     return next();
   } catch (err) {
     console.log("AUTH ERROR:", err.message);
@@ -2142,25 +2154,66 @@ function auth(req, res, next) {
 /* =========================================================
     LOGIN
 ========================================================= */
-app.post("/login", (req, res) => {
+function loginPayload(user, token) {
+  if (user.owner) return { token, role: "admin", username: ADMIN_USER, name: "Admin", accessRole: "admin", roleLabel: "Owner", pages: Object.keys(PAGES), readOnly: false, isAdmin: true, owner: true };
+  const access = accessFor(user);
+  return { token, role: "employee", userId: user.id, username: user.username, name: user.name, department: user.department, ...access };
+}
+
+app.post("/login", async (req, res) => {
   try {
-    const { username, password } = req.body;
+    const username = String(req.body?.username || "").trim();
+    const password = String(req.body?.password || "");
 
-    if (username === ADMIN_USER && password === ADMIN_PASS) {
-      return res.json({ token: SECRET_TOKEN, role: "admin", username: ADMIN_USER });
+    if (ADMIN_PASS && username === ADMIN_USER && password === ADMIN_PASS) {
+      const token = newSessionToken();
+      global.internalSessions.set(token, { owner: true, username: ADMIN_USER, createdAt: Date.now() });
+      await logActivity({ user: OWNER_USER, req, section: "Account", action: "Logged in" });
+      return res.json(loginPayload(OWNER_USER, token));
     }
 
-    const employee = global.internalUsers.find((user) => user.username === String(username).trim());
-    if (employee && employee.password === password) {
-      const token = `employee-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-      global.internalSessions.set(token, { userId: employee.id, username: employee.username, name: employee.name, department: employee.department });
-      return res.json({ token, role: "employee", userId: employee.id, username: employee.username, name: employee.name, department: employee.department });
+    const employee = global.internalUsers.find((user) => user.username === username);
+    if (employee && verifyPassword(password, employee.password)) {
+      const token = newSessionToken();
+      global.internalSessions.set(token, { userId: employee.id, username: employee.username, name: employee.name, department: employee.department, createdAt: Date.now() });
+      employee.lastLoginAt = new Date().toISOString();
+      await logActivity({ user: { ...employee, userId: employee.id, ...accessFor(employee) }, req, section: "Account", action: "Logged in" });
+      return res.json(loginPayload(employee, token));
     }
 
+    await logActivity({ user: null, req, section: "Account", action: `Failed login for "${username.slice(0, 60)}"`, actorName: username.slice(0, 60) || "Unknown" });
     res.status(401).json({ error: "Invalid credentials" });
   } catch (err) {
     res.status(500).json({ error: "Server error" });
   }
+});
+
+// Who is logged in and what they can open (the dashboard checks this regularly).
+app.get("/me", auth, (req, res) => {
+  const token = req.headers.authorization.split(" ")[1];
+  res.json(loginPayload(req.user.owner ? OWNER_USER : global.internalUsers.find((user) => String(user.id) === String(req.user.userId)), token));
+});
+
+app.post("/me/password", auth, (req, res) => {
+  if (req.user.owner) return res.status(400).json({ error: "The owner password is set on the server (ADMIN_PASS)." });
+  const employee = global.internalUsers.find((user) => String(user.id) === String(req.user.userId));
+  const current = String(req.body?.current || "");
+  const next = String(req.body?.next || "");
+  if (!employee || !verifyPassword(current, employee.password)) return res.status(400).json({ error: "Current password is wrong" });
+  if (next.length < 8) return res.status(400).json({ error: "New password must be at least 8 characters" });
+  employee.password = hashPassword(next);
+  // Log out their other devices; this one stays signed in.
+  const token = req.headers.authorization.split(" ")[1];
+  for (const [key, session] of global.internalSessions) {
+    if (String(session.userId) === String(employee.id) && key !== token) global.internalSessions.delete(key);
+  }
+  res.json({ success: true });
+});
+
+app.post("/logout", auth, (req, res) => {
+  global.internalSessions.delete(req.headers.authorization.split(" ")[1]);
+  scheduleInternalSave();
+  res.json({ success: true });
 });
 
 /* =========================================================
@@ -2383,7 +2436,7 @@ app.get("/admin/settings", auth, async (req, res) => {
 
 app.post("/admin/settings", auth, async (req, res) => {
   try {
-    if (req.user?.role !== "admin") return res.status(403).json({ error: "Admin access required" });
+    if (!hasPage(req.user, "settings")) return res.status(403).json({ error: "Bot settings access required" });
     const { paytm_verification_enabled, auto_close_inactive_tickets, auto_close_minutes, premium_message_mode, admin_logo } = req.body || {};
 
     if (typeof paytm_verification_enabled !== "undefined") {
@@ -2802,6 +2855,7 @@ registerFindingsRoutes(app, { db, auth });
 registerExpiryRoutes(app, { db, auth });
 registerUpiScanRoutes(app, { auth });
 registerTicketChatRoutes(app, { db, auth });
+registerActivityRoutes(app, { auth });
 
 app.get("/host-sites/renewals-due", auth, async (req, res) => {
   try {
@@ -2881,7 +2935,7 @@ app.get("/brands", auth, async (req, res) => {
 
 app.post("/brands", auth, async (req, res) => {
   try {
-    if (req.user?.role !== "admin") return res.status(403).json({ error: "Admin access required" });
+    if (!req.user?.isAdmin) return res.status(403).json({ error: "Admin access required" });
     const { name, contact_email, contact_phone, status = "active" } = req.body || {};
     if (!String(name || "").trim()) return res.status(400).json({ error: "Brand name is required" });
     const result = await db.query("INSERT INTO brands (name, contact_email, contact_phone, status) VALUES ($1, $2, $3, $4) RETURNING *", [String(name).trim(), contact_email || null, contact_phone || null, status]);
@@ -2894,7 +2948,7 @@ app.post("/brands", auth, async (req, res) => {
 
 app.post("/skus", auth, async (req, res) => {
   try {
-    if (req.user?.role !== "admin") return res.status(403).json({ error: "Admin access required" });
+    if (!req.user?.isAdmin) return res.status(403).json({ error: "Admin access required" });
     const { brand_id, name, category, unit_price = 0 } = req.body || {};
     if (!String(name || "").trim()) return res.status(400).json({ error: "SKU name is required" });
     const result = await db.query("INSERT INTO skus (brand_id, name, category, unit_price) VALUES ($1, $2, $3, $4) RETURNING *", [brand_id || null, String(name).trim(), category || null, unit_price]);
@@ -3047,7 +3101,7 @@ const importSchemas = {
 };
 
 function importUserCanAccess(req) {
-  return req.user?.role === "admin" || req.user?.department === "Operations";
+  return hasPage(req.user, "operations");
 }
 
 function normalizeImportRow(row) {
@@ -3624,19 +3678,43 @@ app.get("/admin/messages/:ticketId", auth, async (req, res) => {
 
 app.get("/internal/users", auth, (req, res) => {
   try {
-    if (req.user?.role === "admin") return res.json(global.internalUsers);
-    res.json(global.internalUsers.map(({ password, ...user }) => user));
+    // Passwords never leave the server; admins also see each person's access.
+    res.json(global.internalUsers.map((user) => publicUser(user, { withAccess: Boolean(req.user?.isAdmin) })));
   } catch (err) {
     console.log("INTERNAL USERS ERROR:", err.message);
     res.status(500).json({ error: "Server error" });
   }
 });
 
+// Checks a requested role and page list; unknown pages are dropped.
+function accessFields(body) {
+  const fields = {};
+  if (body.accessRole !== undefined) {
+    if (!ROLE_PRESETS[body.accessRole]) throw new Error("Unknown role");
+    fields.accessRole = body.accessRole;
+  }
+  if (body.pages !== undefined) {
+    if (!Array.isArray(body.pages)) throw new Error("Pages must be a list");
+    fields.pages = body.pages.filter((page) => PAGES[page]);
+  }
+  return fields;
+}
+
+function endSessionsOf(userId) {
+  for (const [token, session] of global.internalSessions) {
+    if (String(session.userId) === String(userId)) global.internalSessions.delete(token);
+  }
+}
+
 app.delete("/internal/users/:id", auth, (req, res) => {
   try {
-    if (req.user?.role !== "admin") return res.status(403).json({ error: "Admin access required" });
+    if (!req.user?.isAdmin) return res.status(403).json({ error: "Admin access required" });
     const { id } = req.params;
+    const removed = global.internalUsers.find((user) => String(user.id) === String(id));
+    if (!removed) return res.status(404).json({ error: "Employee not found" });
     global.internalUsers = global.internalUsers.filter((user) => String(user.id) !== String(id));
+    endSessionsOf(id);
+    res.locals.activity = { action: `Deleted employee ${removed.name} (${removed.username})` };
     io.emit("internal-user-updated", { removedUserId: id });
     res.json({ success: true });
   } catch (err) {
@@ -3647,8 +3725,8 @@ app.delete("/internal/users/:id", auth, (req, res) => {
 
 app.post("/internal/users", auth, (req, res) => {
   try {
-    if (req.user?.role !== "admin") return res.status(403).json({ error: "Admin access required" });
-    const { name, department, role, tags, isAdmin } = req.body || {};
+    if (!req.user?.isAdmin) return res.status(403).json({ error: "Admin access required" });
+    const { name, department, role, tags } = req.body || {};
 
     if (!name || !department || !role) {
       return res.status(400).json({ error: "Name, department and role are required" });
@@ -3657,52 +3735,91 @@ app.post("/internal/users", auth, (req, res) => {
     const baseUsername = String(name).trim().toLowerCase().replace(/[^a-z0-9]+/g, ".").replace(/^\.|\.$/g, "") || "employee";
     let username = baseUsername;
     let suffix = 2;
-    while (global.internalUsers.some((user) => user.username === username)) {
+    while (global.internalUsers.some((user) => user.username === username) || username === ADMIN_USER) {
       username = `${baseUsername}${suffix}`;
       suffix += 1;
     }
-    const generatedPassword = `Snackit@${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
+    const generatedPassword = generatePassword();
 
     const nextUser = {
       id: Date.now() + Math.random(),
       username,
-      password: generatedPassword,
+      password: hashPassword(generatedPassword),
       name: String(name).trim(),
       department: String(department).trim(),
       role: String(role).trim(),
       tags: getInternalTagList(tags ? String(tags).split(",") : []),
-      isAdmin: Boolean(isAdmin),
+      ...accessFields(req.body || {}),
     };
 
     global.internalUsers.push(nextUser);
-    io.emit("internal-user-updated", { user: nextUser });
-    res.json({ success: true, user: nextUser, credentials: { username, password: generatedPassword } });
+    res.locals.activity = { action: `Added employee ${nextUser.name} (${username}) as ${accessFor(nextUser).roleLabel}` };
+    io.emit("internal-user-updated", { user: publicUser(nextUser) });
+    res.json({ success: true, user: publicUser(nextUser, { withAccess: true }), credentials: { username, password: generatedPassword } });
   } catch (err) {
     console.log("CREATE INTERNAL USER ERROR:", err.message);
-    res.status(500).json({ error: "Server error" });
+    res.status(err.message.startsWith("Unknown") || err.message.startsWith("Pages") ? 400 : 500).json({ error: err.message });
   }
 });
 
 app.patch("/internal/users/:id", auth, (req, res) => {
   try {
-    if (req.user?.role !== "admin") return res.status(403).json({ error: "Admin access required" });
+    if (!req.user?.isAdmin) return res.status(403).json({ error: "Admin access required" });
     const user = global.internalUsers.find((item) => String(item.id) === String(req.params.id));
     if (!user) return res.status(404).json({ error: "Employee not found" });
 
-    const { name, department, role, tags, username, password } = req.body || {};
+    const { name, department, role, tags, username } = req.body || {};
+    const before = accessFor(user);
+    const beforeProfile = JSON.stringify([user.name, user.department, user.role, user.tags, user.username]);
+    const snapshot = { name: user.name, department: user.department, role: user.role, tags: (user.tags || []).join(","), username: user.username };
+    const access = accessFields(req.body || {});
+    if (username !== undefined) {
+      const next = String(username).trim();
+      if (!next) return res.status(400).json({ error: "Username can't be empty" });
+      if (next === ADMIN_USER || global.internalUsers.some((item) => item !== user && item.username === next)) {
+        return res.status(400).json({ error: "That username is already taken" });
+      }
+      user.username = next;
+    }
     if (name !== undefined) user.name = String(name).trim();
     if (department !== undefined) user.department = String(department).trim();
     if (role !== undefined) user.role = String(role).trim();
-    if (username !== undefined) user.username = String(username).trim();
-    if (password !== undefined && String(password).trim()) user.password = String(password).trim();
     if (tags !== undefined) user.tags = getInternalTagList(Array.isArray(tags) ? tags : String(tags).split(","));
+    Object.assign(user, access);
 
-    io.emit("internal-user-updated", { user });
-    res.json({ success: true, user });
+    const after = accessFor(user);
+    const labels = { name: "name", department: "department", role: "job title", tags: "tags", username: "username" };
+    const current = { name: user.name, department: user.department, role: user.role, tags: (user.tags || []).join(","), username: user.username };
+    const changes = JSON.stringify([user.name, user.department, user.role, user.tags, user.username]) === beforeProfile
+      ? []
+      : Object.keys(labels).filter((key) => snapshot[key] !== current[key]).map((key) => `${labels[key]}: ${snapshot[key] || "—"} → ${current[key] || "—"}`);
+    const accessNote = before.accessRole !== after.accessRole || before.pages.join() !== after.pages.join()
+      ? ` · access: ${before.roleLabel} → ${after.roleLabel} (${after.pages.map((page) => PAGES[page]).join(", ") || "chat only"})`
+      : "";
+    res.locals.activity = { action: `Updated employee ${user.name}${changes.length ? ` (${changes.join("; ")})` : ""}${accessNote}` };
+    io.emit("internal-user-updated", { user: publicUser(user) });
+    res.json({ success: true, user: publicUser(user, { withAccess: true }) });
   } catch (err) {
     console.log("UPDATE INTERNAL USER ERROR:", err.message);
-    res.status(500).json({ error: "Server error" });
+    res.status(err.message.startsWith("Unknown") || err.message.startsWith("Pages") ? 400 : 500).json({ error: err.message });
   }
+});
+
+// Sets a new random password (shown once) and signs the person out everywhere.
+app.post("/internal/users/:id/reset-password", auth, (req, res) => {
+  if (!req.user?.isAdmin) return res.status(403).json({ error: "Admin access required" });
+  const user = global.internalUsers.find((item) => String(item.id) === String(req.params.id));
+  if (!user) return res.status(404).json({ error: "Employee not found" });
+  const password = generatePassword();
+  user.password = hashPassword(password);
+  endSessionsOf(user.id);
+  res.locals.activity = { action: `Reset password for ${user.name} (${user.username})` };
+  res.json({ success: true, credentials: { username: user.username, password } });
+});
+
+// Roles and pages the Employees page offers.
+app.get("/internal/access-options", auth, (req, res) => {
+  res.json({ pages: PAGES, roles: Object.fromEntries(Object.entries(ROLE_PRESETS).map(([key, preset]) => [key, { label: preset.label, pages: preset.pages, readOnly: preset.readOnly }])) });
 });
 
 app.get("/internal/chats", auth, (req, res) => {
@@ -3720,7 +3837,7 @@ app.get("/internal/chats", auth, (req, res) => {
 
 app.delete("/internal/chats/:id", auth, (req, res) => {
   try {
-    if (req.user?.role !== "admin") return res.status(403).json({ error: "Admin access required" });
+    if (!req.user?.isAdmin) return res.status(403).json({ error: "Admin access required" });
     const { id } = req.params;
     const deleted = global.internalChats.find((chat) => String(chat.id) === String(id));
     global.internalChats = global.internalChats.filter((chat) => String(chat.id) !== String(id));
@@ -4093,6 +4210,16 @@ try {
   await loadInternalState(db);
 } catch (err) {
   console.error("INTERNAL CHAT LOAD ERROR (starting with defaults):", err.message);
+}
+
+// Passwords left over from before are scrambled once; the plain text is never kept.
+if (migrateUserPasswords(global.internalUsers)) scheduleInternalSave();
+if (!ADMIN_PASS) console.warn("⚠️ ADMIN_PASS is not set: the shared owner login is disabled. Named admin accounts still work.");
+
+try {
+  await ensureActivityLog(db);
+} catch (err) {
+  console.error("ACTIVITY LOG SETUP ERROR:", err.message);
 }
 
 // httpServer (not app) so the socket.io live updates are served on the same port.

@@ -151,7 +151,7 @@ export function registerFindingsRoutes(app, { db, auth }) {
 
   // Import findings from CSV (the Export CSV format). Rows whose ref already exists are skipped.
   app.post("/findings/import", auth, handle("FINDINGS IMPORT", async (req, res) => {
-    if (req.user?.role !== "admin") return res.status(403).json({ error: "Only admin can import findings" });
+    if (!req.user?.isAdmin) return res.status(403).json({ error: "Only admin can import findings" });
     const rows = Array.isArray(req.body?.rows) ? req.body.rows.slice(0, 2000) : [];
     if (!rows.length) return res.status(400).json({ error: "No rows to import" });
     const by = userName(req.user);
@@ -246,7 +246,7 @@ export function registerFindingsRoutes(app, { db, auth }) {
   }));
 
   app.delete("/findings/:id", auth, handle("FINDING DELETE", async (req, res) => {
-    if (req.user?.role !== "admin") return res.status(403).json({ error: "Only admin can delete findings" });
+    if (!req.user?.isAdmin) return res.status(403).json({ error: "Only admin can delete findings" });
     await db.query("DELETE FROM audit_findings WHERE id = $1", [req.params.id]);
     res.json({ ok: true });
   }));

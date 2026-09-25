@@ -103,7 +103,7 @@ async function ensureAuditTables(db) {
 }
 
 function canAccessAudits(user) {
-  return user?.role === "admin" || AUDIT_DEPARTMENTS.includes(user?.department);
+  return Boolean(user?.isAdmin || user?.pages?.includes("audit"));
 }
 
 function userName(user) {
@@ -136,7 +136,7 @@ export function registerAuditRoutes(app, { db, auth, uploadImage }) {
     next();
   };
   const adminOnly = (req, res, next) => {
-    if (req.user?.role !== "admin") return res.status(403).json({ error: "Only admins can delete" });
+    if (!req.user?.isAdmin) return res.status(403).json({ error: "Only admins can delete" });
     next();
   };
   const handle = (label, fn) => async (req, res) => {
