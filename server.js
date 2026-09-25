@@ -20,6 +20,7 @@ import { loadInternalState, internalSaveMiddleware } from "./internalStore.js";
 import { registerFindingsRoutes } from "./findingsRoutes.js";
 import { registerExpiryRoutes } from "./expiryRoutes.js";
 import { ensureUpiScanColumns, scanUpiScreenshot, registerUpiScanRoutes } from "./upiScanner.js";
+import { ensureTicketChatSchema, registerTicketChatRoutes, storeIncomingMedia, saveTicketMessage, applyStatusUpdates } from "./ticketChat.js";
 
 /* ================= CLOUDINARY ================= */
 cloudinary.config({
@@ -250,6 +251,7 @@ async function ensureSupportColumns() {
     `);
     await db.query("ALTER TABLE feedback ADD COLUMN IF NOT EXISTS ticket_id INTEGER REFERENCES tickets(id)");
     await ensureUpiScanColumns(db);
+    await ensureTicketChatSchema(db);
     await db.query(`
       INSERT INTO machines (name, location)
       SELECT DISTINCT LEFT(TRIM(location), 200), TRIM(location)
@@ -478,6 +480,9 @@ function extractMedia(jobData) {
 async function uploadToCloudinary(url, type = "image") {
   try {
     if (!url) return null;
+
+    // Already on Cloudinary (the webhook stores customer media as it arrives).
+    if (url.includes("res.cloudinary.com")) return url;
 
     let uploadSource = url;
 
@@ -2796,6 +2801,7 @@ registerPushRoutes(app, { db, auth });
 registerFindingsRoutes(app, { db, auth });
 registerExpiryRoutes(app, { db, auth });
 registerUpiScanRoutes(app, { auth });
+registerTicketChatRoutes(app, { db, auth });
 
 app.get("/host-sites/renewals-due", auth, async (req, res) => {
   try {
@@ -3490,6 +3496,12 @@ app.post("/webhook", async (req, res) => {
     const value = change?.value;
     const msg = value?.messages?.[0];
 
+    // Delivery ticks (sent / delivered / read / failed) for messages we sent.
+    if (!msg && value?.statuses?.length) {
+      await applyStatusUpdates(db, value.statuses);
+      return res.sendStatus(200);
+    }
+
     if (!msg) return res.sendStatus(200);
 
     // De-dupe: WhatsApp can redeliver the same webhook (e.g. slow ack, cold start)
@@ -3526,27 +3538,16 @@ app.post("/webhook", async (req, res) => {
       text = msg.text?.body || "";
     }
 
-    if (type === "image" || type === "video") {
-      isImage = true;
-      mediaType = type;
-
-      const mediaId = type === "image" ? msg.image?.id : msg.video?.id;
-
-      if (mediaId) {
-        try {
-          const mediaRes = await axios.get(
-            `https://graph.facebook.com/v19.0/${mediaId}`,
-            {
-              headers: {
-                Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`,
-              },
-            }
-          );
-
-          mediaUrl = mediaRes.data?.url || null;
-        } catch (err) {
-          console.log("MEDIA URL ERROR:", err.response?.data || err.message);
-        }
+    // Photos, videos, documents and voice notes are copied to Cloudinary so the
+    // dashboard chat can show them. The bot flow still only treats photos and
+    // videos as screenshots, exactly as before.
+    const media = await storeIncomingMedia(msg);
+    if (media) {
+      text = text || media.caption;
+      if (type === "image" || type === "video") {
+        isImage = true;
+        mediaType = type;
+        mediaUrl = media.url || media.graphUrl;
       }
     }
 
@@ -3562,7 +3563,27 @@ app.post("/webhook", async (req, res) => {
       return res.sendStatus(200);
     }
 
-    await saveMessage(ticket.id, "user", text || "[media]");
+    await saveTicketMessage(db, {
+      ticketId: ticket.id,
+      sender: "user",
+      text: text || (media ? "" : "[media]"),
+      mediaUrl: media?.url || null,
+      mediaType: media?.kind || null,
+      fileName: media?.fileName || null,
+      mimeType: media?.mimeType || null,
+      waMessageId: msg.id || null,
+    });
+
+    // During a takeover the admin is told straight away, even with the dashboard closed.
+    if (ticket.takeover === true || ticket.takeover === "true") {
+      sendPushToUsers(db, ["admin"], {
+        title: `Customer ${from} replied`,
+        body: (text || (media ? `📎 Sent a ${media.kind === "image" ? "photo" : media.kind}` : "New message")).slice(0, 180),
+        view: "tickets",
+        ticketId: String(ticket.id),
+        phone: from,
+      });
+    }
 
     await processMessage({
       ticketId: ticket.id,

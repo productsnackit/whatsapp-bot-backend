@@ -55,6 +55,11 @@ async function postToWhatsApp(data) {
   }
 }
 
+// Any message payload (text, image, document…); returns { ok, id, code, error }.
+export function sendWhatsAppPayload(data) {
+  return postToWhatsApp(data);
+}
+
 // Message with up to 3 reply buttons ([{ id, title }], title max 20 characters).
 // WhatsApp only delivers this within 24 hours of the person's last message to us.
 export function sendWhatsAppButtons(to, body, buttons) {
