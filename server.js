@@ -20,6 +20,7 @@ import { loadInternalState, internalSaveMiddleware, scheduleInternalSave } from 
 import { accessFor, canUsePath, hasPage, hashPassword, verifyPassword, generatePassword, newSessionToken, migrateUserPasswords, publicUser, PAGES, ROLE_PRESETS } from "./accessControl.js";
 import { ensureActivityLog, activityMiddleware, registerActivityRoutes, logActivity } from "./activityLog.js";
 import { ensureRefillTables, registerRefillRoutes, refillTick } from "./refillSchedule.js";
+import { registerTaskRoutes, taskReminderTick } from "./internalTasks.js";
 import { registerFindingsRoutes } from "./findingsRoutes.js";
 import { registerExpiryRoutes } from "./expiryRoutes.js";
 import { ensureUpiScanColumns, scanUpiScreenshot, registerUpiScanRoutes } from "./upiScanner.js";
@@ -2858,6 +2859,14 @@ registerUpiScanRoutes(app, { auth });
 registerTicketChatRoutes(app, { db, auth });
 registerActivityRoutes(app, { auth });
 registerRefillRoutes(app, { auth });
+registerTaskRoutes(app, {
+  auth,
+  getUserKey: getInternalUserKey,
+  canSeeChat: canSeeInternalChat,
+  emitChat: emitInternalChat,
+  sendPush: (userKeys, payload) => sendPushToUsers(db, userKeys, payload),
+  scheduleSave: scheduleInternalSave,
+});
 
 app.get("/host-sites/renewals-due", auth, async (req, res) => {
   try {
@@ -4032,7 +4041,13 @@ app.post("/internal/chats/:id/messages", auth, (req, res) => {
         .filter((userId) => global.internalUsers.some((user) => String(user.id) === userId && user.department === chat.department)),
       reactions: {},
       assignedTo: null,
+      createdAt: new Date().toISOString(),
+      createdByKey: getInternalUserKey(req.user),
     };
+    // A tagged message is a task; it can come with a due date.
+    if (message.mentions.length && req.body?.dueAt && !Number.isNaN(new Date(req.body.dueAt).getTime())) {
+      message.dueAt = new Date(req.body.dueAt).toISOString();
+    }
 
     chat.messages.push(message);
     chat.unreadBy = { ...(chat.unreadBy || {}) };
@@ -4142,7 +4157,10 @@ app.patch("/internal/chats/:chatId/messages/:messageId/status", auth, (req, res)
 
     message.status = req.body.status;
     message.statusUpdatedBy = req.user?.name || "Admin";
+    message.statusUpdatedByKey = getInternalUserKey(req.user);
     message.statusUpdatedAt = new Date().toISOString();
+    message.completedAt = req.body.status === "resolved" ? message.statusUpdatedAt : null;
+    message.history = [...(message.history || []), { at: message.statusUpdatedAt, by: message.statusUpdatedBy, action: { open: "reopened", "in-progress": "started", resolved: "resolved" }[req.body.status] }].slice(-30);
     emitInternalChat(chat, "internal-chat-updated", { chat });
     res.json({ success: true, chat });
   } catch (err) {
@@ -4228,6 +4246,7 @@ try {
 try {
   await ensureRefillTables(db, { sendPush: (userKeys, payload) => sendPushToUsers(db, userKeys, payload) });
   setInterval(refillTick, 60 * 1000);
+  setInterval(taskReminderTick, 5 * 60 * 1000);
   setTimeout(refillTick, 15 * 1000);
 } catch (err) {
   console.error("REFILL SCHEDULE SETUP ERROR:", err.message);
