@@ -141,6 +141,20 @@ export async function ensureRefillTables(database, { sendPush } = {}) {
     )
   `);
   await db.query("CREATE TABLE IF NOT EXISTS refill_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+  // Temporary cover: another refiller does a site's visits on certain days.
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS refill_shifts (
+      id SERIAL PRIMARY KEY,
+      location_id INTEGER NOT NULL,
+      to_refiller_id INTEGER NOT NULL,
+      from_date TEXT NOT NULL,
+      to_date TEXT NOT NULL,
+      note TEXT,
+      created_by TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+  await db.query("ALTER TABLE refill_tasks ADD COLUMN IF NOT EXISTS shifted_from TEXT, ADD COLUMN IF NOT EXISTS base_refiller_id INTEGER");
 }
 
 async function getSettings() {
@@ -162,47 +176,119 @@ function occursOn(schedule, date) {
   return (schedule.days || []).includes(weekday(date));
 }
 
-// Creates the next 14 days of visits and keeps future visits in line with site/refiller changes.
+// Who does a site's visit on a date: a temporary shift if one covers that day (the newest
+// wins), otherwise the site's usual refiller (or the schedule's cover refiller).
+function refillerOn(locationId, date, usualId, shifts) {
+  const shift = shifts
+    .filter((item) => item.location_id === locationId && item.from_date <= date && item.to_date >= date)
+    .sort((a, b) => b.id - a.id)[0];
+  return shift ? { id: shift.to_refiller_id, shifted: true } : { id: usualId, shifted: false };
+}
+
+// Creates the next 14 days of visits and keeps future visits in line with sites, refillers and shifts.
 export async function generateTasks({ force = false } = {}) {
   if (!force && Date.now() - lastGenerated < 10 * 60 * 1000) return;
   lastGenerated = Date.now();
   const today = istDate();
-  const { rows: schedules } = await db.query(`
-    SELECT s.*, l.name AS location_name, l.machine_code,
-           r.id AS resolved_refiller_id, r.name AS refiller_name, r.phone AS refiller_phone
-    FROM refill_schedules s
-    JOIN audit_locations l ON l.id = s.location_id
-    LEFT JOIN audit_refillers r ON r.id = COALESCE(s.refiller_id, l.refiller_id)
-    WHERE s.active
-  `);
+  const [{ rows: schedules }, { rows: refillerRows }, { rows: shifts }, { rows: locations }] = await Promise.all([
+    db.query(`SELECT s.*, l.name AS location_name, l.machine_code, COALESCE(s.refiller_id, l.refiller_id) AS usual_refiller_id
+              FROM refill_schedules s JOIN audit_locations l ON l.id = s.location_id WHERE s.active`),
+    db.query("SELECT id, name, phone FROM audit_refillers"),
+    db.query("SELECT * FROM refill_shifts WHERE to_date >= $1", [today]),
+    db.query("SELECT id, name, machine_code, refiller_id FROM audit_locations"),
+  ]);
+  const refillers = new Map(refillerRows.map((row) => [row.id, row]));
+  const nameOf = (id) => refillers.get(id)?.name || null;
+  const phoneOf = (id) => phoneDigits(refillers.get(id)?.phone) || null;
+
   for (const schedule of schedules) {
     for (let offset = 0; offset < HORIZON_DAYS; offset += 1) {
       const date = addDays(today, offset);
       if (!occursOn(schedule, date)) continue;
+      const who = refillerOn(schedule.location_id, date, schedule.usual_refiller_id, shifts);
       for (const time of schedule.times) {
         const dueAt = istToUtc(date, time);
         if (dueAt < new Date()) continue; // never create visits in the past
         await db.query(
-          `INSERT INTO refill_tasks (schedule_id, location_id, location_name, machine_code, refiller_id, refiller_name, refiller_phone, due_date, due_time, due_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+          `INSERT INTO refill_tasks (schedule_id, location_id, location_name, machine_code, refiller_id, refiller_name, refiller_phone, due_date, due_time, due_at, shifted_from, base_refiller_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
            ON CONFLICT (schedule_id, due_date, due_time) DO NOTHING`,
-          [schedule.id, schedule.location_id, schedule.location_name, schedule.machine_code, schedule.resolved_refiller_id, schedule.refiller_name, phoneDigits(schedule.refiller_phone) || null, date, time, dueAt]
+          [schedule.id, schedule.location_id, schedule.location_name, schedule.machine_code, who.id, nameOf(who.id), phoneOf(who.id), date, time, dueAt,
+            who.shifted ? nameOf(schedule.usual_refiller_id) : null, schedule.usual_refiller_id]
         );
       }
     }
   }
-  // Future visits that no one has been reminded about follow the site's current name and refiller.
-  await db.query(`
-    UPDATE refill_tasks t
-    SET location_name = l.name, machine_code = l.machine_code, refiller_id = r.id, refiller_name = r.name,
-        refiller_phone = NULLIF(regexp_replace(COALESCE(r.phone, ''), '\\D', '', 'g'), '')
-    FROM refill_schedules s
-    JOIN audit_locations l ON l.id = s.location_id
-    LEFT JOIN audit_refillers r ON r.id = COALESCE(s.refiller_id, l.refiller_id)
-    WHERE t.schedule_id = s.id AND t.status = 'scheduled' AND t.due_at > NOW() AND t.day_before_sent_at IS NULL
-      AND (t.refiller_id IS DISTINCT FROM r.id OR t.location_name IS DISTINCT FROM l.name)
-  `);
-  await db.query(`UPDATE refill_tasks SET refiller_phone = '91' || refiller_phone WHERE length(refiller_phone) = 10`);
+  await syncFutureTasks({ today, schedules, shifts, locations, nameOf, phoneOf });
+}
+
+// Upcoming visits follow the current site names, refillers and shifts. When a visit moves to
+// someone else, the new refiller is told right away if it's soon, and the old one is told they
+// needn't go if they had already been reminded.
+async function syncFutureTasks({ today, schedules, shifts, locations, nameOf, phoneOf }) {
+  const bySchedule = new Map(schedules.map((row) => [row.id, row]));
+  const bySite = new Map(locations.map((row) => [row.id, row]));
+  const { rows: tasks } = await db.query("SELECT * FROM refill_tasks WHERE status = 'scheduled' AND due_at > NOW() ORDER BY due_at");
+  const settings = await getSettings();
+  const tomorrowListOut = new Date() >= istToUtc(today, settings.day_before_time);
+  const newlyAssigned = new Map();
+  const releasedFrom = new Map();
+
+  for (const task of tasks) {
+    const site = bySite.get(task.location_id);
+    if (!site) continue;
+    const usual = task.schedule_id
+      ? bySchedule.get(task.schedule_id)?.usual_refiller_id ?? site.refiller_id
+      : task.base_refiller_id ?? task.refiller_id;
+    const who = refillerOn(task.location_id, task.due_date, usual, shifts);
+    const moved = (who.id || null) !== (task.refiller_id || null);
+    const renamed = site.name !== task.location_name || (site.machine_code || null) !== (task.machine_code || null);
+    const shiftedFrom = who.shifted ? nameOf(usual) : null;
+    if (!moved && !renamed && shiftedFrom === (task.shifted_from || null)) continue;
+
+    if (moved) {
+      const soon = task.due_date === today || (task.due_date === addDays(today, 1) && tomorrowListOut);
+      if ((task.day_before_sent_at || task.hour_before_sent_at) && task.refiller_phone) {
+        releasedFrom.set(task.refiller_phone, [...(releasedFrom.get(task.refiller_phone) || []), { ...task, newName: nameOf(who.id) }]);
+      }
+      const phone = phoneOf(who.id);
+      if (soon && phone) newlyAssigned.set(phone, [...(newlyAssigned.get(phone) || []), { ...task, refiller_name: nameOf(who.id) }]);
+    }
+    await db.query(
+      `UPDATE refill_tasks SET location_name = $2, machine_code = $3, refiller_id = $4, refiller_name = $5, refiller_phone = $6, shifted_from = $7,
+         day_before_sent_at = CASE WHEN $8 THEN NULL ELSE day_before_sent_at END,
+         hour_before_sent_at = CASE WHEN $8 THEN NULL ELSE hour_before_sent_at END,
+         reminder_error = CASE WHEN $8 THEN NULL ELSE reminder_error END
+       WHERE id = $1`,
+      [task.id, site.name, site.machine_code, who.id, nameOf(who.id), phoneOf(who.id), shiftedFrom, moved]
+    );
+  }
+
+  for (const [phone, list] of releasedFrom) {
+    await sendWhatsApp(phone, [
+      "ℹ️ Change to your refills:",
+      "",
+      ...list.map((task) => `• ${task.location_name}, ${task.due_date === today ? "today" : prettyDate(task.due_date)} ${prettyTime(task.due_time)} → now done by ${task.newName || "someone else"}`),
+      "",
+      "You don't need to go for these. Thank you!",
+    ].join("\n"));
+  }
+  for (const [phone, list] of newlyAssigned) {
+    const name = list[0].refiller_name || "";
+    const text = [
+      `Hi ${name} 👋 New refill visit${list.length === 1 ? "" : "s"} for you:`,
+      "",
+      ...list.map((task, index) => `${index + 1}. ${task.due_date === today ? "Today" : prettyDate(task.due_date)} ${prettyTime(task.due_time)} · ${task.location_name}${task.machine_code ? ` (${task.machine_code})` : ""}`),
+      "",
+      "After refilling, send a photo of the machine here and choose the site. 📸",
+    ].join("\n");
+    const result = await sendReminder(phone, text, [name || "there", String(list.length), "newly assigned", list.map((task) => `${task.due_date === today ? "today" : prettyDate(task.due_date)} ${prettyTime(task.due_time)} ${task.location_name}`).join("; ").slice(0, 900)]);
+    // Counts as their reminder, so the evening list doesn't repeat it.
+    await db.query(
+      "UPDATE refill_tasks SET day_before_sent_at = CASE WHEN $2 THEN NOW() ELSE NULL END, reminder_error = $3 WHERE id = ANY($1)",
+      [list.map((task) => task.id), result.ok, result.ok ? null : result.error]
+    );
+  }
 }
 
 // After a schedule changes, future visits nobody was told about yet are rebuilt from it.
@@ -566,18 +652,23 @@ export function registerRefillRoutes(app, { auth }) {
   app.get("/refills/overview", auth, guard, handle("REFILL OVERVIEW", async (req, res) => {
     await generateTasks();
     const date = validDate(req.query.date) ? req.query.date : istDate();
-    const [tasks, locations, refillers, settings, pending] = await Promise.all([
+    const [tasks, locations, refillers, settings, pending, shifts] = await Promise.all([
       db.query("SELECT * FROM refill_tasks WHERE due_date = $1 AND status <> 'cancelled' ORDER BY due_time, location_name", [date]),
       db.query(`SELECT l.id, l.name, l.machine_code, l.refiller_id, r.name AS refiller_name, row_to_json(s) AS schedule
                 FROM audit_locations l LEFT JOIN audit_refillers r ON r.id = l.refiller_id
                 LEFT JOIN refill_schedules s ON s.location_id = l.id ORDER BY r.name NULLS LAST, l.name`),
-      db.query("SELECT id, name, phone FROM audit_refillers ORDER BY name"),
+      db.query("SELECT id, name, phone, shift, workload FROM audit_refillers ORDER BY name"),
       getSettings(),
       db.query("SELECT COUNT(*)::int AS count FROM refill_tasks WHERE status = 'done'"),
+      db.query(`SELECT sh.*, l.name AS location_name, r.name AS to_refiller_name, u.name AS usual_refiller_name
+                FROM refill_shifts sh JOIN audit_locations l ON l.id = sh.location_id
+                LEFT JOIN audit_refillers r ON r.id = sh.to_refiller_id
+                LEFT JOIN audit_refillers u ON u.id = l.refiller_id
+                WHERE sh.to_date >= $1 ORDER BY sh.from_date, l.name`, [istDate()]),
     ]);
     res.json({
       date, today: istDate(), now: new Date().toISOString(),
-      tasks: tasks.rows, locations: locations.rows, refillers: refillers.rows, settings,
+      tasks: tasks.rows, locations: locations.rows, refillers: refillers.rows, settings, shifts: shifts.rows,
       awaitingVerification: pending.rows[0].count,
       template: process.env.REFILL_TEMPLATE_NAME || "refill_reminder",
     });
@@ -650,10 +741,11 @@ export function registerRefillRoutes(app, { auth }) {
     const location = site.rows[0];
     if (!location) throw new Error("Choose a site");
     const { rows } = await db.query(
-      `INSERT INTO refill_tasks (location_id, location_name, machine_code, refiller_id, refiller_name, refiller_phone, due_date, due_time, due_at, notes, created_by)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
+      `INSERT INTO refill_tasks (location_id, location_name, machine_code, refiller_id, refiller_name, refiller_phone, due_date, due_time, due_at, notes, created_by, base_refiller_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $4) RETURNING *`,
       [location.id, location.name, location.machine_code, location.rid, location.rname, phoneDigits(location.rphone) || null, dueDate, dueTime, istToUtc(dueDate, dueTime), String(notes || "").trim() || null, actorName(req.user)]
     );
+    await generateTasks({ force: true }); // a shift on that day applies to it too
     res.locals.activity = { section: "Refills", action: `Added a one-off refill at ${location.name} for ${dueDate} ${dueTime} (${location.rname || "no refiller"})` };
     res.status(201).json(rows[0]);
   }));
@@ -698,6 +790,52 @@ export function registerRefillRoutes(app, { auth }) {
     const { rows } = await db.query("DELETE FROM refill_schedules WHERE location_id = $1 RETURNING id", [req.params.locationId]);
     if (rows[0]) await db.query("DELETE FROM refill_tasks WHERE schedule_id = $1 AND status = 'scheduled' AND due_at > NOW()", [rows[0].id]);
     res.locals.activity = { section: "Refills", action: `Removed the refill schedule of site #${req.params.locationId}` };
+    res.json({ success: true });
+  }));
+
+  // Moves sites to another refiller, permanently or only on some days (a temporary shift).
+  app.post("/refills/assign", auth, guard, handle("REFILL ASSIGN", async (req, res) => {
+    const ids = [...new Set((req.body?.location_ids || []).map(Number).filter(Boolean))];
+    const refillerId = Number(req.body?.refiller_id);
+    if (!ids.length) throw new Error("Choose at least one site");
+    const target = (await db.query("SELECT id, name FROM audit_refillers WHERE id = $1", [refillerId])).rows[0];
+    if (!target) throw new Error("Choose a refiller");
+    const { rows: sites } = await db.query("SELECT id, name FROM audit_locations WHERE id = ANY($1)", [ids]);
+    const siteNames = sites.map((site) => site.name).join(", ");
+
+    if (req.body?.mode === "dates") {
+      const from = req.body.from_date;
+      const to = req.body.to_date || from;
+      if (!validDate(from) || !validDate(to) || to < from) throw new Error("Invalid dates");
+      if (to < istDate()) throw new Error("Invalid dates: they're in the past");
+      for (const site of sites) {
+        // A new shift replaces older ones for the same site that fall inside its dates.
+        await db.query("DELETE FROM refill_shifts WHERE location_id = $1 AND from_date >= $2 AND to_date <= $3", [site.id, from, to]);
+        await db.query(
+          "INSERT INTO refill_shifts (location_id, to_refiller_id, from_date, to_date, note, created_by) VALUES ($1, $2, $3, $4, $5, $6)",
+          [site.id, target.id, from, to, String(req.body.note || "").trim().slice(0, 200) || null, actorName(req.user)]
+        );
+      }
+      res.locals.activity = { section: "Refills", action: `Shifted ${siteNames} to ${target.name} for ${from === to ? prettyDate(from) : `${prettyDate(from)} – ${prettyDate(to)}`}` };
+    } else {
+      await db.query("UPDATE audit_locations SET refiller_id = $2, updated_at = NOW() WHERE id = ANY($1)", [ids, target.id]);
+      await db.query("UPDATE refill_schedules SET refiller_id = NULL, updated_at = NOW() WHERE location_id = ANY($1)", [ids]);
+      await db.query("UPDATE refill_tasks SET base_refiller_id = $2 WHERE location_id = ANY($1) AND schedule_id IS NULL AND status = 'scheduled' AND due_at > NOW()", [ids, target.id]);
+      res.locals.activity = { section: "Refills", action: `Moved ${siteNames} to ${target.name} permanently` };
+    }
+    await generateTasks({ force: true });
+    res.json({ moved: sites.length });
+  }));
+
+  app.delete("/refills/shifts/:id", auth, guard, handle("REFILL SHIFT DELETE", async (req, res) => {
+    const { rows } = await db.query(
+      `DELETE FROM refill_shifts sh USING audit_locations l WHERE sh.id = $1 AND l.id = sh.location_id
+       RETURNING sh.*, l.name AS location_name`,
+      [req.params.id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: "Shift not found" });
+    await generateTasks({ force: true });
+    res.locals.activity = { section: "Refills", action: `Ended the temporary shift of ${rows[0].location_name} (${rows[0].from_date} – ${rows[0].to_date})` };
     res.json({ success: true });
   }));
 
