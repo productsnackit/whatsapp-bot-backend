@@ -21,6 +21,7 @@ import { accessFor, canUsePath, hasPage, hashPassword, verifyPassword, generateP
 import { ensureActivityLog, activityMiddleware, registerActivityRoutes, logActivity } from "./activityLog.js";
 import { ensureRefillTables, registerRefillRoutes, refillTick } from "./refillSchedule.js";
 import { registerTaskRoutes, taskReminderTick } from "./internalTasks.js";
+import { ensureImageRetention, cleanOldImages } from "./imageRetention.js";
 import { registerFindingsRoutes } from "./findingsRoutes.js";
 import { registerExpiryRoutes } from "./expiryRoutes.js";
 import { ensureUpiScanColumns, scanUpiScreenshot, registerUpiScanRoutes, readUpiImage, readMissedScreenshots } from "./upiScanner.js";
@@ -2353,6 +2354,7 @@ app.get("/tickets", auth, async (req, res) => {
         upi_image,
         upi_scan,
         upi_utr,
+        images_deleted_at,
         screenshot_upi_id,
         refund_amount,
         transaction_verified,
@@ -4375,6 +4377,10 @@ try {
   setInterval(taskReminderTick, 5 * 60 * 1000);
   setTimeout(refillTick, 15 * 1000);
   setTimeout(() => readMissedScreenshots(), 60 * 1000);
+  // Old photos are deleted from Cloudinary to stay within the free plan (see imageRetention.js).
+  await ensureImageRetention(db).catch((err) => console.error("IMAGE CLEAN-UP SETUP ERROR:", err.message));
+  setTimeout(cleanOldImages, 5 * 60 * 1000);
+  setInterval(cleanOldImages, 6 * 60 * 60 * 1000);
 } catch (err) {
   console.error("REFILL SCHEDULE SETUP ERROR:", err.message);
 }
