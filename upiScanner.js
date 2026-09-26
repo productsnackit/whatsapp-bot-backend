@@ -223,10 +223,23 @@ async function scanNow(ticketId) {
   };
   // The customer's UPI ID from the screenshot is shown on the dashboard. The ticket's own
   // upi_id column holds the transaction ID the customer gave, so it is never overwritten.
-  await db.query(
-    `UPDATE tickets SET upi_scan = $1, upi_utr = $2, screenshot_upi_id = $3, upi_scanned_at = NOW() WHERE id = $4`,
-    [JSON.stringify(scan), result.utr, result.payer_upi, ticketId]
+  // The amount paid also becomes the refund amount when nobody has set one yet (editable on the dashboard).
+  const saveScan = () => db.query(
+    `UPDATE tickets SET upi_scan = $1, upi_utr = $2, screenshot_upi_id = $3, upi_scanned_at = NOW(),
+       refund_amount = CASE WHEN COALESCE(NULLIF(refund_amount::text, '')::numeric, 0) = 0 AND $5::numeric > 0 THEN $6 ELSE refund_amount END
+     WHERE id = $4`,
+    [JSON.stringify(scan), result.utr, result.payer_upi, ticketId, result.amount ?? null, result.amount != null ? String(result.amount) : null]
   );
+  try {
+    await saveScan();
+  } catch (err) {
+    // e.g. paise in a whole-rupee column: keep the reading, leave the refund amount alone.
+    console.log(`UPI SCAN SAVE (refund amount skipped) ticket #${ticketId}:`, err.message);
+    await db.query(
+      "UPDATE tickets SET upi_scan = $1, upi_utr = $2, screenshot_upi_id = $3, upi_scanned_at = NOW() WHERE id = $4",
+      [JSON.stringify(scan), result.utr, result.payer_upi, ticketId]
+    );
+  }
   console.log(`🔎 UPI scan ticket #${ticketId}: UTR ${result.utr || "-"}, ₹${result.amount ?? "-"}, ${result.payer_upi || "no UPI ID"} (${scan.ms}ms)`);
   return scan;
 }
@@ -254,6 +267,13 @@ export function scanUpiScreenshot(ticketId) {
 export async function readMissedScreenshots(limit = 40) {
   if (!db) return;
   try {
+    // Screenshots read before amounts filled the refund amount: fill it now where it's still empty.
+    const filled = await db.query(
+      `UPDATE tickets SET refund_amount = (upi_scan->>'amount')::numeric
+       WHERE upi_scan->>'amount' ~ '^[0-9]+(\\.[0-9]+)?$' AND COALESCE(NULLIF(refund_amount::text, '')::numeric, 0) = 0
+       RETURNING id`
+    ).catch((err) => { console.log("REFUND AMOUNT FILL SKIPPED:", err.message); return { rows: [] }; });
+    if (filled.rows.length) console.log(`💰 Refund amount filled from screenshots on ${filled.rows.length} ticket(s)`);
     const { rows } = await db.query(
       `SELECT id FROM tickets WHERE upi_image IS NOT NULL AND upi_scan IS NULL AND created_at > NOW() - INTERVAL '30 days'
        ORDER BY id DESC LIMIT $1`,
