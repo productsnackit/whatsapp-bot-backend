@@ -869,8 +869,12 @@ async function autoCloseInactiveTickets() {
       `
         SELECT *
         FROM tickets
-        WHERE LOWER(COALESCE(status, '')) NOT IN ('closed', 'resolved', 'refunded', 'auto_refunded')
-          AND state != 'CLOSED'
+        -- Only conversations the customer abandoned half-way through the bot's steps.
+        -- Submitted requests (DONE) wait for the team, and taken-over chats wait for an
+        -- admin; neither is the customer's silence, so they are never auto-closed.
+        WHERE LOWER(COALESCE(status, '')) NOT IN ('closed', 'auto_closed', 'resolved', 'refunded', 'auto_refunded', 'processing')
+          AND COALESCE(state, '') NOT IN ('CLOSED', 'DONE')
+          AND COALESCE(takeover, FALSE) = FALSE
           AND COALESCE(last_customer_message_at, updated_at) < NOW() - ($1 * INTERVAL '1 minute')
       `,
       [closeMinutes]
