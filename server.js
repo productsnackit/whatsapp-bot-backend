@@ -23,7 +23,7 @@ import { ensureRefillTables, registerRefillRoutes, refillTick } from "./refillSc
 import { registerTaskRoutes, taskReminderTick } from "./internalTasks.js";
 import { registerFindingsRoutes } from "./findingsRoutes.js";
 import { registerExpiryRoutes } from "./expiryRoutes.js";
-import { ensureUpiScanColumns, scanUpiScreenshot, registerUpiScanRoutes } from "./upiScanner.js";
+import { ensureUpiScanColumns, scanUpiScreenshot, registerUpiScanRoutes, readUpiImage } from "./upiScanner.js";
 import { ensureTicketChatSchema, registerTicketChatRoutes, storeIncomingMedia, saveTicketMessage, applyStatusUpdates } from "./ticketChat.js";
 
 /* ================= CLOUDINARY ================= */
@@ -707,6 +707,106 @@ async function isDuplicateTransaction(transactionId, ticketId) {
   return result.rows.length > 0;
 }
 
+// The customer sends the payment screenshot instead of typing the transaction ID; it is read here.
+const PAYMENT_SCREENSHOT_PROMPT = `📸 *SEND YOUR UPI PAYMENT SCREENSHOT*
+
+Send the screenshot of this payment from your UPI app (GPay, PhonePe, Paytm…). We'll read the transaction ID from it automatically.
+
+You can also type the transaction ID instead.`;
+
+async function readPaymentScreenshot(mediaUrl) {
+  const uploaded = await uploadToCloudinary(mediaUrl);
+  if (!uploaded) return null;
+  try {
+    const file = await axios.get(uploaded, { responseType: "arraybuffer", timeout: 20000 });
+    const { result } = await readUpiImage(Buffer.from(file.data));
+    return { url: uploaded, utr: result.utr || null };
+  } catch (err) {
+    console.log("PAYMENT SCREENSHOT READ ERROR:", err.message);
+    return { url: uploaded, utr: null };
+  }
+}
+
+async function checkPaytm(ticketId, transactionId, from) {
+  if (!isPaytmVerificationEnabled()) return false;
+  const result = await verifyAndProcessPayment(ticketId, transactionId, from);
+  return Boolean(result?.verified || result?.status === "TXN_SUCCESS");
+}
+
+// Screenshot received at the transaction-ID step: read the ID, then finish the ticket.
+async function finishWithPaymentScreenshot({ ticketId, from, mediaUrl, doneMessage }) {
+  await sendWhatsApp(from, "⏳ Reading your payment screenshot...");
+  const read = await readPaymentScreenshot(mediaUrl);
+  if (!read) return sendWhatsApp(from, "❌ Upload failed. Please send the screenshot again.");
+  if (!read.utr) {
+    await updateTicket(ticketId, { upi_image: read.url });
+    return sendWhatsApp(from, `We saved your screenshot, but couldn't read the transaction ID clearly.
+
+Please type the transaction ID (UTR / UPI Ref No.) shown on it.`);
+  }
+  if (await isDuplicateTransaction(read.utr, ticketId)) {
+    await updateTicket(ticketId, { upi_image: read.url });
+    return sendWhatsApp(from, `This transaction (${read.utr}) has already been linked to another request.
+
+If this is a different payment, please send its screenshot or type its transaction ID.`);
+  }
+  const verified = await checkPaytm(ticketId, read.utr, from);
+  await updateTicket(ticketId, { upi_id: read.utr, upi_image: read.url, transaction_verified: verified, state: "DONE", status: "PROCESSING" });
+  return sendWhatsApp(from, `Transaction ID *${read.utr}* read from your screenshot.
+
+${doneMessage}`);
+}
+
+// They typed the ID after an unreadable screenshot: the screenshot is already saved, so finish.
+async function finishWithTypedId({ ticketId, from, transactionId, doneMessage }) {
+  if (await isDuplicateTransaction(transactionId, ticketId)) {
+    return sendWhatsApp(from, "This transaction has already been linked to another request. Please check the transaction ID or contact support.");
+  }
+  const verified = await checkPaytm(ticketId, transactionId, from);
+  await updateTicket(ticketId, { upi_id: transactionId, transaction_verified: verified, state: "DONE", status: "PROCESSING" });
+  return sendWhatsApp(from, doneMessage);
+}
+
+const DONE_REFUND = `✅ *TICKET SUBMITTED SUCCESSFULLY!*
+
+📋 Your refund request has been received.
+
+🕐 Processing time: 1 working day
+
+Our team will review and process your refund within 24 hours.
+
+Thank you for choosing Snackit!`;
+const DONE_EXPIRED = `✅ *TICKET SUBMITTED!*
+
+Your request has been received. We'll review within 24 hours.
+
+Thank you! 🙏`;
+const DONE_PRICE = `✅ *TICKET SUBMITTED!*
+
+We've received your complaint. Expected resolution: 24 hours.
+
+Thank you!`;
+const DONE_DAMAGED = `✅ *TICKET SUBMITTED!*
+
+We regret the inconvenience. Our team will process this within 24 hours.
+
+Thank you for your patience!`;
+
+// At a transaction-ID step: a screenshot is read automatically; a typed ID after an unreadable
+// screenshot finishes the ticket. Returns false when the normal typed-ID steps should continue.
+async function handlePaymentStep({ ticketId, from, text, isImage, mediaUrl, mediaType, existingTicket, doneMessage }) {
+  if (isImage && mediaUrl && !isVideo(mediaType)) {
+    await finishWithPaymentScreenshot({ ticketId, from, mediaUrl, doneMessage });
+    return true;
+  }
+  const typed = String(text || "").trim();
+  if (existingTicket.upi_image && typed && isValidTransactionId(typed) && !isAlphabetOnly(typed)) {
+    await finishWithTypedId({ ticketId, from, transactionId: typed, doneMessage });
+    return true;
+  }
+  return false;
+}
+
 const FINAL_MSG = "✅ Ticket has been raised, we will process your concern soon.";
 const MAX_RETRIES = 3;
 
@@ -1155,16 +1255,15 @@ Please try again.`
             from,
             `✅ Image received!
 
-💳 *ENTER TRANSACTION ID*
-
-Share your Transaction ID (from payment app or Paytm).
-
-Example: "1234567890566654" or "UTR123456789ABC"`
+${PAYMENT_SCREENSHOT_PROMPT}`
           );
         }
 
         if (state === "STEP2") {
           const retryKey = getRetryKey(ticketId, "STEP2_UPI");
+
+          const paymentStep = await handlePaymentStep({ ticketId, from, text, isImage, mediaUrl, mediaType, existingTicket, doneMessage: DONE_REFUND });
+          if (paymentStep) return;
 
           const transactionId = text.trim();
 
@@ -1583,14 +1682,15 @@ Please send a clear photo showing the expiry date or damage.`
             from,
             `✅ Image received!
 
-💳 *ENTER TRANSACTION ID*
-
-Share your Transaction ID.`
+${PAYMENT_SCREENSHOT_PROMPT}`
           );
         }
 
         if (state === "EXP_UPI") {
           const retryKey = getRetryKey(ticketId, "EXP_UPI");
+
+          const paymentStep = await handlePaymentStep({ ticketId, from, text, isImage, mediaUrl, mediaType, existingTicket, doneMessage: DONE_EXPIRED });
+          if (paymentStep) return;
 
           if (isAlphabetOnly(text)) {
             incrementRetry(retryKey);
@@ -1736,12 +1836,15 @@ Show the product with its price tag clearly visible.`
             from,
             `Image received!
 
-💳 *ENTER TRANSACTION ID*`
+${PAYMENT_SCREENSHOT_PROMPT}`
           );
         }
 
         if (state === "PRICE_UPI") {
           const retryKey = getRetryKey(ticketId, "PRICE_UPI");
+
+          const paymentStep = await handlePaymentStep({ ticketId, from, text, isImage, mediaUrl, mediaType, existingTicket, doneMessage: DONE_PRICE });
+          if (paymentStep) return;
 
           if (isAlphabetOnly(text)) {
             incrementRetry(retryKey);
@@ -1876,12 +1979,15 @@ Show the damage clearly in the photo.`
             from,
             `✅ Image received!
 
-💳 *ENTER TRANSACTION ID*`
+${PAYMENT_SCREENSHOT_PROMPT}`
           );
         }
 
         if (state === "DAM_UPI") {
           const retryKey = getRetryKey(ticketId, "DAM_UPI");
+
+          const paymentStep = await handlePaymentStep({ ticketId, from, text, isImage, mediaUrl, mediaType, existingTicket, doneMessage: DONE_DAMAGED });
+          if (paymentStep) return;
 
           if (isAlphabetOnly(text)) {
             incrementRetry(retryKey);

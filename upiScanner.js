@@ -203,12 +203,10 @@ async function scanNow(ticketId) {
     image: ticket.upi_image,
     ms: Date.now() - started,
   };
-  // The customer's UPI ID from the screenshot is shown on the dashboard; it also
-  // fills the ticket's UPI ID when the customer didn't type a proper one.
+  // The customer's UPI ID from the screenshot is shown on the dashboard. The ticket's own
+  // upi_id column holds the transaction ID the customer gave, so it is never overwritten.
   await db.query(
-    `UPDATE tickets SET upi_scan = $1, upi_utr = $2, screenshot_upi_id = $3, upi_scanned_at = NOW(),
-       upi_id = CASE WHEN $3::text IS NOT NULL AND COALESCE(upi_id, '') NOT LIKE '%@%' THEN $3::text ELSE upi_id END
-     WHERE id = $4`,
+    `UPDATE tickets SET upi_scan = $1, upi_utr = $2, screenshot_upi_id = $3, upi_scanned_at = NOW() WHERE id = $4`,
     [JSON.stringify(scan), result.utr, result.payer_upi, ticketId]
   );
   console.log(`🔎 UPI scan ticket #${ticketId}: UTR ${result.utr || "-"}, ₹${result.amount ?? "-"}, ${result.payer_upi || "no UPI ID"} (${scan.ms}ms)`);
