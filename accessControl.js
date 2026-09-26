@@ -12,7 +12,7 @@ export const PAGES = {
   tickets: "Tickets & customer chat",
   feedback: "Feedback",
   products: "Product leads",
-  operations: "Operations",
+  // "operations" (inventory, clients, brands, demand, imports) is hidden on the dashboard; add it back here to offer it again.
   audit: "Refill Audit",
   findings: "Internal Audit",
   expiry: "Expiry Tracking",
@@ -27,7 +27,7 @@ export const ROLE_PRESETS = {
   admin: { label: "Admin", pages: ALL_PAGES, readOnly: false },
   support: { label: "Support agent", pages: ["tickets", "feedback", "products", "findings", "expiry"], readOnly: false },
   quality: { label: "Quality auditor", pages: ["audit", "refills", "findings", "expiry"], readOnly: false },
-  operations: { label: "Operations", pages: ["operations", "audit", "refills", "findings", "expiry"], readOnly: false },
+  operations: { label: "Operations", pages: ["audit", "refills", "findings", "expiry"], readOnly: false },
   staff: { label: "Staff", pages: ["findings", "expiry"], readOnly: false },
   viewer: { label: "Viewer (read only)", pages: ALL_PAGES.filter((page) => !["settings", "activity"].includes(page)), readOnly: true },
 };
