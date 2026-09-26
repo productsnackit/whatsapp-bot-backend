@@ -21,7 +21,7 @@ import { accessFor, canUsePath, hasPage, hashPassword, verifyPassword, generateP
 import { ensureActivityLog, activityMiddleware, registerActivityRoutes, logActivity } from "./activityLog.js";
 import { ensureRefillTables, registerRefillRoutes, refillTick } from "./refillSchedule.js";
 import { registerTaskRoutes, taskReminderTick } from "./internalTasks.js";
-import { ensureImageRetention, cleanOldImages } from "./imageRetention.js";
+import { ensureImageRetention, cleanOldImages, registerImageRetentionRoutes } from "./imageRetention.js";
 import { registerFindingsRoutes } from "./findingsRoutes.js";
 import { registerExpiryRoutes } from "./expiryRoutes.js";
 import { ensureUpiScanColumns, scanUpiScreenshot, registerUpiScanRoutes, readUpiImage, readMissedScreenshots } from "./upiScanner.js";
@@ -2986,6 +2986,7 @@ registerExpiryRoutes(app, { db, auth });
 registerUpiScanRoutes(app, { auth });
 registerTicketChatRoutes(app, { db, auth });
 registerActivityRoutes(app, { auth });
+registerImageRetentionRoutes(app, { auth });
 registerRefillRoutes(app, { auth });
 registerTaskRoutes(app, {
   auth,
