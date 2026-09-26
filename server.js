@@ -19,6 +19,7 @@ import { handleRefillerWhatsApp } from "./refillerTasks.js";
 import { loadInternalState, internalSaveMiddleware, scheduleInternalSave } from "./internalStore.js";
 import { accessFor, canUsePath, hasPage, hashPassword, verifyPassword, generatePassword, newSessionToken, migrateUserPasswords, publicUser, PAGES, ROLE_PRESETS } from "./accessControl.js";
 import { ensureActivityLog, activityMiddleware, registerActivityRoutes, logActivity } from "./activityLog.js";
+import { ensureRefillTables, registerRefillRoutes, refillTick } from "./refillSchedule.js";
 import { registerFindingsRoutes } from "./findingsRoutes.js";
 import { registerExpiryRoutes } from "./expiryRoutes.js";
 import { ensureUpiScanColumns, scanUpiScreenshot, registerUpiScanRoutes } from "./upiScanner.js";
@@ -2856,6 +2857,7 @@ registerExpiryRoutes(app, { db, auth });
 registerUpiScanRoutes(app, { auth });
 registerTicketChatRoutes(app, { db, auth });
 registerActivityRoutes(app, { auth });
+registerRefillRoutes(app, { auth });
 
 app.get("/host-sites/renewals-due", auth, async (req, res) => {
   try {
@@ -4220,6 +4222,15 @@ try {
   await ensureActivityLog(db);
 } catch (err) {
   console.error("ACTIVITY LOG SETUP ERROR:", err.message);
+}
+
+// Refill schedule: builds visits from schedules and sends reminders every minute.
+try {
+  await ensureRefillTables(db, { sendPush: (userKeys, payload) => sendPushToUsers(db, userKeys, payload) });
+  setInterval(refillTick, 60 * 1000);
+  setTimeout(refillTick, 15 * 1000);
+} catch (err) {
+  console.error("REFILL SCHEDULE SETUP ERROR:", err.message);
 }
 
 // httpServer (not app) so the socket.io live updates are served on the same port.

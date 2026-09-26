@@ -91,3 +91,28 @@ export function sendWhatsAppTemplate(to, name, language, bodyParams = [], button
     },
   });
 }
+
+// Tappable list (up to 10 rows): rows are [{ id, title (24 chars), description (72 chars) }].
+// Like buttons, WhatsApp only delivers it within 24 hours of the person's last message.
+export function sendWhatsAppList(to, body, buttonLabel, sectionTitle, rows) {
+  return postToWhatsApp({
+    messaging_product: "whatsapp",
+    to,
+    type: "interactive",
+    interactive: {
+      type: "list",
+      body: { text: String(body).slice(0, 1024) },
+      action: {
+        button: String(buttonLabel).slice(0, 20),
+        sections: [{
+          title: String(sectionTitle).slice(0, 24),
+          rows: rows.slice(0, 10).map(({ id, title, description }) => ({
+            id: String(id).slice(0, 200),
+            title: String(title).slice(0, 24),
+            ...(description ? { description: String(description).slice(0, 72) } : {}),
+          })),
+        }],
+      },
+    },
+  });
+}

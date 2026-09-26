@@ -11,6 +11,7 @@
     first "Yes, resolved", second "Not yet".
 ========================================================= */
 import { sendWhatsApp, sendWhatsAppButtons, sendWhatsAppTemplate } from "./whatsapp.js";
+import { handleRefillMessage, sendRefillSummary } from "./refillSchedule.js";
 
 const REENGAGEMENT_ERROR = 131047;
 
@@ -148,6 +149,9 @@ export async function handleRefillerWhatsApp(db, msg) {
     return true;
   }
 
+  // Refill proof: machine photos and the site they pick from the list.
+  if (await handleRefillMessage(msg, refiller)) return true;
+
   const pending = await pendingTasks(db, refiller.phone);
   const text = String(msg.text?.body || msg.button?.text || "").trim().toLowerCase();
   const saidYes = /^(yes|y|done|resolved|fixed|ok done|haan|ha)\b/.test(text);
@@ -155,15 +159,18 @@ export async function handleRefillerWhatsApp(db, msg) {
 
   if (pending.length && (saidYes || saidNo)) {
     await answerTask(db, refiller, pending[0], saidYes);
-  } else if (pending.length) {
-    // Anything else: show the oldest open task again so they can tap an answer.
-    await sendWhatsAppButtons(
-      refiller.phone,
-      `You have ${pending.length} open task${pending.length === 1 ? "" : "s"}.\n\n${taskMessage(pending[0])}`,
-      taskButtons(pending[0].id)
-    );
   } else {
-    await sendWhatsApp(refiller.phone, `Hi ${refiller.name || ""}, you have no open Snackit tasks right now. Thank you!`.replace("Hi ,", "Hi,"));
+    // Anything else: today's refill visits, then the oldest open CAPA task so they can tap an answer.
+    const summary = await sendRefillSummary(refiller);
+    if (pending.length) {
+      await sendWhatsAppButtons(
+        refiller.phone,
+        `You have ${pending.length} open task${pending.length === 1 ? "" : "s"}.\n\n${taskMessage(pending[0])}`,
+        taskButtons(pending[0].id)
+      );
+    } else if (!summary) {
+      await sendWhatsApp(refiller.phone, `Hi ${refiller.name || ""}, you have no open Snackit tasks right now. Thank you!`.replace("Hi ,", "Hi,"));
+    }
   }
   return true;
 }

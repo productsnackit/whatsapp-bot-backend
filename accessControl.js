@@ -16,6 +16,7 @@ export const PAGES = {
   audit: "Refill Audit",
   findings: "Internal Audit",
   expiry: "Expiry Tracking",
+  refills: "Refill Schedule",
   analytics: "Analytics",
   activity: "Activity log",
   settings: "Bot settings",
@@ -25,8 +26,8 @@ const ALL_PAGES = Object.keys(PAGES);
 export const ROLE_PRESETS = {
   admin: { label: "Admin", pages: ALL_PAGES, readOnly: false },
   support: { label: "Support agent", pages: ["tickets", "feedback", "products", "findings", "expiry"], readOnly: false },
-  quality: { label: "Quality auditor", pages: ["audit", "findings", "expiry"], readOnly: false },
-  operations: { label: "Operations", pages: ["operations", "audit", "findings", "expiry"], readOnly: false },
+  quality: { label: "Quality auditor", pages: ["audit", "refills", "findings", "expiry"], readOnly: false },
+  operations: { label: "Operations", pages: ["operations", "audit", "refills", "findings", "expiry"], readOnly: false },
   staff: { label: "Staff", pages: ["findings", "expiry"], readOnly: false },
   viewer: { label: "Viewer (read only)", pages: ALL_PAGES.filter((page) => !["settings", "activity"].includes(page)), readOnly: true },
 };
@@ -114,6 +115,7 @@ const PATH_RULES = [
   [/^\/(audit|audits)(\/|$)/, ["audit"]],
   [/^\/findings(\/|$)/, ["findings"]],
   [/^\/expiry(\/|$)/, ["expiry"]],
+  [/^\/refills(\/|$)/, ["refills"]],
   [/^\/analytics\//, ["analytics", "operations", "tickets"]],
   [/^\/(operations|machines|inventory|host-sites|brands|skus|leads)(\/|$)/, ["operations"]],
   [/^\/activity(\/|$)/, ["activity"]],
