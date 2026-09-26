@@ -695,6 +695,13 @@ function getRetryCount(key) {
   return global.retryCount[key] || 0;
 }
 
+// A ticket is finished once it's refunded, resolved or closed (by the team or automatically).
+function isClosedTicket(ticket) {
+  return String(ticket?.state || "").toUpperCase() === "CLOSED"
+    || ["closed", "auto_closed", "resolved", "refunded", "auto_refunded"].includes(String(ticket?.status || "").toLowerCase());
+}
+const CLOSED_TICKET_ERROR = "This ticket is closed. Reopen it first to message the customer or change it.";
+
 async function isDuplicateTransaction(transactionId, ticketId) {
   const result = await db.query(
     `SELECT id FROM tickets
@@ -2451,6 +2458,8 @@ app.post("/ticket/action", auth, async (req, res) => {
     }
 
     const ticket = result.rows[0];
+    // Pressing a button twice would send the customer the same message again.
+    if (isClosedTicket(ticket)) return res.status(409).json({ error: CLOSED_TICKET_ERROR });
 
     console.log("PHONE:", ticket.phone);
 
@@ -2506,7 +2515,8 @@ app.post("/ticket/action", auth, async (req, res) => {
       console.log("❌ No phone found");
     }
 
-    await updateTicket(ticketId, { status, state: "CLOSED", refund_stage: "PROCESSED" });
+    // Closing also ends any takeover, so the bot handles the customer's next message ("1" for a new request).
+    await updateTicket(ticketId, { status, state: "CLOSED", refund_stage: "PROCESSED", takeover: false });
 
     console.log("✅ DONE");
 
@@ -2631,6 +2641,10 @@ app.post("/admin/paytm-setting", auth, async (req, res) => {
 app.post("/admin/send", auth, async (req, res) => {
   try {
     const { phone, message, ticketId } = req.body;
+    if (ticketId) {
+      const current = await db.query("SELECT state, status FROM tickets WHERE id = $1", [ticketId]);
+      if (isClosedTicket(current.rows[0])) return res.status(409).json({ error: CLOSED_TICKET_ERROR });
+    }
 
     await sendWhatsApp(phone, message);
 
@@ -2654,6 +2668,8 @@ app.post("/admin/takeover", auth, async (req, res) => {
     if (!phone && !ticketId) return res.status(400).json({ error: "Phone or ticket ID is required" });
 
     if (ticketId) {
+      const current = await db.query("SELECT state, status FROM tickets WHERE id = $1", [ticketId]);
+      if (isClosedTicket(current.rows[0])) return res.status(409).json({ error: CLOSED_TICKET_ERROR });
       await updateTicket(ticketId, { takeover: true, status: "OPEN" });
     } else {
       await updateTicketByPhone(phone, { takeover: true, status: "OPEN" });

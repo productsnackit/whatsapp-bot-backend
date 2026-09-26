@@ -178,6 +178,12 @@ async function sendMedia(phone, kind, link, { caption, fileName }) {
   return sendWhatsAppPayload({ messaging_product: "whatsapp", to: phone, type: kind, [kind]: media });
 }
 
+// Same rule as server.js: refunded, resolved or closed tickets can't be messaged until reopened.
+function isClosed(ticket) {
+  return String(ticket?.state || "").toUpperCase() === "CLOSED"
+    || ["closed", "auto_closed", "resolved", "refunded", "auto_refunded"].includes(String(ticket?.status || "").toLowerCase());
+}
+
 function userName(req) {
   if (req.user?.name) return req.user.name;
   return req.user?.role === "admin" ? "Admin" : req.user?.username || "Support";
@@ -188,9 +194,10 @@ export function registerTicketChatRoutes(app, { db, auth }) {
   app.post("/admin/tickets/:id/send", auth, async (req, res) => {
     try {
       const ticketId = Number(req.params.id);
-      const { rows } = await db.query("SELECT id, phone FROM tickets WHERE id = $1", [ticketId]);
+      const { rows } = await db.query("SELECT id, phone, state, status FROM tickets WHERE id = $1", [ticketId]);
       const ticket = rows[0];
       if (!ticket) return res.status(404).json({ error: "Ticket not found" });
+      if (isClosed(ticket)) return res.status(409).json({ error: "This ticket is closed. Reopen it first to message the customer." });
 
       const text = String(req.body?.text || "").trim();
       const files = Array.isArray(req.body?.files) ? req.body.files.slice(0, 10) : [];
@@ -244,12 +251,13 @@ export function registerTicketChatRoutes(app, { db, auth }) {
   app.post("/admin/tickets/:id/messages/:messageId/retry", auth, async (req, res) => {
     try {
       const { rows } = await db.query(
-        `SELECT m.*, t.phone FROM messages m JOIN tickets t ON t.id = m.ticket_id
+        `SELECT m.*, t.phone, t.state AS ticket_state, t.status AS ticket_status FROM messages m JOIN tickets t ON t.id = m.ticket_id
          WHERE m.id = $1 AND m.ticket_id = $2 AND m.sender = 'admin'`,
         [req.params.messageId, req.params.id]
       );
       const message = rows[0];
       if (!message) return res.status(404).json({ error: "Message not found" });
+      if (isClosed({ state: message.ticket_state, status: message.ticket_status })) return res.status(409).json({ error: "This ticket is closed. Reopen it first to message the customer." });
       const result = message.media_url
         ? await sendMedia(message.phone, message.media_type, message.media_url, { caption: message.message, fileName: message.file_name })
         : await sendText(message.phone, message.message);
