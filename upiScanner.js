@@ -8,6 +8,14 @@
 import axios from "axios";
 import sharp from "sharp";
 import { createWorker, PSM } from "tesseract.js";
+import os from "os";
+import path from "path";
+import { createRequire } from "module";
+
+// The English language file ships with the app (no download at start-up, so it works even
+// when the server can't reach the internet).
+const require = createRequire(import.meta.url);
+const LANG_PATH = path.join(path.dirname(require.resolve("@tesseract.js-data/eng/package.json")), "4.0.0_best_int");
 
 let db = null;
 let workerPromise = null;
@@ -30,7 +38,7 @@ export async function ensureUpiScanColumns(database) {
 // One reader is kept and reused; the language data downloads once per start.
 function getWorker() {
   if (!workerPromise) {
-    workerPromise = createWorker("eng")
+    workerPromise = createWorker("eng", 1, { langPath: LANG_PATH, cachePath: os.tmpdir(), gzip: true })
       // Sparse mode finds text of any size anywhere on the screen, like the big ₹ amount.
       .then(async (worker) => { await worker.setParameters({ tessedit_pageseg_mode: PSM.SPARSE_TEXT }); return worker; })
       .catch((err) => {
@@ -67,14 +75,18 @@ const APPS = [
 const EMAIL_DOMAINS = /^(gmail|yahoo|outlook|hotmail|icloud|rediffmail|live)$/i;
 
 // UPI IDs look like name@bank; the bank part has no dot (unlike email addresses).
+// Google Pay hides the start of IDs ("••••01-3@okhdfcbank"); those are kept with the dots
+// and marked as partly hidden, so nobody mistakes the visible part for the full ID.
 function findUpiIds(lines) {
   const found = [];
   lines.forEach((line, index) => {
     const pattern = /([a-z0-9][a-z0-9._-]{1,255})\s?@\s?([a-z][a-z0-9]{1,63})(?![a-z0-9]*\.[a-z])/gi;
     for (const match of line.matchAll(pattern)) {
       if (EMAIL_DOMAINS.test(match[2])) continue;
-      const id = `${match[1]}@${match[2]}`.toLowerCase();
-      if (!found.some((item) => item.id === id)) found.push({ id, index });
+      const before = line.slice(0, match.index);
+      const masked = /[•*+«·.:~-]{2,}\s*$/.test(before);
+      const id = `${masked ? "••••" : ""}${match[1]}@${match[2]}`.toLowerCase();
+      if (!found.some((item) => item.id === id)) found.push({ id, index, masked });
     }
   });
   return found;
@@ -98,6 +110,10 @@ function findUtr(text) {
 }
 
 function findAmount(lines) {
+  // Wording used by the apps, e.g. "Payment of ₹72 completed", "Paid ₹72", "₹72 sent".
+  const joined = lines.join(" ");
+  const worded = joined.match(/(?:payment of|paid|amount paid|you paid|sent|debited)\s*(?:₹|rs\.?|inr|[%zZF])?\s*([0-9]{1,3}(?:,[0-9]{2,3})+(?:\.[0-9]{1,2})?|[0-9]{1,5}(?:\.[0-9]{1,2})?)\b(?!\s*(?:%|am|pm|:))/i);
+  if (worded && Number(worded[1].replace(/,/g, "")) > 0) return Number(worded[1].replace(/,/g, ""));
   const number = "([0-9]{1,3}(?:,[0-9]{2,3})+(?:\\.[0-9]{1,2})?|[0-9]{1,5}(?:\\.[0-9]{1,2})?)";
   for (const line of lines) {
     const labelled = line.match(new RegExp(`(?:₹|\\brs\\.?|\\binr|amount(?: paid)?)\\s*:?\\s*${number}\\b`, "i"));
@@ -163,7 +179,9 @@ async function buildFlags(ticket, result) {
   if (result.status === "FAILED") flags.push("Screenshot shows a FAILED payment.");
   if (result.status === "PENDING") flags.push("Screenshot shows a PENDING payment.");
   const typed = String(ticket.upi_id || "").trim().toLowerCase();
-  if (typed.includes("@") && result.payer_upi && typed !== result.payer_upi && typed !== result.payer_upi.replace(/@.*/, "")) flags.push(`Customer typed UPI ID ${typed}, screenshot shows ${result.payer_upi}.`);
+  const visible = String(result.payer_upi || "").replace(/^••••/, "");
+  const matchesTyped = result.payer_upi?.startsWith("••••") ? typed.endsWith(visible) : typed === result.payer_upi;
+  if (typed.includes("@") && result.payer_upi && !matchesTyped) flags.push(`Customer typed UPI ID ${typed}, screenshot shows ${result.payer_upi}.`);
   if (result.utr) {
     const duplicate = await db.query(
       "SELECT id, phone FROM tickets WHERE upi_utr = $1 AND id <> $2 ORDER BY id LIMIT 3",
@@ -230,6 +248,22 @@ export function scanUpiScreenshot(ticketId) {
   const job = queue.then(() => scanNow(ticketId)).finally(closeWhenIdle);
   queue = job.catch((err) => console.error(`UPI SCAN ERROR ticket #${ticketId}:`, err.message));
   return job;
+}
+
+// After a restart, recent screenshots that were never read are read in the background.
+export async function readMissedScreenshots(limit = 40) {
+  if (!db) return;
+  try {
+    const { rows } = await db.query(
+      `SELECT id FROM tickets WHERE upi_image IS NOT NULL AND upi_scan IS NULL AND created_at > NOW() - INTERVAL '30 days'
+       ORDER BY id DESC LIMIT $1`,
+      [limit]
+    );
+    if (rows.length) console.log(`🔎 Reading ${rows.length} UPI screenshot(s) that were missed`);
+    for (const row of rows) scanUpiScreenshot(row.id).catch(() => {});
+  } catch (err) {
+    console.log("UPI BACKFILL ERROR:", err.message);
+  }
 }
 
 export function registerUpiScanRoutes(app, { auth }) {

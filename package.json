@@ -8,6 +8,7 @@
     "worker": "node worker.js"
   },
   "dependencies": {
+    "@tesseract.js-data/eng": "^1.0.0",
     "axios": "^1.17.0",
     "bullmq": "^5.78.0",
     "chart.js": "^4.5.1",

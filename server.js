@@ -23,7 +23,7 @@ import { ensureRefillTables, registerRefillRoutes, refillTick } from "./refillSc
 import { registerTaskRoutes, taskReminderTick } from "./internalTasks.js";
 import { registerFindingsRoutes } from "./findingsRoutes.js";
 import { registerExpiryRoutes } from "./expiryRoutes.js";
-import { ensureUpiScanColumns, scanUpiScreenshot, registerUpiScanRoutes, readUpiImage } from "./upiScanner.js";
+import { ensureUpiScanColumns, scanUpiScreenshot, registerUpiScanRoutes, readUpiImage, readMissedScreenshots } from "./upiScanner.js";
 import { ensureTicketChatSchema, registerTicketChatRoutes, storeIncomingMedia, saveTicketMessage, applyStatusUpdates } from "./ticketChat.js";
 
 /* ================= CLOUDINARY ================= */
@@ -4354,6 +4354,7 @@ try {
   setInterval(refillTick, 60 * 1000);
   setInterval(taskReminderTick, 5 * 60 * 1000);
   setTimeout(refillTick, 15 * 1000);
+  setTimeout(() => readMissedScreenshots(), 60 * 1000);
 } catch (err) {
   console.error("REFILL SCHEDULE SETUP ERROR:", err.message);
 }
