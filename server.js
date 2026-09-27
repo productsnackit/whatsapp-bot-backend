@@ -3818,6 +3818,11 @@ app.get("/admin/messages/:ticketId", auth, async (req, res) => {
   }
 });
 
+// The dashboard logo for everyone (the Admin Settings upload), whatever their pages.
+app.get("/internal/branding", auth, (req, res) => {
+  res.json({ logo: global.botSettings?.admin_logo || "" });
+});
+
 app.get("/internal/users", auth, (req, res) => {
   try {
     // Passwords never leave the server; admins also see each person's access.
