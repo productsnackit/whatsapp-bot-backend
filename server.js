@@ -26,6 +26,7 @@ import { registerAnalyticsOverview } from "./analyticsOverview.js";
 import { registerFindingsRoutes } from "./findingsRoutes.js";
 import { registerExpiryRoutes } from "./expiryRoutes.js";
 import { ensureUpiScanColumns, scanUpiScreenshot, registerUpiScanRoutes, readUpiImage, readMissedScreenshots } from "./upiScanner.js";
+import { ensureTicketWatch, addTicketWatch, alertOverdueTickets, fingerprintMissedScreenshots, registerTicketWatchRoutes } from "./ticketWatch.js";
 import { ensureTicketChatSchema, registerTicketChatRoutes, storeIncomingMedia, saveTicketMessage, applyStatusUpdates } from "./ticketChat.js";
 
 /* ================= CLOUDINARY ================= */
@@ -2393,7 +2394,8 @@ app.get("/tickets", auth, async (req, res) => {
         : null,
     }));
 
-    res.json(rows);
+    // Adds how long each ticket has waited for the team and the refund checks (ticketWatch.js).
+    res.json(await addTicketWatch(rows));
   } catch (err) {
     console.log("FETCH ERROR:", err.message);
     res.status(500).json({ error: "Server error" });
@@ -2989,6 +2991,7 @@ registerTicketChatRoutes(app, { db, auth });
 registerActivityRoutes(app, { auth });
 registerImageRetentionRoutes(app, { auth });
 registerAnalyticsOverview(app, { db, auth });
+registerTicketWatchRoutes(app, { auth });
 registerRefillRoutes(app, { auth });
 registerTaskRoutes(app, {
   auth,
@@ -3769,6 +3772,8 @@ app.post("/webhook", async (req, res) => {
       mimeType: media?.mimeType || null,
       waMessageId: msg.id || null,
     });
+    // The reply timer and auto-close both count from the customer's latest message.
+    await db.query("UPDATE tickets SET last_customer_message_at = NOW() WHERE id = $1", [ticket.id]).catch(() => {});
 
     // During a takeover the admin is told straight away, even with the dashboard closed.
     if (ticket.takeover === true || ticket.takeover === "true") {
@@ -4391,6 +4396,20 @@ try {
   setInterval(cleanOldImages, 6 * 60 * 60 * 1000);
 } catch (err) {
   console.error("REFILL SCHEDULE SETUP ERROR:", err.message);
+}
+
+// Ticket reply timers (overdue alerts every 5 minutes) and refund checks (see ticketWatch.js).
+try {
+  await ensureTicketWatch(db, {
+    sendWhatsApp,
+    // Everyone who can open Tickets gets the phone notification.
+    pushToTeam: (payload) => sendPushToUsers(db, ["admin", ...global.internalUsers.filter((user) => hasPage(accessFor(user), "tickets")).map((user) => user.username)], payload),
+  });
+  setInterval(alertOverdueTickets, 5 * 60 * 1000);
+  setTimeout(alertOverdueTickets, 2 * 60 * 1000);
+  setTimeout(() => fingerprintMissedScreenshots(async (url) => Buffer.from((await axios.get(url, { responseType: "arraybuffer", timeout: 20000 })).data)), 3 * 60 * 1000);
+} catch (err) {
+  console.error("TICKET WATCH SETUP ERROR:", err.message);
 }
 
 // httpServer (not app) so the socket.io live updates are served on the same port.

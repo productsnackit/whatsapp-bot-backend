@@ -11,6 +11,7 @@ import { createWorker, PSM } from "tesseract.js";
 import os from "os";
 import path from "path";
 import { createRequire } from "module";
+import { imageFingerprint } from "./ticketWatch.js";
 
 // The English language file ships with the app (no download at start-up, so it works even
 // when the server can't reach the internet).
@@ -212,7 +213,12 @@ async function scanNow(ticketId) {
 
   const started = Date.now();
   const image = await axios.get(ticket.upi_image, { responseType: "arraybuffer", timeout: 20000 });
-  const { result, data } = await readUpiImage(Buffer.from(image.data));
+  const buffer = Buffer.from(image.data);
+  const { result, data } = await readUpiImage(buffer);
+  // Lets the dashboard spot the same screenshot sent on another ticket.
+  await imageFingerprint(buffer)
+    .then((hash) => db.query("UPDATE tickets SET upi_image_hash = $1 WHERE id = $2", [hash, ticketId]))
+    .catch((err) => console.log(`SCREENSHOT FINGERPRINT ticket #${ticketId}:`, err.message));
   const scan = {
     ...result,
     confidence: Math.round(data.confidence || 0),
