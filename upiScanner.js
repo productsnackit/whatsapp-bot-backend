@@ -23,6 +23,8 @@ let workerPromise = null;
 let idleTimer = null;
 let queue = Promise.resolve();
 const IDLE_MS = 5 * 60 * 1000;
+// Bumped when the reader gets better; open tickets read by an older version are read again.
+const SCAN_VERSION = 2;
 
 export async function ensureUpiScanColumns(database) {
   db = database;
@@ -110,25 +112,151 @@ function findUtr(text) {
   return bare ? bare[1] : null;
 }
 
-function findAmount(lines) {
-  // Wording used by the apps, e.g. "Payment of ₹72 completed", "Paid ₹72", "₹72 sent".
-  const joined = lines.join(" ");
-  const worded = joined.match(/(?:payment of|paid|amount paid|you paid|sent|debited)\s*(?:₹|rs\.?|inr|[%zZF])?\s*([0-9]{1,3}(?:,[0-9]{2,3})+(?:\.[0-9]{1,2})?|[0-9]{1,5}(?:\.[0-9]{1,2})?)\b(?!\s*(?:%|am|pm|:))/i);
-  if (worded && Number(worded[1].replace(/,/g, "")) > 0) return Number(worded[1].replace(/,/g, ""));
-  const number = "([0-9]{1,3}(?:,[0-9]{2,3})+(?:\\.[0-9]{1,2})?|[0-9]{1,5}(?:\\.[0-9]{1,2})?)";
-  for (const line of lines) {
-    const labelled = line.match(new RegExp(`(?:₹|\\brs\\.?|\\binr|amount(?: paid)?)\\s*:?\\s*${number}\\b`, "i"));
-    if (labelled) return Number(labelled[1].replace(/,/g, ""));
-  }
-  // The big amount sits on its own line; OCR often reads ₹ as X, <, T, %, Z or F.
-  for (const line of lines) {
-    const alone = line.trim().match(new RegExp(`^(?:[₹xX<T%zZF]{1,2}\\s?)?${number}$`));
-    if (alone) {
-      const value = Number(alone[1].replace(/,/g, ""));
-      if (value > 0 && value < 100000) return value;
+/* ---------- Amount ----------
+   The English OCR model has no ₹ sign, so it reads it as another character: "R25", "¥25",
+   "%25", or even a digit ("₹25" → "325"). Every place the amount appears, in every reading
+   of the screenshot, gives a vote; the amount most readings agree on wins. When they don't
+   agree, or the amount is implausible for a vending machine, it is marked uncertain so it is
+   checked by a person and never filled in as the refund amount automatically. */
+const MONTHS = "jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec";
+const RUPEE = "(₹|rs\\.?|inr|[rzxft%<&$€£¥?])";
+const NUMBER = "(\\d{1,3}(?:,\\d{2,3})+(?:\\.\\d{1,2})?|\\d{1,6}(?:\\.\\d{1,2})?)";
+// Most vending purchases are small; a bigger amount is shown but always checked by a person.
+const MAX_PLAUSIBLE_AMOUNT = Number(process.env.UPI_MAX_AMOUNT) || 2000;
+
+function amountValue(raw) {
+  const value = Number(String(raw || "").replace(/,/g, ""));
+  return Number.isFinite(value) && value > 0 && value < 100000 ? value : null;
+}
+
+// "₹25" read as "325": the number without its first digit is a (weaker) candidate too.
+function withoutMisreadRupee(raw) {
+  const [whole, paise] = String(raw).replace(/,/g, "").split(".");
+  if (whole.length < 2 || !/^[237]/.test(whole) || whole[1] === "0") return null;
+  return amountValue(`${whole.slice(1)}${paise ? `.${paise}` : ""}`);
+}
+
+function amountVotes(text) {
+  const lines = String(text || "").split(/\n+/).map((line) => line.trim()).filter(Boolean);
+  const votes = [];
+  const add = (value, weight) => { if (value != null) votes.push({ value, weight }); };
+  const phrase = new RegExp(`\\b(?:payment of|amount paid|you paid|paid|amount|debited|sent|total)\\b\\s*:?\\s*${RUPEE}?\\s?${NUMBER}(?![\\d:])(?!\\s*(?:${MONTHS}|am\\b|pm\\b|%))`, "i");
+  const realRupee = new RegExp(`(?:₹|\\brs\\.?|\\binr)\\s?${NUMBER}(?![\\d:])`, "gi");
+  const alone = new RegExp(`^${RUPEE}?\\s?${NUMBER}$`, "i");
+
+  lines.forEach((line, index) => {
+    // "Payment of ₹25 completed", "Paid ₹25", "Amount: ₹25", "₹25 debited".
+    const worded = line.match(phrase);
+    if (worded) {
+      if (worded[1]) add(amountValue(worded[2]), 3);
+      else {
+        add(amountValue(worded[2]), 2);
+        add(withoutMisreadRupee(worded[2]), 1.5);
+      }
+    }
+    // A ₹ or Rs that OCR did read correctly.
+    for (const match of line.matchAll(realRupee)) add(amountValue(match[1]), 3);
+    // The big amount on its own line.
+    const big = !worded && line.match(alone);
+    if (big) {
+      const raw = big[2];
+      const digits = raw.replace(/[,.]/g, "");
+      const value = amountValue(raw);
+      // Not an amount: account suffixes ("0548", or 4 digits under the bank's name) and years.
+      const accountSuffix = /^0/.test(raw) || (digits.length === 4 && /\bbank\b/i.test(lines[index - 1] || ""));
+      const year = !big[1] && value >= 2000 && value <= 2100 && Number.isInteger(value);
+      if (!accountSuffix && !year && digits.length <= 6) {
+        if (big[1]) add(value, 2.5);
+        else {
+          add(value, 1);
+          add(withoutMisreadRupee(raw), 0.5);
+        }
+      }
+    }
+  });
+  return votes;
+}
+
+// texts: every OCR reading of the same screenshot.
+export function voteAmount(texts) {
+  const totals = new Map();
+  let all = 0;
+  for (const text of texts) {
+    for (const { value, weight } of amountVotes(text)) {
+      totals.set(value, (totals.get(value) || 0) + weight);
+      all += weight;
     }
   }
-  return null;
+  const ranked = [...totals.entries()].sort((a, b) => b[1] - a[1]);
+  if (!ranked.length) return { amount: null, uncertain: false, options: [] };
+  const [amount, score] = ranked[0];
+  const uncertain = score / all < 0.6 || score < 2.5 || amount > MAX_PLAUSIBLE_AMOUNT;
+  return { amount, uncertain, options: ranked.slice(0, 3).map(([value]) => value) };
+}
+
+function findAmount(lines) {
+  return voteAmount([lines.join("\n")]).amount;
+}
+
+/* A ₹ sign read as a digit ("₹25" → "325") is told apart from a real 2, 3 or 7 by its shape:
+   ₹ has bars across the top and a leg that ends in the middle, so its lower-left corner and
+   middle-right are empty, where a 2 or 3 has ink (and a 7 has no second bar on the left). */
+async function inkGrid(image, bbox, lightInk) {
+  const meta = await sharp(image).metadata();
+  const left = Math.max(0, bbox.x0);
+  const top = Math.max(0, bbox.y0);
+  const width = Math.min(meta.width, bbox.x1) - left;
+  const height = Math.min(meta.height, bbox.y1) - top;
+  if (width < 4 || height < 6) return null;
+  const { data, info } = await sharp(image).extract({ left, top, width, height }).greyscale().raw().toBuffer({ resolveWithObject: true });
+  const ink = Array.from({ length: 4 }, () => [0, 0, 0, 0]);
+  const cells = Array.from({ length: 4 }, () => [0, 0, 0, 0]);
+  for (let y = 0; y < info.height; y += 1) {
+    for (let x = 0; x < info.width; x += 1) {
+      const value = data[(y * info.width + x) * info.channels];
+      const row = Math.min(3, Math.floor((y / info.height) * 4));
+      const col = Math.min(3, Math.floor((x / info.width) * 4));
+      cells[row][col] += 1;
+      if (lightInk ? value > 128 : value < 128) ink[row][col] += 1;
+    }
+  }
+  return ink.map((row, r) => row.map((count, c) => count / cells[r][c]));
+}
+
+function looksLikeRupee(grid) {
+  if (!grid) return false;
+  return grid[3][0] < 0.12 // lower-left corner empty (a 2 or 3 curls into it)
+    && grid[2][2] < 0.15 && grid[2][3] < 0.15 // middle-right empty (a 3 bulges there)
+    && grid[1][0] + grid[1][1] > 0.3 // second bar reaches the left (a 7 has none)
+    && grid[0][1] + grid[0][2] > 1.0; // bar across the top
+}
+
+// Numbers in one OCR reading whose first "digit" is really ₹: { "325" → "₹25" }.
+async function rupeeFixes(image, data) {
+  const fixes = new Map();
+  const { channels } = await sharp(image).stats();
+  const lightInk = channels[0].mean < 128;
+  for (const block of data.blocks || []) {
+    for (const paragraph of block.paragraphs || []) {
+      for (const line of paragraph.lines || []) {
+        for (const word of line.words || []) {
+          const text = String(word.text || "");
+          if (!/^[237][\d,]*\d(?:\.\d{1,2})?$/.test(text) || (word.symbols || []).length < 2) continue;
+          if (looksLikeRupee(await inkGrid(image, word.symbols[0].bbox, lightInk).catch(() => null))) fixes.set(text, `₹${text.slice(1)}`);
+        }
+      }
+    }
+  }
+  return fixes;
+}
+
+function applyFixes(text, fixes) {
+  let fixed = String(text || "");
+  for (const [wrong, right] of fixes) {
+    const escaped = wrong.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    fixed = fixed.replace(new RegExp(`(^|[^\\d,.])${escaped}(?![\\d,])`, "g"), `$1${right}`);
+  }
+  return fixed;
 }
 
 function findStatus(text) {
@@ -179,6 +307,10 @@ async function buildFlags(ticket, result) {
   if (!result.utr && !result.amount && !result.upi_ids.length) flags.push("Could not read payment details. Check the screenshot yourself.");
   if (result.status === "FAILED") flags.push("Screenshot shows a FAILED payment.");
   if (result.status === "PENDING") flags.push("Screenshot shows a PENDING payment.");
+  if (result.amount != null && result.amount_uncertain) {
+    const others = (result.amount_options || []).filter((value) => value !== result.amount).map((value) => `₹${value}`);
+    flags.push(`Amount not clear on the screenshot: probably ₹${result.amount}${others.length ? ` (could be ${others.join(" or ")})` : ""}. Check it and enter the refund amount yourself.`);
+  }
   const typed = String(ticket.upi_id || "").trim().toLowerCase();
   const visible = String(result.payer_upi || "").replace(/^••••/, "");
   const matchesTyped = result.payer_upi?.startsWith("••••") ? typed.endsWith(visible) : typed === result.payer_upi;
@@ -197,17 +329,28 @@ async function buildFlags(ticket, result) {
 export async function readUpiImage(buffer) {
   const worker = await getWorker();
   const passes = [];
+  const fixes = new Map();
   for (const prepared of await prepareImages(buffer)) {
-    const { data } = await worker.recognize(prepared);
+    // Word and letter boxes too, to check the shape of an amount's first character.
+    const { data } = await worker.recognize(prepared, {}, { text: true, blocks: true });
     passes.push(data);
+    for (const [wrong, right] of await rupeeFixes(prepared, data).catch(() => new Map())) fixes.set(wrong, right);
   }
   const [first, second] = passes.map((data) => parseUpiText(data.text));
   const result = Object.fromEntries(Object.entries(first).map(([key, value]) => [key, (Array.isArray(value) ? value.length : value != null) ? value : second[key]]));
+  // The amount is voted on across both readings (see voteAmount).
+  const vote = voteAmount(passes.map((pass) => applyFixes(pass.text, fixes)));
+  result.amount = vote.amount;
+  result.amount_uncertain = vote.uncertain;
+  result.amount_options = vote.options;
   return { result, data: { text: passes.map((pass) => pass.text).join("\n-----\n"), confidence: passes[0].confidence } };
 }
 
 async function scanNow(ticketId) {
-  const { rows } = await db.query("SELECT id, phone, upi_id, upi_image FROM tickets WHERE id = $1", [ticketId]);
+  const { rows } = await db.query(
+    "SELECT id, phone, upi_id, upi_image, refund_amount::text AS refund_amount, upi_scan->>'amount' AS old_amount FROM tickets WHERE id = $1",
+    [ticketId]
+  );
   const ticket = rows[0];
   if (!ticket?.upi_image) return null;
 
@@ -221,6 +364,7 @@ async function scanNow(ticketId) {
     .catch((err) => console.log(`SCREENSHOT FINGERPRINT ticket #${ticketId}:`, err.message));
   const scan = {
     ...result,
+    v: SCAN_VERSION,
     confidence: Math.round(data.confidence || 0),
     flags: await buildFlags(ticket, result),
     text: String(data.text || "").slice(0, 4000),
@@ -229,12 +373,17 @@ async function scanNow(ticketId) {
   };
   // The customer's UPI ID from the screenshot is shown on the dashboard. The ticket's own
   // upi_id column holds the transaction ID the customer gave, so it is never overwritten.
-  // The amount paid also becomes the refund amount when nobody has set one yet (editable on the dashboard).
+  // The amount paid also becomes the refund amount when nobody has set one yet (editable on the
+  // dashboard), but only when the reading is sure. A refund amount that an earlier reading
+  // filled in (it still equals that reading) follows the new reading; one a person typed is kept.
+  const current = Number(String(ticket.refund_amount || "").trim() || 0);
+  const autoFilled = !current || (ticket.old_amount != null && current === Number(ticket.old_amount));
+  const newRefund = result.amount != null && !result.amount_uncertain ? String(result.amount) : null;
   const saveScan = () => db.query(
     `UPDATE tickets SET upi_scan = $1, upi_utr = $2, screenshot_upi_id = $3, upi_scanned_at = NOW(),
-       refund_amount = CASE WHEN COALESCE(NULLIF(refund_amount::text, '')::numeric, 0) = 0 AND $5::numeric > 0 THEN $6 ELSE refund_amount END
+       refund_amount = CASE WHEN $5 THEN $6 ELSE refund_amount END
      WHERE id = $4`,
-    [JSON.stringify(scan), result.utr, result.payer_upi, ticketId, result.amount ?? null, result.amount != null ? String(result.amount) : null]
+    [JSON.stringify(scan), result.utr, result.payer_upi, ticketId, autoFilled && (newRefund !== null || current > 0), newRefund]
   );
   try {
     await saveScan();
@@ -277,15 +426,27 @@ export async function readMissedScreenshots(limit = 40) {
     const filled = await db.query(
       `UPDATE tickets SET refund_amount = (upi_scan->>'amount')::numeric
        WHERE upi_scan->>'amount' ~ '^[0-9]+(\\.[0-9]+)?$' AND COALESCE(NULLIF(refund_amount::text, '')::numeric, 0) = 0
+         AND COALESCE(upi_scan->>'amount_uncertain', 'false') <> 'true'
        RETURNING id`
     ).catch((err) => { console.log("REFUND AMOUNT FILL SKIPPED:", err.message); return { rows: [] }; });
     if (filled.rows.length) console.log(`💰 Refund amount filled from screenshots on ${filled.rows.length} ticket(s)`);
+    // Never read, or (for tickets still open) read by an older, less accurate version.
     const { rows } = await db.query(
+      `SELECT id FROM tickets
+       WHERE upi_image IS NOT NULL AND images_deleted_at IS NULL AND created_at > NOW() - INTERVAL '30 days'
+         AND (upi_scan IS NULL OR (
+           COALESCE(upi_scan->>'v', '1') <> $2
+           AND COALESCE(state, '') <> 'CLOSED'
+           AND LOWER(COALESCE(status, '')) NOT IN ('closed', 'auto_closed', 'resolved', 'refunded', 'auto_refunded')
+         ))
+       ORDER BY id DESC LIMIT $1`,
+      [limit, String(SCAN_VERSION)]
+    ).catch(() => db.query(
       `SELECT id FROM tickets WHERE upi_image IS NOT NULL AND upi_scan IS NULL AND created_at > NOW() - INTERVAL '30 days'
        ORDER BY id DESC LIMIT $1`,
       [limit]
-    );
-    if (rows.length) console.log(`🔎 Reading ${rows.length} UPI screenshot(s) that were missed`);
+    ));
+    if (rows.length) console.log(`🔎 Reading ${rows.length} UPI screenshot(s) (missed, or read by an older version)`);
     for (const row of rows) scanUpiScreenshot(row.id).catch(() => {});
   } catch (err) {
     console.log("UPI BACKFILL ERROR:", err.message);
