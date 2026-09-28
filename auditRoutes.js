@@ -277,9 +277,11 @@ export function registerAuditRoutes(app, { db, auth, uploadImage }) {
     const capaIds = [];
     for (const item of checklist) {
       if (Number(item.score) !== 0) continue;
+      // The checklist point it came from decides who gets it if the refiller can't do it.
       const capa = await db.query(
-        `INSERT INTO audit_capa (audit_id, location, refiller, refiller_phone, severity, defect) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
-        [auditId, location, body.refiller || null, body.refillerPhone || null, item.critical ? "P1 - Critical SOP defect" : "P2 - Routine defect", `${item.text}${item.notes ? ` - ${item.notes}` : ""}`]
+        `INSERT INTO audit_capa (audit_id, location, refiller, refiller_phone, severity, defect, issue_key, issue_category) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
+        [auditId, location, body.refiller || null, body.refillerPhone || null, item.critical ? "P1 - Critical SOP defect" : "P2 - Routine defect", `${item.text}${item.notes ? ` - ${item.notes}` : ""}`,
+          item.id ? String(item.id).slice(0, 80) : null, item.category ? String(item.category).slice(0, 120) : null]
       );
       capaIds.push(capa.rows[0].id);
     }
@@ -378,5 +380,44 @@ export function registerAuditRoutes(app, { db, auth, uploadImage }) {
     );
     if (!result.rows.length) return res.status(404).json({ error: "CAPA ticket not found" });
     res.json(result.rows[0]);
+  }));
+
+  /* ---------- Who gets a task the refiller can't do ---------- */
+  app.get("/audit/escalation-contacts", auth, guard, handle("CAPA ESCALATION CONTACTS", async (req, res) => {
+    const { rows } = await db.query("SELECT id, name, phone, all_issues, issue_keys, issue_texts FROM capa_escalation_contacts ORDER BY id");
+    res.json(rows);
+  }));
+
+  // Replaces the whole list: [{ name, phone, all_issues, issues: [{ key, text }] }].
+  app.put("/audit/escalation-contacts", auth, guard, handle("CAPA ESCALATION SAVE", async (req, res) => {
+    if (!req.user?.isAdmin) return res.status(403).json({ error: "Only admins can change this" });
+    const list = Array.isArray(req.body?.contacts) ? req.body.contacts.slice(0, 30) : [];
+    const contacts = [];
+    for (const item of list) {
+      const name = String(item?.name || "").trim().slice(0, 80);
+      const digits = String(item?.phone || "").replace(/\D/g, "");
+      if (!name && !digits) continue;
+      if (!name) return res.status(400).json({ error: "Every person needs a name" });
+      if (digits.length < 10 || digits.length > 13) return res.status(400).json({ error: `Enter ${name}'s WhatsApp number with 10 digits (or 91 + 10 digits)` });
+      const issues = (Array.isArray(item.issues) ? item.issues : []).filter((issue) => issue?.key);
+      if (!item.all_issues && !issues.length) return res.status(400).json({ error: `Tick at least one kind of issue for ${name}, or "All other issues"` });
+      contacts.push({
+        name,
+        phone: digits,
+        all_issues: Boolean(item.all_issues),
+        keys: issues.map((issue) => String(issue.key).slice(0, 80)),
+        texts: issues.map((issue) => String(issue.text || "").slice(0, 200)),
+      });
+    }
+    await db.query("DELETE FROM capa_escalation_contacts");
+    for (const contact of contacts) {
+      await db.query(
+        "INSERT INTO capa_escalation_contacts (name, phone, all_issues, issue_keys, issue_texts) VALUES ($1, $2, $3, $4, $5)",
+        [contact.name, contact.phone, contact.all_issues, contact.all_issues ? [] : contact.keys, contact.all_issues ? [] : contact.texts]
+      );
+    }
+    res.locals.activity = { section: "Refill Audit", action: `Set CAPA escalation contacts: ${contacts.map((contact) => contact.name).join(", ") || "none"}` };
+    const { rows } = await db.query("SELECT id, name, phone, all_issues, issue_keys, issue_texts FROM capa_escalation_contacts ORDER BY id");
+    res.json(rows);
   }));
 }

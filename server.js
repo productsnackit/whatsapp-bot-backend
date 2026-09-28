@@ -15,7 +15,7 @@ import db from "./db.js";
 import { sendWhatsApp } from "./whatsapp.js";
 import { registerAuditRoutes } from "./auditRoutes.js";
 import { registerPushRoutes, sendPushToUsers, pushUserKey } from "./pushNotifications.js";
-import { handleRefillerWhatsApp } from "./refillerTasks.js";
+import { handleRefillerWhatsApp, setCapaEscalationPush } from "./refillerTasks.js";
 import { loadInternalState, internalSaveMiddleware, scheduleInternalSave } from "./internalStore.js";
 import { accessFor, canUsePath, hasPage, hashPassword, verifyPassword, generatePassword, newSessionToken, migrateUserPasswords, publicUser, PAGES, ROLE_PRESETS } from "./accessControl.js";
 import { ensureActivityLog, activityMiddleware, registerActivityRoutes, logActivity } from "./activityLog.js";
@@ -3023,6 +3023,8 @@ app.get("/inventory/velocity", auth, async (req, res) => {
 });
 
 registerAuditRoutes(app, { db, auth, uploadImage: (dataUrl) => uploadToCloudinary(dataUrl) });
+// When a refiller taps "Can't do it", everyone with Refill Audit gets a phone notification.
+setCapaEscalationPush((payload) => sendPushToUsers(db, ["admin", ...global.internalUsers.filter((user) => hasPage(accessFor(user), "audit")).map((user) => user.username)], payload));
 registerPushRoutes(app, { db, auth });
 registerFindingsRoutes(app, { db, auth });
 registerExpiryRoutes(app, { db, auth });
