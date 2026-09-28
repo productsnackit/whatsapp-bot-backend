@@ -24,6 +24,8 @@ const REENGAGEMENT_ERROR = 131047;
 const DEFAULT_SETTINGS = { day_before_time: "19:00", hour_before_minutes: "60", grace_minutes: "120", reminders_enabled: "true" };
 const DAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const OPEN_STATUSES = ["scheduled", "missed", "rejected"];
+// Refill times for a site newly given 1, 2, 3 or 4 visits a day by a pasted timetable.
+const TIMETABLE_TIMES = { 1: ["10:00"], 2: ["10:00", "16:00"], 3: ["09:00", "13:00", "17:00"], 4: ["09:00", "12:00", "15:00", "18:00"] };
 
 let db = null;
 
@@ -784,6 +786,62 @@ export function registerRefillRoutes(app, { auth }) {
     for (const id of ids) await saveSchedule(id, { ...fields, refiller_id: null });
     res.locals.activity = { section: "Refills", action: `Set the same refill schedule for ${ids.length} sites` };
     res.json({ saved: ids.length });
+  }));
+
+  // A refiller's weekly timetable (pasted from Excel on the dashboard, which matches the names
+  // to sites first). Each listed site becomes theirs with those days; sites keep their refill
+  // times when the number of visits a day is unchanged. Sites they no longer have can be paused.
+  app.post("/refills/timetable", auth, guard, handle("REFILL TIMETABLE", async (req, res) => {
+    const refiller = (await db.query("SELECT id, name FROM audit_refillers WHERE id = $1", [Number(req.body?.refiller_id)])).rows[0];
+    if (!refiller) throw new Error("Choose a refiller");
+    const entries = (Array.isArray(req.body?.sites) ? req.body.sites : []).slice(0, 200);
+    if (!entries.length) throw new Error("Choose at least one site");
+    const today = istDate();
+    const touched = [];
+    let created = 0;
+    for (const entry of entries) {
+      const days = [...new Set((entry.days || []).map(Number).filter((day) => day >= 0 && day <= 6))].sort();
+      if (!days.length) throw new Error(`Pick at least one day for ${entry.new_name || `site #${entry.location_id}`}`);
+      const visits = Math.max(1, Math.min(4, Number(entry.visits) || 1));
+      let locationId = Number(entry.location_id) || null;
+      if (!locationId) {
+        const name = String(entry.new_name || "").trim().replace(/\s+/g, " ").slice(0, 120);
+        if (!name) throw new Error("Invalid site name");
+        const { rows } = await db.query(
+          `INSERT INTO audit_locations (name, refiller_id) VALUES ($1, $2)
+           ON CONFLICT (name) DO UPDATE SET refiller_id = EXCLUDED.refiller_id, updated_at = NOW() RETURNING id, (xmax = 0) AS inserted`,
+          [name, refiller.id]
+        );
+        locationId = rows[0].id;
+        if (rows[0].inserted) created += 1;
+      } else {
+        await db.query("UPDATE audit_locations SET refiller_id = $2, updated_at = NOW() WHERE id = $1", [locationId, refiller.id]);
+      }
+      const existing = (await db.query("SELECT * FROM refill_schedules WHERE location_id = $1", [locationId])).rows[0];
+      const times = existing?.times?.length === visits ? existing.times : TIMETABLE_TIMES[visits];
+      const { rows } = await db.query(
+        `INSERT INTO refill_schedules (location_id, refiller_id, mode, days, interval_days, start_date, end_date, times, notes, active)
+         VALUES ($1, NULL, 'weekly', $2, NULL, $3, NULL, $4, $5, TRUE)
+         ON CONFLICT (location_id) DO UPDATE SET refiller_id = NULL, mode = 'weekly', days = EXCLUDED.days, interval_days = NULL,
+           end_date = NULL, times = EXCLUDED.times, active = TRUE, updated_at = NOW()
+         RETURNING id`,
+        [locationId, days, existing?.start_date && existing.start_date <= today ? existing.start_date : today, times, existing?.notes || null]
+      );
+      touched.push(rows[0].id);
+    }
+    const pauseIds = [...new Set((req.body?.pause_location_ids || []).map(Number).filter(Boolean))];
+    if (pauseIds.length) {
+      const { rows } = await db.query("UPDATE refill_schedules SET active = FALSE, updated_at = NOW() WHERE location_id = ANY($1) RETURNING id", [pauseIds]);
+      touched.push(...rows.map((row) => row.id));
+    }
+    // Upcoming visits nobody has been reminded about yet are rebuilt from the new days.
+    await db.query(
+      "DELETE FROM refill_tasks WHERE schedule_id = ANY($1) AND status = 'scheduled' AND due_at > NOW() AND day_before_sent_at IS NULL AND hour_before_sent_at IS NULL",
+      [touched]
+    );
+    await generateTasks({ force: true });
+    res.locals.activity = { section: "Refills", action: `Applied ${refiller.name}'s weekly timetable: ${entries.length} site${entries.length === 1 ? "" : "s"}${created ? ` (${created} new)` : ""}${pauseIds.length ? `, ${pauseIds.length} paused` : ""}` };
+    res.json({ saved: entries.length, created, paused: pauseIds.length });
   }));
 
   app.delete("/refills/schedules/:locationId", auth, guard, handle("REFILL SCHEDULE DELETE", async (req, res) => {
