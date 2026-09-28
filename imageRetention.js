@@ -50,7 +50,7 @@ function cloudinaryAsset(url) {
   return { type, publicId: type === "raw" ? file : file.replace(/\.[a-z0-9]+$/i, "") };
 }
 
-async function destroyFiles(urls) {
+export async function destroyFiles(urls) {
   const byType = { image: [], video: [], raw: [] };
   for (const url of urls) {
     const asset = cloudinaryAsset(url);

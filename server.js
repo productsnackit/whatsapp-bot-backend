@@ -28,6 +28,7 @@ import { registerFindingsRoutes } from "./findingsRoutes.js";
 import { registerExpiryRoutes } from "./expiryRoutes.js";
 import { ensureUpiScanColumns, scanUpiScreenshot, registerUpiScanRoutes, readUpiImage, readMissedScreenshots } from "./upiScanner.js";
 import { ensureWhatsAppOutbox, applyOutboxStatuses, noteInbound } from "./whatsappOutbox.js";
+import { registerTicketCleanupRoutes } from "./ticketCleanup.js";
 import { ensureTicketWatch, addTicketWatch, alertOverdueTickets, fingerprintMissedScreenshots, registerTicketWatchRoutes } from "./ticketWatch.js";
 import { ensureTicketChatSchema, registerTicketChatRoutes, storeIncomingMedia, saveTicketMessage, applyStatusUpdates } from "./ticketChat.js";
 
@@ -3055,6 +3056,7 @@ registerActivityRoutes(app, { auth });
 registerImageRetentionRoutes(app, { auth });
 registerAnalyticsOverview(app, { db, auth });
 registerTicketWatchRoutes(app, { auth });
+registerTicketCleanupRoutes(app, { auth, db, onChanged: () => ticketsChanged() });
 registerRefillRoutes(app, { auth });
 registerTaskRoutes(app, {
   auth,
