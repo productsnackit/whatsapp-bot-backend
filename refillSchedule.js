@@ -778,6 +778,29 @@ export async function handleRefillMessage(msg, refiller) {
   return false;
 }
 
+// After a refiller messages us (their 24-hour window is open again), lists that failed while
+// it was shut go out now as normal, free messages: today's list, and tomorrow's if it's due.
+export async function redeliverRefillLists(refiller, { summarySent = false } = {}) {
+  if (!db || !refiller?.phone) return;
+  const today = istDate();
+  const { rows } = await db.query(
+    `SELECT id, due_date FROM refill_tasks
+     WHERE refiller_phone = $1 AND due_date IN ($2, $3) AND status IN ('scheduled', 'rejected') AND reminder_error IS NOT NULL`,
+    [refiller.phone, today, addDays(today, 1)]
+  );
+  if (!rows.length) return;
+  const todayIds = rows.filter((row) => row.due_date === today).map((row) => row.id);
+  if (todayIds.length) {
+    if (!summarySent) await sendWhatsApp(refiller.phone, await todaySummary(refiller));
+    await db.query("UPDATE refill_tasks SET reminder_error = NULL, morning_sent_at = COALESCE(morning_sent_at, NOW()) WHERE id = ANY($1)", [todayIds]);
+  }
+  if (rows.some((row) => row.due_date !== today)) {
+    await db.query("UPDATE refill_tasks SET reminder_error = NULL WHERE refiller_phone = $1 AND due_date = $2 AND reminder_error IS NOT NULL", [refiller.phone, addDays(today, 1)]);
+    await sendDayBefore(await getSettings(), { onlyPhone: refiller.phone });
+  }
+  console.log(`📨 Re-sent ${rows.length} refill reminder(s) to ${refiller.name || refiller.phone} after they messaged`);
+}
+
 // Sends the refiller today's visits; returns false when the refill schedule isn't set up.
 export async function sendRefillSummary(refiller) {
   if (!db) return false;

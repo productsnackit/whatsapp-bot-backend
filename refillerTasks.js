@@ -18,7 +18,7 @@
     first "Yes, resolved", second "Not yet".
 ========================================================= */
 import { sendWhatsApp, sendWhatsAppButtons, sendWhatsAppPayload } from "./whatsapp.js";
-import { handleRefillMessage, sendRefillSummary } from "./refillSchedule.js";
+import { handleRefillMessage, sendRefillSummary, redeliverRefillLists } from "./refillSchedule.js";
 import { sendWithFallback, onDeliveryUpdate, noteRefillerMessage } from "./whatsappOutbox.js";
 
 let pushToAuditTeam = null;
@@ -295,11 +295,24 @@ async function answerTask(db, refiller, ticket, resolved) {
 async function handleContactReply(db, msg) {
   const buttonId = msg?.interactive?.button_reply?.id || msg?.button?.payload || "";
   const tapped = buttonId.match(/^CAPA_(YES|NO|CANT):(\d+)$/);
-  if (!tapped) return false;
-  const phone = phoneDigits(msg.from);
-  const { rows: contacts } = await db.query("SELECT name, phone FROM capa_escalation_contacts");
+  const phone = phoneDigits(msg?.from);
+  const { rows: contacts } = await db.query("SELECT * FROM capa_escalation_contacts").catch(() => ({ rows: [] }));
   const contact = contacts.find((row) => phoneDigits(row.phone) === phone);
   if (!contact) return false;
+  if (!tapped) {
+    // Escalation contacts aren't customers: they get their open tasks, not the refund menu.
+    // (Tasks that failed to reach them are re-sent right after this, in full.)
+    const { rows: open } = await db.query("SELECT * FROM audit_capa WHERE status = 'OPEN' AND escalated_at IS NOT NULL AND escalation_error IS NULL ORDER BY escalated_at");
+    const mine = [];
+    for (const ticket of open) if ((await contactsFor(db, ticket)).some((row) => row.id === contact.id)) mine.push(ticket);
+    const { rows: failed } = await db.query("SELECT 1 FROM audit_capa WHERE status = 'OPEN' AND escalated_at IS NOT NULL AND escalation_error IS NOT NULL LIMIT 1");
+    if (mine.length) {
+      await sendWhatsApp(phone, [`Hi ${contact.name} 👋 Open refill tasks sent to you:`, "", ...mine.slice(0, 10).map((ticket) => `• ${ticket.ref} · ${ticket.location} · ${ticket.defect}`), "", "Tap \"Yes, resolved\" on a task once it's fixed."].join("\n"));
+    } else if (!failed.length) {
+      await sendWhatsApp(phone, `Hi ${contact.name} 👋 You have no open refill tasks right now. Thank you!`);
+    }
+    return true;
+  }
   const { rows } = await db.query("SELECT * FROM audit_capa WHERE id = $1", [tapped[2]]);
   const ticket = rows[0];
   if (!ticket) {
@@ -331,6 +344,40 @@ async function handleContactReply(db, msg) {
 // Returns true when the sender is a refiller (or an escalation contact answering a task): the
 // message is handled here and must not reach the customer bot.
 export async function handleRefillerWhatsApp(db, msg) {
+  const handled = await handleMessage(db, msg);
+  // Their message opened WhatsApp's 24-hour window: whatever failed for them while it was
+  // shut (CAPA tasks, refill lists, escalations) goes now, as normal free messages.
+  await redeliverFailed(db, msg).catch((err) => console.log("REDELIVER ERROR:", err.message));
+  return handled;
+}
+
+async function redeliverFailed(db, msg) {
+  const phone = phoneDigits(msg?.from);
+  if (!phone) return;
+  const refiller = await findRefiller(db, phone);
+  if (refiller) {
+    const { rows: tasks } = await db.query(
+      "SELECT id FROM audit_capa WHERE refiller_phone = $1 AND status = 'OPEN' AND whatsapp_status = 'FAILED' AND escalated_at IS NULL ORDER BY id",
+      [phone]
+    );
+    for (const task of tasks) await sendCapaToRefiller(db, task.id);
+    // A plain text already got today's list as the reply.
+    await redeliverRefillLists(refiller, { summarySent: msg.type === "text" });
+    if (tasks.length) console.log(`📨 Re-sent ${tasks.length} CAPA task(s) to ${refiller.name} after they messaged`);
+  }
+  const { rows: contacts } = await db.query("SELECT * FROM capa_escalation_contacts").catch(() => ({ rows: [] }));
+  const contact = contacts.find((row) => phoneDigits(row.phone) === phone);
+  if (!contact) return;
+  const { rows: tickets } = await db.query("SELECT * FROM audit_capa WHERE status = 'OPEN' AND escalated_at IS NOT NULL AND escalation_error IS NOT NULL ORDER BY id");
+  for (const ticket of tickets) {
+    if (!(await contactsFor(db, ticket)).some((row) => row.id === contact.id)) continue;
+    const machine = await machineOf(db, ticket);
+    const result = await sendWhatsAppButtons(phone, escalationMessage(ticket, { name: ticket.refiller, phone: ticket.refiller_phone }, machine), [{ id: `CAPA_YES:${ticket.id}`, title: "Yes, resolved" }]);
+    if (result.ok) await db.query("UPDATE audit_capa SET escalation_error = NULL WHERE id = $1", [ticket.id]);
+  }
+}
+
+async function handleMessage(db, msg) {
   const refiller = await findRefiller(db, msg?.from);
   if (!refiller) return handleContactReply(db, msg);
   // Opens WhatsApp's 24-hour window: normal messages reach them until then.
