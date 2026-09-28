@@ -26,6 +26,7 @@ import { registerAnalyticsOverview } from "./analyticsOverview.js";
 import { registerFindingsRoutes } from "./findingsRoutes.js";
 import { registerExpiryRoutes } from "./expiryRoutes.js";
 import { ensureUpiScanColumns, scanUpiScreenshot, registerUpiScanRoutes, readUpiImage, readMissedScreenshots } from "./upiScanner.js";
+import { ensureWhatsAppOutbox, applyOutboxStatuses } from "./whatsappOutbox.js";
 import { ensureTicketWatch, addTicketWatch, alertOverdueTickets, fingerprintMissedScreenshots, registerTicketWatchRoutes } from "./ticketWatch.js";
 import { ensureTicketChatSchema, registerTicketChatRoutes, storeIncomingMedia, saveTicketMessage, applyStatusUpdates } from "./ticketChat.js";
 
@@ -3737,6 +3738,8 @@ app.post("/webhook", async (req, res) => {
     // Delivery ticks (sent / delivered / read / failed) for messages we sent.
     if (!msg && value?.statuses?.length) {
       await applyStatusUpdates(db, value.statuses);
+      // Refiller messages (CAPA tasks, refill reminders) that failed late get the template or show why.
+      await applyOutboxStatuses(value.statuses);
       return res.sendStatus(200);
     }
 
@@ -4436,6 +4439,8 @@ try {
 } catch (err) {
   console.error("REFILL SCHEDULE SETUP ERROR:", err.message);
 }
+
+await ensureWhatsAppOutbox(db).catch((err) => console.error("WHATSAPP OUTBOX SETUP ERROR:", err.message));
 
 // Ticket reply timers (overdue alerts every 5 minutes) and refund checks (see ticketWatch.js).
 try {

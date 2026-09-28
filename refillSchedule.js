@@ -14,13 +14,13 @@
     "refill_reminder", language REFILL_TEMPLATE_LANG, default "en") whose
     body has {{1}} name, {{2}} number of visits, {{3}} when, {{4}} visits.
 ========================================================= */
-import { sendWhatsAppPayload, sendWhatsAppList, sendWhatsAppTemplate } from "./whatsapp.js";
+import { sendWhatsAppPayload, sendWhatsAppList } from "./whatsapp.js";
 import { storeIncomingMedia } from "./ticketChat.js";
 import { hasPage, accessFor } from "./accessControl.js";
+import { sendWithFallback, onDeliveryUpdate } from "./whatsappOutbox.js";
 
 const IST_MINUTES = 330;
 const HORIZON_DAYS = 14;
-const REENGAGEMENT_ERROR = 131047;
 const DEFAULT_SETTINGS = { day_before_time: "19:00", hour_before_minutes: "60", grace_minutes: "120", reminders_enabled: "true" };
 const DAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const OPEN_STATUSES = ["scheduled", "missed", "rejected"];
@@ -159,6 +159,10 @@ export async function ensureRefillTables(database, { sendPush } = {}) {
   await db.query("ALTER TABLE refill_tasks ADD COLUMN IF NOT EXISTS shifted_from TEXT, ADD COLUMN IF NOT EXISTS base_refiller_id INTEGER");
   // A site can share its visits: { "16:00": refillerId } gives that visit time to another refiller.
   await db.query("ALTER TABLE refill_schedules ADD COLUMN IF NOT EXISTS time_refillers JSONB NOT NULL DEFAULT '{}'::jsonb");
+  // A reminder WhatsApp accepted but later couldn't deliver shows its reason on the visit.
+  onDeliveryUpdate("refill", async ({ refIds, ok, error }) => {
+    if (!ok && refIds.length) await db.query("UPDATE refill_tasks SET reminder_error = $2 WHERE id = ANY($1)", [refIds, error]);
+  });
 }
 
 async function getSettings() {
@@ -316,7 +320,7 @@ async function syncFutureTasks({ today, schedules, shifts, locations, nameOf, ph
       "",
       "After refilling, send a photo of the machine here and choose the site. 📸",
     ].join("\n");
-    const result = await sendReminder(phone, text, [name || "there", String(list.length), "newly assigned", list.map((task) => `${task.due_date === today ? "today" : prettyDate(task.due_date)} ${prettyTime(task.due_time)} ${task.location_name}`).join("; ").slice(0, 900)]);
+    const result = await sendReminder(phone, text, [name || "there", String(list.length), "newly assigned", list.map((task) => `${task.due_date === today ? "today" : prettyDate(task.due_date)} ${prettyTime(task.due_time)} ${task.location_name}`).join("; ").slice(0, 900)], list.map((task) => task.id));
     // Counts as their reminder, so the evening list doesn't repeat it.
     await db.query(
       "UPDATE refill_tasks SET day_before_sent_at = CASE WHEN $2 THEN NOW() ELSE NULL END, reminder_error = $3 WHERE id = ANY($1)",
@@ -336,14 +340,16 @@ async function rebuildSchedule(scheduleId) {
 
 /* ---------- Reminders ---------- */
 
-async function sendReminder(phone, text, templateParams) {
-  let result = await sendWhatsAppPayload({ messaging_product: "whatsapp", to: phone, type: "text", text: { body: text } });
-  if (!result.ok && result.code === REENGAGEMENT_ERROR) {
-    // Outside the 24-hour window only an approved template gets through.
-    result = await sendWhatsAppTemplate(phone, process.env.REFILL_TEMPLATE_NAME || "refill_reminder", process.env.REFILL_TEMPLATE_LANG || "en", templateParams);
-    if (!result.ok) result.error = `Template "${process.env.REFILL_TEMPLATE_NAME || "refill_reminder"}" failed: ${result.error}`;
-  }
-  return result;
+// Outside WhatsApp's 24-hour window only an approved template gets through. WhatsApp may
+// report that a few seconds after accepting the message, so it is followed up in whatsappOutbox.js.
+async function sendReminder(phone, text, templateParams, taskIds = []) {
+  return sendWithFallback({
+    kind: "refill",
+    refIds: taskIds,
+    to: phone,
+    send: () => sendWhatsAppPayload({ messaging_product: "whatsapp", to: phone, type: "text", text: { body: text } }),
+    template: { name: process.env.REFILL_TEMPLATE_NAME || "refill_reminder", lang: process.env.REFILL_TEMPLATE_LANG || "en", params: templateParams },
+  });
 }
 
 function visitLine(task, index) {
@@ -373,7 +379,7 @@ async function sendDayBefore(settings, { onlyPhone = null, force = false } = {})
       "",
       "After refilling each machine, send a photo of it here and choose the site. 📸",
     ].join("\n");
-    const result = await sendReminder(phone, text, [name || "there", String(tasks.length), `tomorrow (${prettyDate(tomorrow)})`, tasks.map((task) => `${prettyTime(task.due_time)} ${task.location_name}`).join("; ").slice(0, 900)]);
+    const result = await sendReminder(phone, text, [name || "there", String(tasks.length), `tomorrow (${prettyDate(tomorrow)})`, tasks.map((task) => `${prettyTime(task.due_time)} ${task.location_name}`).join("; ").slice(0, 900)], tasks.map((task) => task.id));
     await db.query(
       "UPDATE refill_tasks SET day_before_sent_at = CASE WHEN $2 THEN NOW() ELSE day_before_sent_at END, reminder_error = $3 WHERE id = ANY($1)",
       [tasks.map((task) => task.id), result.ok, result.ok ? null : result.error]
@@ -399,7 +405,7 @@ async function sendHourBefore(settings) {
       "",
       "After refilling, send a photo of the machine here and choose the site.",
     ].join("\n");
-    const result = await sendReminder(task.refiller_phone, text, [task.refiller_name || "there", "1", `today at ${prettyTime(task.due_time)}`, task.location_name]);
+    const result = await sendReminder(task.refiller_phone, text, [task.refiller_name || "there", "1", `today at ${prettyTime(task.due_time)}`, task.location_name], [task.id]);
     await db.query(
       "UPDATE refill_tasks SET hour_before_sent_at = CASE WHEN $2 THEN NOW() ELSE hour_before_sent_at END, reminder_error = $3 WHERE id = $1",
       [task.id, result.ok, result.ok ? null : result.error]
@@ -802,7 +808,8 @@ export function registerRefillRoutes(app, { auth }) {
     const result = await sendReminder(
       task.refiller_phone,
       `⏰ Refill reminder\n\n📍 ${task.location_name}${task.machine_code ? ` (${task.machine_code})` : ""}\n🕐 ${when}\n\nAfter refilling, send a photo of the machine here and choose the site.`,
-      [task.refiller_name || "there", "1", when, task.location_name]
+      [task.refiller_name || "there", "1", when, task.location_name],
+      [task.id]
     );
     await db.query("UPDATE refill_tasks SET reminder_error = $2 WHERE id = $1", [task.id, result.ok ? null : result.error]);
     if (!result.ok) return res.status(502).json({ error: result.error });

@@ -10,10 +10,9 @@
     {{1}} task ref, {{2}} location, {{3}} issue, and two quick-reply buttons:
     first "Yes, resolved", second "Not yet".
 ========================================================= */
-import { sendWhatsApp, sendWhatsAppButtons, sendWhatsAppTemplate } from "./whatsapp.js";
+import { sendWhatsApp, sendWhatsAppButtons } from "./whatsapp.js";
 import { handleRefillMessage, sendRefillSummary } from "./refillSchedule.js";
-
-const REENGAGEMENT_ERROR = 131047;
+import { sendWithFallback, onDeliveryUpdate } from "./whatsappOutbox.js";
 
 // "+91 91106 23553", "9110623553" and "919110623553" all become "919110623553".
 export function phoneDigits(phone) {
@@ -29,8 +28,20 @@ export async function ensureCapaWhatsAppColumns(db) {
       ADD COLUMN IF NOT EXISTS whatsapp_error TEXT,
       ADD COLUMN IF NOT EXISTS whatsapp_sent_at TIMESTAMPTZ,
       ADD COLUMN IF NOT EXISTS refiller_reply TEXT,
-      ADD COLUMN IF NOT EXISTS refiller_replied_at TIMESTAMPTZ
+      ADD COLUMN IF NOT EXISTS refiller_replied_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS whatsapp_delivery TEXT
   `);
+  // WhatsApp reports delivery (or a late failure) a few seconds after sending.
+  onDeliveryUpdate("capa", async ({ refIds, ok, status, error }) => {
+    if (!ok) {
+      await db.query("UPDATE audit_capa SET whatsapp_status = 'FAILED', whatsapp_error = $2, whatsapp_delivery = NULL WHERE id = ANY($1)", [refIds, error]);
+    } else if (status === "delivered" || status === "read") {
+      await db.query(
+        "UPDATE audit_capa SET whatsapp_delivery = $2 WHERE id = ANY($1) AND (whatsapp_delivery IS NULL OR $2 = 'read')",
+        [refIds, status]
+      );
+    }
+  });
 }
 
 function taskButtons(id) {
@@ -70,22 +81,21 @@ export async function sendCapaToRefiller(db, capaId) {
   if (!to) {
     result = { ok: false, error: `No phone number saved for ${ticket.refiller || "this refiller"}` };
   } else {
-    result = await sendWhatsAppButtons(to, taskMessage(ticket), taskButtons(ticket.id));
-    if (!result.ok && result.code === REENGAGEMENT_ERROR) {
-      result = process.env.CAPA_TEMPLATE_NAME
-        ? await sendWhatsAppTemplate(
-            to,
-            process.env.CAPA_TEMPLATE_NAME,
-            process.env.CAPA_TEMPLATE_LANG || "en",
-            [ticket.ref, ticket.location, ticket.defect],
-            taskButtons(ticket.id).map((button) => button.id)
-          )
-        : { ok: false, error: "Refiller hasn't messaged the customer care number in the last 24 hours. Ask them to send \"Hi\" to it, then resend." };
-    }
+    // Without an approved template, WhatsApp only delivers to someone who messaged us in the last 24 hours.
+    result = await sendWithFallback({
+      kind: "capa",
+      refIds: [ticket.id],
+      to,
+      send: () => sendWhatsAppButtons(to, taskMessage(ticket), taskButtons(ticket.id)),
+      template: process.env.CAPA_TEMPLATE_NAME
+        ? { name: process.env.CAPA_TEMPLATE_NAME, lang: process.env.CAPA_TEMPLATE_LANG || "en", params: [ticket.ref, ticket.location, ticket.defect], buttons: taskButtons(ticket.id).map((button) => button.id) }
+        : null,
+      noWindowError: `${ticket.refiller || "The refiller"} hasn't messaged the Snackit WhatsApp number in the last 24 hours, so WhatsApp didn't deliver it. Ask them to send "Hi" to the number, then press Resend.`,
+    });
   }
 
   await db.query(
-    `UPDATE audit_capa SET refiller_phone = $2, whatsapp_status = $3, whatsapp_error = $4,
+    `UPDATE audit_capa SET refiller_phone = $2, whatsapp_status = $3, whatsapp_error = $4, whatsapp_delivery = NULL,
        whatsapp_sent_at = CASE WHEN $3 = 'SENT' THEN NOW() ELSE whatsapp_sent_at END
      WHERE id = $1`,
     [ticket.id, to || null, result.ok ? "SENT" : "FAILED", result.ok ? null : result.error]
