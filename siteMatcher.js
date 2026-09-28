@@ -1,0 +1,220 @@
+/* =========================================================
+    SITE MATCHING
+    Customers answer "where is the machine?" in their own words ("Quay
+    Building, Amagi tech park banglore", "nutanix 3rd floor", "NT-3").
+    This finds which of our sites (Refill Audit → Locations) they mean,
+    allowing small spelling mistakes, and saves it on the ticket next to
+    what they typed, so analytics count real sites.
+      - site:   one site clearly matched;
+      - group:  a company with several sites (e.g. "Alorica") but not which one;
+      - manual: set by someone on the dashboard;
+      - none:   nothing matched.
+    When someone sets the site by hand they can keep the customer's wording
+    as an extra name for that site, so it matches by itself next time.
+========================================================= */
+
+let db = null;
+let cache = { at: 0, sites: [] };
+let onTicketsChanged = null;
+
+// Notes in site names that customers never type ("Awfis ebay (less sales)").
+const NOTE_WORDS = new Set(["less", "sales", "average", "avg"]);
+// Words that say nothing about which site it is; a remembered wording matches on the rest,
+// so "Quay Building, Baghmane Tech Park Banglore" also matches "quay baghmane 3rd floor".
+const GENERIC_WORDS = new Set(`bangalore banglore bengaluru bengalore bangaluru blr karnataka india pvt ltd private limited
+  office floor ground first second third fourth fifth sixth 1st 2nd 3rd 4th 5th 6th 7th 8th 9th 10th tech park building bldg
+  tower block wing gate lobby level area sector phase street road rd main cross layout nagar near opposite opp the in at of on
+  and my our is it this machine vending snackit cafeteria cafe canteen pantry campus company side inside`.split(/\s+/).filter(Boolean));
+const COMPLAINT_WORDS = /\b(money|debited|deducted|refund|payment|paid|amount|rupees|rs|not dispensed|dispense|product|stuck|received|charged|wrong|damaged|expired|help|please)\b/i;
+const distinctiveWords = (text) => tokensOf(text).filter((word) => !GENERIC_WORDS.has(word) && !/^\d+$/.test(word));
+
+export function normaliseText(text) {
+  return String(text || "")
+    .toLowerCase()
+    .replace(/&/g, " and ")
+    .replace(/[^a-z0-9]+/g, " ")
+    // "NT 3", "nt-3" and "NT3" are the same building.
+    .replace(/\b([a-z]{1,3}) (\d{1,2})\b/g, "$1$2")
+    .trim();
+}
+const tokensOf = (text) => normaliseText(text).split(" ").filter(Boolean);
+
+function editDistance(a, b) {
+  const row = Array.from({ length: b.length + 1 }, (_, index) => index);
+  for (let i = 1; i <= a.length; i += 1) {
+    let diagonal = row[0];
+    row[0] = i;
+    for (let j = 1; j <= b.length; j += 1) {
+      const above = row[j];
+      row[j] = Math.min(row[j] + 1, row[j - 1] + 1, diagonal + (a[i - 1] === b[j - 1] ? 0 : 1));
+      diagonal = above;
+    }
+  }
+  return row[b.length];
+}
+
+// Same word, allowing a typo in longer words ("baghmane" ~ "bagmane", "caterpiller" ~ "caterpillar").
+function sameWord(a, b) {
+  if (a === b) return true;
+  const length = Math.min(a.length, b.length);
+  if (length < 5 || /\d/.test(a + b)) return false;
+  return editDistance(a, b) <= (length >= 8 ? 2 : 1);
+}
+
+function phraseIn(tokens, phrase) {
+  if (!phrase.length) return false;
+  for (let start = 0; start + phrase.length <= tokens.length; start += 1) {
+    if (phrase.every((word, offset) => sameWord(tokens[start + offset], word))) return true;
+  }
+  return false;
+}
+
+function describe(site) {
+  const name = String(site.name || "");
+  const core = tokensOf(name.replace(/\([^)]*\)/g, " ")).filter((word) => !NOTE_WORDS.has(word));
+  const qualifiers = [...name.matchAll(/\(([^)]*)\)/g)].flatMap((match) => tokensOf(match[1])).filter((word) => !NOTE_WORDS.has(word));
+  const aliases = (site.aliases || []).map(distinctiveWords).filter((alias) => alias.length);
+  return { id: site.id, name, display: name.replace(/\([^)]*\)/g, " ").replace(/\s+/g, " ").trim() || name, core, qualifiers, aliases };
+}
+
+async function loadSites() {
+  if (Date.now() - cache.at < 60000) return cache.sites;
+  const { rows } = await db.query("SELECT id, name, COALESCE(aliases, '{}') AS aliases FROM audit_locations ORDER BY id").catch(() => ({ rows: [] }));
+  cache = { at: Date.now(), sites: rows.map(describe).filter((site) => site.core.length || site.aliases.length) };
+  return cache.sites;
+}
+
+// The site a customer's text points to: { site_id, site_name, site_match }.
+export function matchText(text, sites) {
+  const raw = String(text || "");
+  const tokens = tokensOf(raw);
+  if (!tokens.length) return { site_id: null, site_name: null, site_match: "none" };
+  const compact = tokens.join("");
+  const found = [];
+  for (const site of sites) {
+    let score = 0;
+    const coreCompact = site.core.join("");
+    // Very short names ("NI", "ZF") only count when written in capitals, not inside ordinary words.
+    const shortName = site.core.length === 1 && coreCompact.length <= 2;
+    const coreHit = shortName
+      ? new RegExp(`\\b${coreCompact}\\b`).test(raw.toLowerCase()) && new RegExp(`\\b${coreCompact.toUpperCase()}\\b`).test(raw)
+      : phraseIn(tokens, site.core) || (coreCompact.length >= 5 && compact.includes(coreCompact));
+    if (coreHit) score = 2 * site.core.length + site.qualifiers.filter((word) => tokens.some((token) => sameWord(token, word))).length;
+    // A remembered wording: all of its distinctive words, in any order.
+    for (const alias of site.aliases) {
+      if (alias.every((word) => tokens.some((token) => sameWord(token, word)))) score = Math.max(score, 3 + 2 * alias.length);
+    }
+    if (score) found.push({ site, score });
+  }
+  // Nothing whole matched: the company name alone ("alorica" for "Alorica nitish").
+  if (!found.length) {
+    for (const site of sites) {
+      const brand = site.core[0];
+      if (brand && brand.length >= 5 && tokens.some((token) => sameWord(token, brand))) found.push({ site, score: 1 });
+    }
+  }
+  if (!found.length) return { site_id: null, site_name: null, site_match: "none" };
+  const best = Math.max(...found.map((item) => item.score));
+  const top = found.filter((item) => item.score === best);
+  if (top.length === 1) {
+    const { site } = top[0];
+    // Only the company word matched ("alorica") and the company has other sites: don't guess which.
+    const brandOnly = site.core.length === 1 && best === 2;
+    const siblings = sites.filter((other) => other !== site && other.core[0] === site.core[0]);
+    if (!brandOnly || !siblings.length) return { site_id: site.id, site_name: site.name, site_match: "site" };
+    return { site_id: null, site_name: site.display.split(" ")[0], site_match: "group" };
+  }
+  // Several sites of one company: keep the company ("Alorica") for analytics.
+  const first = top[0].site.core;
+  let shared = 0;
+  while (shared < first.length && top.every((item) => item.site.core[shared] === first[shared])) shared += 1;
+  if (!shared) return { site_id: null, site_name: null, site_match: "none" };
+  const words = top[0].site.display.split(" ");
+  return { site_id: null, site_name: words.slice(0, Math.max(1, Math.min(shared, words.length))).join(" "), site_match: "group" };
+}
+
+export async function matchSite(text) {
+  if (!db) return { site_id: null, site_name: null, site_match: "none" };
+  return matchText(text, await loadSites());
+}
+
+// Matches again every ticket not set by hand (after sites or their extra names change).
+export async function rematchTickets() {
+  if (!db) return 0;
+  const sites = await loadSites();
+  const { rows } = await db.query(
+    `SELECT id, location, site_id, site_name, site_match FROM tickets
+     WHERE NULLIF(TRIM(COALESCE(location, '')), '') IS NOT NULL AND COALESCE(site_match, '') <> 'manual'`
+  );
+  let changed = 0;
+  for (const ticket of rows) {
+    const result = matchText(ticket.location, sites);
+    if (result.site_id === ticket.site_id && result.site_name === ticket.site_name && result.site_match === ticket.site_match) continue;
+    await db.query("UPDATE tickets SET site_id = $2, site_name = $3, site_match = $4 WHERE id = $1", [ticket.id, result.site_id, result.site_name, result.site_match]);
+    changed += 1;
+  }
+  if (changed) {
+    console.log(`📍 Site matching: ${changed} ticket(s) updated`);
+    onTicketsChanged?.();
+  }
+  return changed;
+}
+
+export async function ensureSiteMatching(database, { onChanged } = {}) {
+  db = database;
+  onTicketsChanged = onChanged || null;
+  await db.query("ALTER TABLE audit_locations ADD COLUMN IF NOT EXISTS aliases TEXT[] NOT NULL DEFAULT '{}'");
+  await db.query(`
+    ALTER TABLE tickets
+      ADD COLUMN IF NOT EXISTS site_id INTEGER,
+      ADD COLUMN IF NOT EXISTS site_name TEXT,
+      ADD COLUMN IF NOT EXISTS site_match TEXT
+  `);
+  cache.at = 0;
+  await rematchTickets();
+}
+
+export function registerSiteRoutes(app, { auth }) {
+  // Sites to choose from on the tickets page.
+  app.get("/tickets/sites", auth, async (req, res) => {
+    const { rows } = await db.query("SELECT id, name, COALESCE(aliases, '{}') AS aliases FROM audit_locations ORDER BY name").catch(() => ({ rows: [] }));
+    res.json(rows);
+  });
+
+  // Sets a ticket's site by hand; "remember" keeps the customer's wording as another name for it.
+  app.post("/tickets/:id/site", auth, async (req, res) => {
+    try {
+      const { rows } = await db.query("SELECT id, location FROM tickets WHERE id = $1", [req.params.id]);
+      const ticket = rows[0];
+      if (!ticket) return res.status(404).json({ error: "Ticket not found" });
+      const siteId = Number(req.body?.site_id) || null;
+      if (!siteId) {
+        // Back to automatic matching.
+        const result = await matchSite(ticket.location);
+        await db.query("UPDATE tickets SET site_id = $2, site_name = $3, site_match = $4 WHERE id = $1", [ticket.id, result.site_id, result.site_name, result.site_match]);
+        onTicketsChanged?.();
+        return res.json(result);
+      }
+      const site = (await db.query("SELECT id, name, COALESCE(aliases, '{}') AS aliases FROM audit_locations WHERE id = $1", [siteId])).rows[0];
+      if (!site) return res.status(400).json({ error: "That site doesn't exist" });
+      await db.query("UPDATE tickets SET site_id = $2, site_name = $3, site_match = 'manual' WHERE id = $1", [ticket.id, site.id, site.name]);
+      let remembered = null;
+      const wording = String(ticket.location || "").trim().replace(/\s+/g, " ").slice(0, 120);
+      // Never remembered: wordings of only generic words (they'd match everything) and complaints
+      // typed into the location question ("Money has been debited from my account").
+      const worthRemembering = distinctiveWords(wording).length && !COMPLAINT_WORDS.test(wording);
+      if (req.body?.remember && worthRemembering && !site.aliases.some((alias) => normaliseText(alias) === normaliseText(wording))) {
+        await db.query("UPDATE audit_locations SET aliases = array_append(COALESCE(aliases, '{}'), $2) WHERE id = $1", [site.id, wording]);
+        remembered = wording;
+        cache.at = 0;
+        rematchTickets().catch(() => {});
+      }
+      res.locals.activity = { section: "Tickets", action: `Set ticket #${ticket.id}'s site to ${site.name}${remembered ? ` (remembered "${remembered}")` : ""}` };
+      onTicketsChanged?.();
+      res.json({ site_id: site.id, site_name: site.name, site_match: "manual", remembered });
+    } catch (err) {
+      console.log("SET SITE ERROR:", err.message);
+      res.status(500).json({ error: "Could not set the site" });
+    }
+  });
+}

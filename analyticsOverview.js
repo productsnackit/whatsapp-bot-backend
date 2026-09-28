@@ -29,7 +29,7 @@ function daysBetween(a, b) {
 
 // Amounts may be stored as text; anything that isn't a plain number counts as no amount.
 const TICKET_COLUMNS = `
-  id, created_at, category, main_issue, sub_issue, LOWER(COALESCE(status, '')) AS status, state, location,
+  id, created_at, category, main_issue, sub_issue, LOWER(COALESCE(status, '')) AS status, state, location, site_name, site_match,
   CASE WHEN refund_amount::text ~ '^[0-9]+(\\.[0-9]+)?$' THEN refund_amount::text::numeric END AS refund_amount,
   resolved_at, COALESCE(takeover, FALSE) AS takeover`;
 

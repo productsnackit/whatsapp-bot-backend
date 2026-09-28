@@ -29,6 +29,7 @@ import { registerExpiryRoutes } from "./expiryRoutes.js";
 import { ensureUpiScanColumns, scanUpiScreenshot, registerUpiScanRoutes, readUpiImage, readMissedScreenshots } from "./upiScanner.js";
 import { ensureWhatsAppOutbox, applyOutboxStatuses, noteInbound } from "./whatsappOutbox.js";
 import { registerTicketCleanupRoutes } from "./ticketCleanup.js";
+import { ensureSiteMatching, matchSite, registerSiteRoutes } from "./siteMatcher.js";
 import { ensureTicketWatch, addTicketWatch, alertOverdueTickets, fingerprintMissedScreenshots, registerTicketWatchRoutes } from "./ticketWatch.js";
 import { ensureTicketChatSchema, registerTicketChatRoutes, storeIncomingMedia, saveTicketMessage, applyStatusUpdates } from "./ticketChat.js";
 
@@ -605,6 +606,8 @@ async function updateTicket(id, fields) {
     );
     nextFields.machine_id = machine.rows[0]?.id || null;
     nextFields.location = location;
+    // Which of our sites the customer's words point to (see siteMatcher.js).
+    Object.assign(nextFields, await matchSite(location).catch(() => ({})));
   }
 
   const nextStage = getRefundStage(nextFields.refund_stage || nextFields.status, nextFields.state || current?.state, current?.refund_stage);
@@ -2417,6 +2420,9 @@ app.get("/tickets", auth, async (req, res) => {
         upi_scan - 'text' AS upi_scan,
         upi_image_hash,
         last_customer_message_at,
+        site_id,
+        site_name,
+        site_match,
         upi_utr,
         images_deleted_at,
         screenshot_upi_id,
@@ -3055,6 +3061,7 @@ registerImageRetentionRoutes(app, { auth });
 registerAnalyticsOverview(app, { db, auth });
 registerTicketWatchRoutes(app, { auth });
 registerTicketCleanupRoutes(app, { auth, db, onChanged: () => ticketsChanged() });
+registerSiteRoutes(app, { auth });
 registerRefillRoutes(app, { auth });
 registerTaskRoutes(app, {
   auth,
@@ -4467,6 +4474,13 @@ try {
 }
 
 await ensureWhatsAppOutbox(db).catch((err) => console.error("WHATSAPP OUTBOX SETUP ERROR:", err.message));
+
+// Which of our sites each ticket's location points to; existing tickets are matched too.
+const setUpSiteMatching = () => ensureSiteMatching(db, { onChanged: () => ticketsChanged() });
+await setUpSiteMatching().catch((err) => {
+  console.error("SITE MATCHING SETUP ERROR (trying again shortly):", err.message);
+  setTimeout(() => setUpSiteMatching().catch((retryErr) => console.error("SITE MATCHING SETUP ERROR:", retryErr.message)), 20000);
+});
 
 // Ticket reply timers (overdue alerts every 5 minutes) and refund checks (see ticketWatch.js).
 try {
