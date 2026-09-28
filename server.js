@@ -2572,11 +2572,9 @@ app.post("/ticket/action", auth, async (req, res) => {
 
     if (phone) {
       console.log("📲 Sending WhatsApp to:", phone);
+      // Only the status message: customers aren't asked for a rating afterwards
+      // (they can still choose "Feedback" from the bot's menu).
       await sendWhatsApp(phone, message);
-      if (["REFUNDED", "RESOLVED"].includes(action)) {
-        global.feedbackTargetTicket[phone] = ticketId;
-        await sendWhatsApp(phone, "Please rate your support experience from 1 to 5 by replying with a number.");
-      }
       console.log("✅ WhatsApp sent");
     } else {
       console.log("❌ No phone found");
