@@ -211,24 +211,38 @@ export async function generateTasks({ force = false } = {}) {
   const nameOf = (id) => refillers.get(id)?.name || null;
   const phoneOf = (id) => phoneDigits(refillers.get(id)?.phone) || null;
 
+  // Only visits that don't exist yet are added, all in one go (one query per 1,000 visits
+  // instead of one per visit, which made saving a schedule slow).
+  const { rows: existing } = await db.query(
+    "SELECT schedule_id, due_date, due_time FROM refill_tasks WHERE schedule_id IS NOT NULL AND due_date >= $1",
+    [today]
+  );
+  const have = new Set(existing.map((row) => `${row.schedule_id}|${row.due_date}|${row.due_time}`));
+  const now = new Date();
+  const fresh = [];
   for (const schedule of schedules) {
     for (let offset = 0; offset < HORIZON_DAYS; offset += 1) {
       const date = addDays(today, offset);
       if (!occursOn(schedule, date)) continue;
       for (const time of schedule.times) {
+        if (have.has(`${schedule.id}|${date}|${time}`)) continue;
+        const dueAt = istToUtc(date, time);
+        if (dueAt < now) continue; // never create visits in the past
         const usual = usualFor(schedule, time);
         const who = refillerOn(schedule.location_id, date, usual, shifts);
-        const dueAt = istToUtc(date, time);
-        if (dueAt < new Date()) continue; // never create visits in the past
-        await db.query(
-          `INSERT INTO refill_tasks (schedule_id, location_id, location_name, machine_code, refiller_id, refiller_name, refiller_phone, due_date, due_time, due_at, shifted_from, base_refiller_id)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-           ON CONFLICT (schedule_id, due_date, due_time) DO NOTHING`,
-          [schedule.id, schedule.location_id, schedule.location_name, schedule.machine_code, who.id, nameOf(who.id), phoneOf(who.id), date, time, dueAt,
-            who.shifted ? nameOf(usual) : null, usual]
-        );
+        fresh.push([schedule.id, schedule.location_id, schedule.location_name, schedule.machine_code, who.id, nameOf(who.id), phoneOf(who.id), date, time, dueAt,
+          who.shifted ? nameOf(usual) : null, usual]);
       }
     }
+  }
+  for (let start = 0; start < fresh.length; start += 1000) {
+    const chunk = fresh.slice(start, start + 1000);
+    await db.query(
+      `INSERT INTO refill_tasks (schedule_id, location_id, location_name, machine_code, refiller_id, refiller_name, refiller_phone, due_date, due_time, due_at, shifted_from, base_refiller_id)
+       SELECT * FROM unnest($1::int[], $2::int[], $3::text[], $4::text[], $5::int[], $6::text[], $7::text[], $8::text[], $9::text[], $10::timestamptz[], $11::text[], $12::int[])
+       ON CONFLICT (schedule_id, due_date, due_time) DO NOTHING`,
+      Array.from({ length: 12 }, (_, column) => chunk.map((row) => row[column]))
+    );
   }
   await syncFutureTasks({ today, schedules, shifts, locations, nameOf, phoneOf });
 }
@@ -244,6 +258,7 @@ async function syncFutureTasks({ today, schedules, shifts, locations, nameOf, ph
   const tomorrowListOut = new Date() >= istToUtc(today, settings.day_before_time);
   const newlyAssigned = new Map();
   const releasedFrom = new Map();
+  const changes = [];
 
   for (const task of tasks) {
     const site = bySite.get(task.location_id);
@@ -265,13 +280,21 @@ async function syncFutureTasks({ today, schedules, shifts, locations, nameOf, ph
       const phone = phoneOf(who.id);
       if (soon && phone) newlyAssigned.set(phone, [...(newlyAssigned.get(phone) || []), { ...task, refiller_name: nameOf(who.id) }]);
     }
+    changes.push([task.id, site.name, site.machine_code, who.id, nameOf(who.id), phoneOf(who.id), shiftedFrom, moved]);
+  }
+  // All changed visits are updated together.
+  for (let start = 0; start < changes.length; start += 1000) {
+    const chunk = changes.slice(start, start + 1000);
     await db.query(
-      `UPDATE refill_tasks SET location_name = $2, machine_code = $3, refiller_id = $4, refiller_name = $5, refiller_phone = $6, shifted_from = $7,
-         day_before_sent_at = CASE WHEN $8 THEN NULL ELSE day_before_sent_at END,
-         hour_before_sent_at = CASE WHEN $8 THEN NULL ELSE hour_before_sent_at END,
-         reminder_error = CASE WHEN $8 THEN NULL ELSE reminder_error END
-       WHERE id = $1`,
-      [task.id, site.name, site.machine_code, who.id, nameOf(who.id), phoneOf(who.id), shiftedFrom, moved]
+      `UPDATE refill_tasks t SET location_name = u.location_name, machine_code = u.machine_code, refiller_id = u.refiller_id,
+         refiller_name = u.refiller_name, refiller_phone = u.refiller_phone, shifted_from = u.shifted_from,
+         day_before_sent_at = CASE WHEN u.moved THEN NULL ELSE t.day_before_sent_at END,
+         hour_before_sent_at = CASE WHEN u.moved THEN NULL ELSE t.hour_before_sent_at END,
+         reminder_error = CASE WHEN u.moved THEN NULL ELSE t.reminder_error END
+       FROM unnest($1::int[], $2::text[], $3::text[], $4::int[], $5::text[], $6::text[], $7::text[], $8::bool[])
+         AS u(id, location_name, machine_code, refiller_id, refiller_name, refiller_phone, shifted_from, moved)
+       WHERE t.id = u.id`,
+      Array.from({ length: 8 }, (_, column) => chunk.map((row) => row[column]))
     );
   }
 
