@@ -718,6 +718,11 @@ async function isDuplicateTransaction(transactionId, ticketId) {
 }
 
 // The customer sends the payment screenshot instead of typing the transaction ID; it is read here.
+// The product photo is optional: customers who don't have one reply SKIP.
+const PHOTO_OPTIONAL_LINE = "No photo? Reply *SKIP* to continue without it.";
+const isSkipPhoto = (text) => /^(skip|no|no photo|no image|don'?t have|dont have one|don'?t have one)[.!]?$/i.test(String(text || "").trim());
+const PHOTO_SKIPPED = "👍 No problem, we'll continue without a photo.";
+
 const PAYMENT_SCREENSHOT_PROMPT = `📸 *SEND YOUR UPI PAYMENT SCREENSHOT*
 
 Send the screenshot of this payment from your UPI app (GPay, PhonePe, Paytm…). We'll read the transaction ID from it automatically.
@@ -1186,12 +1191,20 @@ Please send a clear photo of the product/machine where issue occurred.
 
 ⚠️ Make sure:
 ✓ Image is clear and visible
-✓ You can see the product/machine clearly`
+✓ You can see the product/machine clearly
+
+${PHOTO_OPTIONAL_LINE}`
           );
         }
 
         if (state === "STEP1") {
           const retryKey = getRetryKey(ticketId, "STEP1_IMAGE");
+
+          if (!isImage && isSkipPhoto(text)) {
+            resetRetry(retryKey);
+            await updateTicket(ticketId, { state: "STEP2" });
+            return sendWhatsApp(from, `${PHOTO_SKIPPED}\n\n${PAYMENT_SCREENSHOT_PROMPT}`);
+          }
 
           if (isVideo(mediaType)) {
             incrementRetry(retryKey);
@@ -1233,7 +1246,9 @@ Send a clear photo of the product/machine.`
 
 Attempt ${retries}/${MAX_RETRIES}
 
-Please send a clear photo.`
+Please send a clear photo.
+
+${PHOTO_OPTIONAL_LINE}`
             );
           }
 
@@ -1663,12 +1678,20 @@ Thank you for choosing Snackit!`
             from,
             `📸 *SEND PRODUCT IMAGE*
 
-Please send a clear photo showing the expiry date or damage.`
+Please send a clear photo showing the expiry date or damage.
+
+${PHOTO_OPTIONAL_LINE}`
           );
         }
 
         if (state === "EXP_IMG") {
           const retryKey = getRetryKey(ticketId, "EXP_IMG");
+
+          if (!isImage && isSkipPhoto(text)) {
+            resetRetry(retryKey);
+            await updateTicket(ticketId, { state: "EXP_UPI" });
+            return sendWhatsApp(from, `${PHOTO_SKIPPED}\n\n${PAYMENT_SCREENSHOT_PROMPT}`);
+          }
 
           if (isVideo(mediaType)) {
             incrementRetry(retryKey);
@@ -1677,7 +1700,7 @@ Please send a clear photo showing the expiry date or damage.`
 
           if (!isImage || !mediaUrl) {
             incrementRetry(retryKey);
-            return sendWhatsApp(from, `❌ Image not received. Please try again.`);
+            return sendWhatsApp(from, `❌ Image not received. Please try again.\n\n${PHOTO_OPTIONAL_LINE}`);
           }
 
           const uploaded = await uploadToCloudinary(mediaUrl);
@@ -1817,12 +1840,20 @@ Thank you! 🙏`
             from,
             `📸 *SEND PRODUCT PRICE IMAGE*
 
-Show the product with its price tag clearly visible.`
+Show the product with its price tag clearly visible.
+
+${PHOTO_OPTIONAL_LINE}`
           );
         }
 
         if (state === "PRICE_IMG") {
           const retryKey = getRetryKey(ticketId, "PRICE_IMG");
+
+          if (!isImage && isSkipPhoto(text)) {
+            resetRetry(retryKey);
+            await updateTicket(ticketId, { state: "PRICE_UPI" });
+            return sendWhatsApp(from, `${PHOTO_SKIPPED}\n\n${PAYMENT_SCREENSHOT_PROMPT}`);
+          }
 
           if (isVideo(mediaType)) {
             incrementRetry(retryKey);
@@ -1831,7 +1862,7 @@ Show the product with its price tag clearly visible.`
 
           if (!isImage || !mediaUrl) {
             incrementRetry(retryKey);
-            return sendWhatsApp(from, `❌ Image not received. Try again.`);
+            return sendWhatsApp(from, `❌ Image not received. Try again.\n\n${PHOTO_OPTIONAL_LINE}`);
           }
 
           const uploaded = await uploadToCloudinary(mediaUrl);
@@ -1960,12 +1991,20 @@ Thank you!`
             from,
             `📸 *SEND DAMAGED PRODUCT IMAGE*
 
-Show the damage clearly in the photo.`
+Show the damage clearly in the photo.
+
+${PHOTO_OPTIONAL_LINE}`
           );
         }
 
         if (state === "DAM_IMG") {
           const retryKey = getRetryKey(ticketId, "DAM_IMG");
+
+          if (!isImage && isSkipPhoto(text)) {
+            resetRetry(retryKey);
+            await updateTicket(ticketId, { state: "DAM_UPI" });
+            return sendWhatsApp(from, `${PHOTO_SKIPPED}\n\n${PAYMENT_SCREENSHOT_PROMPT}`);
+          }
 
           if (isVideo(mediaType)) {
             incrementRetry(retryKey);
@@ -1974,7 +2013,7 @@ Show the damage clearly in the photo.`
 
           if (!isImage || !mediaUrl) {
             incrementRetry(retryKey);
-            return sendWhatsApp(from, `❌ Image not received. Try again.`);
+            return sendWhatsApp(from, `❌ Image not received. Try again.\n\n${PHOTO_OPTIONAL_LINE}`);
           }
 
           const uploaded = await uploadToCloudinary(mediaUrl);
