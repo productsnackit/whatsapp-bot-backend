@@ -26,7 +26,7 @@ import { registerAnalyticsOverview } from "./analyticsOverview.js";
 import { registerFindingsRoutes } from "./findingsRoutes.js";
 import { registerExpiryRoutes } from "./expiryRoutes.js";
 import { ensureUpiScanColumns, scanUpiScreenshot, registerUpiScanRoutes, readUpiImage, readMissedScreenshots } from "./upiScanner.js";
-import { ensureWhatsAppOutbox, applyOutboxStatuses } from "./whatsappOutbox.js";
+import { ensureWhatsAppOutbox, applyOutboxStatuses, noteInbound } from "./whatsappOutbox.js";
 import { ensureTicketWatch, addTicketWatch, alertOverdueTickets, fingerprintMissedScreenshots, registerTicketWatchRoutes } from "./ticketWatch.js";
 import { ensureTicketChatSchema, registerTicketChatRoutes, storeIncomingMedia, saveTicketMessage, applyStatusUpdates } from "./ticketChat.js";
 
@@ -3760,6 +3760,9 @@ app.post("/webhook", async (req, res) => {
         global.processedMessageIds.delete(oldest);
       }
     }
+
+    // Anyone who messages us can get normal messages for 24 hours; after that only templates.
+    await noteInbound(msg.from);
 
     // Refillers answer their CAPA tasks here; they never get the customer menu or a ticket.
     try {

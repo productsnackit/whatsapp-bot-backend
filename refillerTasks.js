@@ -17,7 +17,7 @@
     {{1}} task ref, {{2}} location, {{3}} issue, and two quick-reply buttons:
     first "Yes, resolved", second "Not yet".
 ========================================================= */
-import { sendWhatsApp, sendWhatsAppButtons } from "./whatsapp.js";
+import { sendWhatsApp, sendWhatsAppButtons, sendWhatsAppPayload } from "./whatsapp.js";
 import { handleRefillMessage, sendRefillSummary } from "./refillSchedule.js";
 import { sendWithFallback, onDeliveryUpdate, noteRefillerMessage } from "./whatsappOutbox.js";
 
@@ -138,7 +138,7 @@ export async function sendCapaToRefiller(db, capaId) {
       to,
       send: () => sendWhatsAppButtons(to, taskMessage(ticket), taskButtons(ticket.id)),
       template: templateFor(ticket),
-      noWindowError: `${ticket.refiller || "The refiller"} hasn't messaged the Snackit WhatsApp number in the last 24 hours, so WhatsApp didn't deliver it. Ask them to send "Hi" to the number, then press Resend.`,
+      noWindowError: `WhatsApp didn't deliver it: ${ticket.refiller || "the refiller"} hasn't messaged the Snackit number in the last 24 hours and the capa_task template couldn't be used. Check CAPA_TEMPLATE_NAME in Render.`,
     });
   }
 
@@ -220,7 +220,12 @@ async function escalateTask(db, refiller, ticket) {
       refIds: [ticket.id],
       to,
       send: () => sendWhatsAppButtons(to, escalationMessage(ticket, refiller, machine), [{ id: `CAPA_YES:${ticket.id}`, title: "Yes, resolved" }]),
-      template: templateFor(ticket, `${ticket.defect} - ${refiller.name || "the refiller"} can't do it, please arrange`, `${ticket.location}${machine ? ` (machine ${machine})` : ""}`),
+      // Full details in the template too: machine ID with the location; priority and refiller with the issue.
+      template: templateFor(
+        ticket,
+        `${ticket.defect} | ${ticket.severity} | ${refiller.name || "The refiller"} (${prettyPhone(refiller.phone)}) can't do it, please arrange`,
+        `${ticket.location} | Machine ID: ${machine || "not recorded"}`
+      ),
       noWindowError: `${contact.name} hasn't messaged the Snackit WhatsApp number in the last 24 hours, so WhatsApp didn't deliver it.`,
     });
     if (!result.ok) errors.push(`${contact.name}: ${result.error}`);
@@ -249,9 +254,18 @@ async function escalateTask(db, refiller, ticket) {
 // The refiller's reason after "Can't do it" goes on the task and to the people it was sent to.
 async function saveEscalationNote(db, refiller, ticket, note) {
   await db.query("UPDATE audit_capa SET escalation_note = $2, note_open_until = NULL WHERE id = $1", [ticket.id, note.slice(0, 500)]);
-  const contacts = await contactsFor(db, ticket);
+  const [contacts, machine] = await Promise.all([contactsFor(db, ticket), machineOf(db, ticket)]);
   for (const contact of contacts) {
-    await sendWhatsApp(phoneDigits(contact.phone), `Note from ${refiller.name || "the refiller"} on ${ticket.ref} (${ticket.location}):\n\n"${note.slice(0, 500)}"`);
+    const to = phoneDigits(contact.phone);
+    // Straight to them: a normal message if they wrote to us today, otherwise the approved template.
+    await sendWithFallback({
+      kind: "capa_escalation",
+      refIds: [ticket.id],
+      to,
+      send: () => sendWhatsAppPayload({ messaging_product: "whatsapp", to, type: "text", text: { body: `Note from ${refiller.name || "the refiller"} on ${ticket.ref} (${ticket.location}):\n\n"${note.slice(0, 500)}"` } }),
+      template: templateFor(ticket, `${ticket.defect} | Note from ${refiller.name || "the refiller"}: ${note.slice(0, 300)}`, `${ticket.location} | Machine ID: ${machine || "not recorded"}`),
+      noWindowError: `${contact.name} hasn't messaged the Snackit WhatsApp number in the last 24 hours, so the note wasn't delivered.`,
+    });
   }
   await sendWhatsApp(refiller.phone, `Thank you. Your note has been added to ${ticket.ref}${contacts.length ? ` and sent to ${contacts.map((contact) => contact.name).join(", ")}` : ""}.`);
 }
@@ -296,7 +310,16 @@ async function handleContactReply(db, msg) {
         "UPDATE audit_capa SET status = 'RESOLVED', resolved_by = $2, resolved_at = NOW(), note_open_until = NULL WHERE id = $1",
         [ticket.id, `${contact.name} (WhatsApp)`]
       );
-      if (ticket.refiller_phone) await sendWhatsApp(ticket.refiller_phone, `${ticket.ref} at ${ticket.location} was fixed by ${contact.name}. Thank you!`);
+      if (ticket.refiller_phone) {
+        const to = ticket.refiller_phone;
+        await sendWithFallback({
+          kind: "capa_notice",
+          refIds: [ticket.id],
+          to,
+          send: () => sendWhatsAppPayload({ messaging_product: "whatsapp", to, type: "text", text: { body: `${ticket.ref} at ${ticket.location} was fixed by ${contact.name}. No action needed. Thank you!` } }),
+          template: templateFor(ticket, `${ticket.defect} | Fixed by ${contact.name}, no action needed`),
+        });
+      }
     }
     await sendWhatsApp(phone, `Thank you, ${contact.name}! ${ticket.ref} at ${ticket.location} is marked as resolved.`);
   } else {

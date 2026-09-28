@@ -27,8 +27,8 @@ export async function ensureWhatsAppOutbox(database) {
     )
   `);
   await db.query("DELETE FROM wa_outbox WHERE created_at < NOW() - INTERVAL '7 days'");
-  // When each refiller last messaged us: WhatsApp's 24-hour window for normal messages.
-  await db.query("ALTER TABLE audit_refillers ADD COLUMN IF NOT EXISTS last_message_at TIMESTAMPTZ").catch(() => {});
+  // When each number (refiller, Xavier, anyone) last messaged us: WhatsApp's 24-hour window.
+  await db.query("CREATE TABLE IF NOT EXISTS wa_inbound (phone TEXT PRIMARY KEY, last_at TIMESTAMPTZ NOT NULL)");
 }
 
 const digitsOf = (phone) => {
@@ -36,20 +36,23 @@ const digitsOf = (phone) => {
   return digits.length === 10 ? `91${digits}` : digits;
 };
 
-// Called for every message a refiller sends us.
-export async function noteRefillerMessage(phone) {
-  if (!db) return;
-  const { rows } = await db.query("SELECT id, phone FROM audit_refillers WHERE phone IS NOT NULL AND phone <> ''");
-  const ids = rows.filter((row) => digitsOf(row.phone) === digitsOf(phone)).map((row) => row.id);
-  if (ids.length) await db.query("UPDATE audit_refillers SET last_message_at = NOW() WHERE id = ANY($1)", [ids]).catch(() => {});
+// Called by the webhook for every message anyone sends us.
+export async function noteInbound(phone) {
+  const key = digitsOf(phone);
+  if (!db || !key) return;
+  await db.query(
+    "INSERT INTO wa_inbound (phone, last_at) VALUES ($1, NOW()) ON CONFLICT (phone) DO UPDATE SET last_at = NOW()",
+    [key]
+  ).catch(() => {});
 }
+export const noteRefillerMessage = noteInbound;
 
-// True only when we know the refiller messaged us in the last 23½ hours (a little margin).
+// True only when we know the number messaged us in the last 23½ hours (a little margin).
+// Otherwise a normal message would be dropped by WhatsApp, so the approved template is used.
 export async function refillerWindowOpen(phone) {
   if (!db) return false;
-  const { rows } = await db.query("SELECT phone, last_message_at FROM audit_refillers WHERE last_message_at IS NOT NULL").catch(() => ({ rows: [] }));
-  const last = rows.filter((row) => digitsOf(row.phone) === digitsOf(phone)).map((row) => new Date(row.last_message_at).getTime()).sort((a, b) => b - a)[0];
-  return Boolean(last && Date.now() - last < 23.5 * 3600000);
+  const { rows } = await db.query("SELECT last_at FROM wa_inbound WHERE phone = $1", [digitsOf(phone)]).catch(() => ({ rows: [] }));
+  return Boolean(rows[0] && Date.now() - new Date(rows[0].last_at).getTime() < 23.5 * 3600000);
 }
 
 // kind: "capa" or "refill"; handler({ refIds, ok, status, error, viaTemplate }) updates their rows.
