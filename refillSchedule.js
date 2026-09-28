@@ -1,13 +1,18 @@
 /* =========================================================
     REFILL SCHEDULE
     Each site (Refill Audit → Locations) can have a refill schedule: which
-    days and at what time its refiller must refill it. From the schedules,
-    a task is created for every visit (14 days ahead). Refillers get a
-    WhatsApp list of tomorrow's visits the evening before, and a nudge one
-    hour before each visit. They prove a refill by sending a photo on
-    WhatsApp and picking the site from their own assigned sites. Admins
-    verify or reject each refill on the dashboard; a visit with no photo
-    after the grace time is marked missed and admins are alerted.
+    days its refiller must refill it. Refillers work through their sites in
+    their own order, so a visit is "anytime that day" (due by the day's close,
+    8 PM by default). Sites visited 2–3 times a day use parts of the day
+    (Morning / Afternoon / Evening, each with its own deadline), and a site
+    that really needs a clock time can still have one.
+    From the schedules, a task is created for every visit (14 days ahead).
+    Refillers get tomorrow's list the evening before, today's list in the
+    morning, and in the afternoon a reminder of what's still pending (plus a
+    nudge before visits with a clock time). They prove a refill by sending a
+    photo on WhatsApp and picking the site. Admins verify or reject each
+    refill; a visit with no photo by its deadline is marked missed and admins
+    are alerted.
 
     Times are India time (IST, UTC+5:30). Reminders outside WhatsApp's
     24-hour window use the Meta template REFILL_TEMPLATE_NAME (default
@@ -21,11 +26,19 @@ import { sendWithFallback, onDeliveryUpdate } from "./whatsappOutbox.js";
 
 const IST_MINUTES = 330;
 const HORIZON_DAYS = 14;
-const DEFAULT_SETTINGS = { day_before_time: "19:00", hour_before_minutes: "60", grace_minutes: "120", reminders_enabled: "true" };
+const DEFAULT_SETTINGS = {
+  day_before_time: "19:00", hour_before_minutes: "60", grace_minutes: "120", reminders_enabled: "true",
+  morning_list_time: "08:00", afternoon_reminder_time: "15:00", day_close_time: "20:00", morning_ends: "13:00", afternoon_ends: "17:00",
+};
+// Visits without a clock time: anytime that day, or a part of the day (sites visited 2–3 times a day).
+const SLOTS = { MORNING: "Morning", AFTERNOON: "Afternoon", EVENING: "Evening", ANY: "Anytime" };
+const SLOT_ORDER = ["MORNING", "AFTERNOON", "EVENING", "ANY"];
+const isSlot = (value) => SLOT_ORDER.includes(value);
+const EXACT_TIME_SQL = "due_time ~ '^[0-9]{2}:[0-9]{2}$'";
 const DAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const OPEN_STATUSES = ["scheduled", "missed", "rejected"];
-// Refill times for a site newly given 1, 2, 3 or 4 visits a day by a pasted timetable.
-const TIMETABLE_TIMES = { 1: ["10:00"], 2: ["10:00", "16:00"], 3: ["09:00", "13:00", "17:00"], 4: ["09:00", "12:00", "15:00", "18:00"] };
+// Visits for a site given 1, 2, 3 or 4 visits a day (pasted timetables, and schedules moved from clock times).
+const TIMETABLE_TIMES = { 1: ["ANY"], 2: ["MORNING", "EVENING"], 3: ["MORNING", "AFTERNOON", "EVENING"], 4: ["MORNING", "AFTERNOON", "EVENING", "ANY"] };
 
 let db = null;
 
@@ -68,6 +81,32 @@ function prettyTime(time) {
 function prettyDate(dateStr) {
   const date = new Date(`${dateStr}T00:00:00Z`);
   return `${DAY_NAMES[date.getUTCDay()]} ${date.getUTCDate()} ${date.toLocaleString("en-IN", { month: "short", timeZone: "UTC" })}`;
+}
+// When a slot must be done by.
+function slotDeadline(slot, settings) {
+  if (slot === "MORNING") return settings.morning_ends;
+  if (slot === "AFTERNOON") return settings.afternoon_ends;
+  return settings.day_close_time;
+}
+// A visit's due_at: the end of its slot, or its clock time.
+function dueAtFor(date, time, settings) {
+  return istToUtc(date, isSlot(time) ? slotDeadline(time, settings) : time);
+}
+// "Morning (by 1:00 PM)", "anytime (by 8:00 PM)" or "10:30 AM".
+function whenLabel(time, settings) {
+  if (!isSlot(time)) return prettyTime(time);
+  const by = settings ? ` (by ${prettyTime(slotDeadline(time, settings))})` : "";
+  return time === "ANY" ? `anytime${by}` : `${SLOTS[time]}${by}`;
+}
+// Short label in lists: nothing for anytime, " · Morning", " · 10:30 AM".
+function tagOf(time) {
+  if (time === "ANY") return "";
+  return ` · ${isSlot(time) ? SLOTS[time] : prettyTime(time)}`;
+}
+// Slots in the order of the day, then clock times.
+function sortTimes(times) {
+  const rank = (time) => (isSlot(time) ? SLOT_ORDER.indexOf(time) : 10);
+  return [...times].sort((a, b) => rank(a) - rank(b) || String(a).localeCompare(String(b)));
 }
 const validTime = (value) => /^([01]\d|2[0-3]):[0-5]\d$/.test(String(value || ""));
 const validDate = (value) => /^\d{4}-\d{2}-\d{2}$/.test(String(value || ""));
@@ -159,10 +198,59 @@ export async function ensureRefillTables(database, { sendPush } = {}) {
   await db.query("ALTER TABLE refill_tasks ADD COLUMN IF NOT EXISTS shifted_from TEXT, ADD COLUMN IF NOT EXISTS base_refiller_id INTEGER");
   // A site can share its visits: { "16:00": refillerId } gives that visit time to another refiller.
   await db.query("ALTER TABLE refill_schedules ADD COLUMN IF NOT EXISTS time_refillers JSONB NOT NULL DEFAULT '{}'::jsonb");
+  await db.query("ALTER TABLE refill_tasks ADD COLUMN IF NOT EXISTS morning_sent_at TIMESTAMPTZ, ADD COLUMN IF NOT EXISTS afternoon_sent_at TIMESTAMPTZ");
   // A reminder WhatsApp accepted but later couldn't deliver shows its reason on the visit.
   onDeliveryUpdate("refill", async ({ refIds, ok, error }) => {
     if (!ok && refIds.length) await db.query("UPDATE refill_tasks SET reminder_error = $2 WHERE id = ANY($1)", [refIds, error]);
   });
+  await moveToAnytimeVisits().catch((err) => console.log("REFILL SLOT MIGRATION ERROR:", err.message));
+}
+
+// Once: schedules with clock times become "anytime that day" (1 visit) or parts of the day
+// (2–3 visits), with their upcoming visits changed to match, so nothing is duplicated.
+async function moveToAnytimeVisits() {
+  const done = await db.query("SELECT 1 FROM refill_settings WHERE key = 'slots_migrated'");
+  if (done.rows.length) return;
+  const settings = await getSettings();
+  const today = istDate();
+  const { rows: schedules } = await db.query("SELECT id, times, time_refillers FROM refill_schedules");
+  let moved = 0;
+  for (const schedule of schedules) {
+    const clock = (schedule.times || []).filter(validTime).sort();
+    if (!clock.length || clock.length !== (schedule.times || []).length) continue;
+    const slots = TIMETABLE_TIMES[Math.min(4, clock.length)].slice(0, clock.length);
+    const slotOf = Object.fromEntries(clock.map((time, index) => [time, slots[index]]));
+    const timeRefillers = Object.fromEntries(Object.entries(schedule.time_refillers || {}).filter(([time]) => slotOf[time]).map(([time, id]) => [slotOf[time], id]));
+    await db.query("UPDATE refill_schedules SET times = $2, time_refillers = $3, updated_at = NOW() WHERE id = $1", [schedule.id, slots, JSON.stringify(timeRefillers)]);
+    const { rows: tasks } = await db.query(
+      "SELECT id, due_date, due_time FROM refill_tasks WHERE schedule_id = $1 AND status = 'scheduled' AND due_date >= $2 ORDER BY due_date, due_time",
+      [schedule.id, today]
+    );
+    const taken = new Set();
+    for (const task of tasks) {
+      const slot = slotOf[task.due_time] || "ANY";
+      const key = `${task.due_date}|${slot}`;
+      if (taken.has(key)) {
+        await db.query("DELETE FROM refill_tasks WHERE id = $1", [task.id]);
+        continue;
+      }
+      taken.add(key);
+      await db.query("UPDATE refill_tasks SET due_time = $2, due_at = $3 WHERE id = $1", [task.id, slot, dueAtFor(task.due_date, slot, settings)]);
+    }
+    moved += 1;
+  }
+  await db.query("INSERT INTO refill_settings (key, value) VALUES ('slots_migrated', 'true') ON CONFLICT (key) DO NOTHING");
+  if (moved) console.log(`🕐 Refill schedules: ${moved} moved from clock times to anytime / parts of the day`);
+}
+
+// After the day's close or slot deadlines change, upcoming visits follow the new times.
+async function refreshSlotDeadlines(settings) {
+  const { rows } = await db.query(`SELECT id, due_date, due_time FROM refill_tasks WHERE status = 'scheduled' AND due_date >= $1 AND NOT (${EXACT_TIME_SQL})`, [istDate()]);
+  if (!rows.length) return;
+  await db.query(
+    "UPDATE refill_tasks t SET due_at = u.due_at FROM unnest($1::int[], $2::timestamptz[]) AS u(id, due_at) WHERE t.id = u.id",
+    [rows.map((row) => row.id), rows.map((row) => dueAtFor(row.due_date, row.due_time, settings))]
+  );
 }
 
 async function getSettings() {
@@ -222,6 +310,7 @@ export async function generateTasks({ force = false } = {}) {
     [today]
   );
   const have = new Set(existing.map((row) => `${row.schedule_id}|${row.due_date}|${row.due_time}`));
+  const settings = await getSettings();
   const now = new Date();
   const fresh = [];
   for (const schedule of schedules) {
@@ -230,8 +319,8 @@ export async function generateTasks({ force = false } = {}) {
       if (!occursOn(schedule, date)) continue;
       for (const time of schedule.times) {
         if (have.has(`${schedule.id}|${date}|${time}`)) continue;
-        const dueAt = istToUtc(date, time);
-        if (dueAt < now) continue; // never create visits in the past
+        const dueAt = dueAtFor(date, time, settings);
+        if (dueAt < now) continue; // never create visits whose deadline has passed
         const usual = usualFor(schedule, time);
         const who = refillerOn(schedule.location_id, date, usual, shifts);
         fresh.push([schedule.id, schedule.location_id, schedule.location_name, schedule.machine_code, who.id, nameOf(who.id), phoneOf(who.id), date, time, dueAt,
@@ -294,6 +383,8 @@ async function syncFutureTasks({ today, schedules, shifts, locations, nameOf, ph
          refiller_name = u.refiller_name, refiller_phone = u.refiller_phone, shifted_from = u.shifted_from,
          day_before_sent_at = CASE WHEN u.moved THEN NULL ELSE t.day_before_sent_at END,
          hour_before_sent_at = CASE WHEN u.moved THEN NULL ELSE t.hour_before_sent_at END,
+         morning_sent_at = CASE WHEN u.moved THEN NULL ELSE t.morning_sent_at END,
+         afternoon_sent_at = CASE WHEN u.moved THEN NULL ELSE t.afternoon_sent_at END,
          reminder_error = CASE WHEN u.moved THEN NULL ELSE t.reminder_error END
        FROM unnest($1::int[], $2::text[], $3::text[], $4::int[], $5::text[], $6::text[], $7::text[], $8::bool[])
          AS u(id, location_name, machine_code, refiller_id, refiller_name, refiller_phone, shifted_from, moved)
@@ -306,7 +397,7 @@ async function syncFutureTasks({ today, schedules, shifts, locations, nameOf, ph
     await sendWhatsApp(phone, [
       "ℹ️ Change to your refills:",
       "",
-      ...list.map((task) => `• ${task.location_name}, ${task.due_date === today ? "today" : prettyDate(task.due_date)} ${prettyTime(task.due_time)} → now done by ${task.newName || "someone else"}`),
+      ...list.map((task) => `• ${task.location_name}, ${task.due_date === today ? "today" : prettyDate(task.due_date)}${tagOf(task.due_time)} → now done by ${task.newName || "someone else"}`),
       "",
       "You don't need to go for these. Thank you!",
     ].join("\n"));
@@ -316,11 +407,11 @@ async function syncFutureTasks({ today, schedules, shifts, locations, nameOf, ph
     const text = [
       `Hi ${name} 👋 New refill visit${list.length === 1 ? "" : "s"} for you:`,
       "",
-      ...list.map((task, index) => `${index + 1}. ${task.due_date === today ? "Today" : prettyDate(task.due_date)} ${prettyTime(task.due_time)} · ${task.location_name}${task.machine_code ? ` (${task.machine_code})` : ""}`),
+      ...list.map((task, index) => `${index + 1}. ${task.due_date === today ? "Today" : prettyDate(task.due_date)}${tagOf(task.due_time)} · ${task.location_name}${task.machine_code ? ` (${task.machine_code})` : ""}`),
       "",
       "After refilling, send a photo of the machine here and choose the site. 📸",
     ].join("\n");
-    const result = await sendReminder(phone, text, [name || "there", String(list.length), "newly assigned", list.map((task) => `${task.due_date === today ? "today" : prettyDate(task.due_date)} ${prettyTime(task.due_time)} ${task.location_name}`).join("; ").slice(0, 900)], list.map((task) => task.id));
+    const result = await sendReminder(phone, text, [name || "there", String(list.length), "newly assigned", list.map((task) => `${task.due_date === today ? "today" : prettyDate(task.due_date)}${tagOf(task.due_time)} ${task.location_name}`).join("; ").slice(0, 900)], list.map((task) => task.id));
     // Counts as their reminder, so the evening list doesn't repeat it.
     await db.query(
       "UPDATE refill_tasks SET day_before_sent_at = CASE WHEN $2 THEN NOW() ELSE NULL END, reminder_error = $3 WHERE id = ANY($1)",
@@ -353,8 +444,17 @@ async function sendReminder(phone, text, templateParams, taskIds = []) {
 }
 
 function visitLine(task, index) {
-  return `${index + 1}. ${prettyTime(task.due_time)} · ${task.location_name}${task.machine_code ? ` (${task.machine_code})` : ""}`;
+  return `${index + 1}. ${task.location_name}${task.machine_code ? ` (${task.machine_code})` : ""}${tagOf(task.due_time)}`;
 }
+
+// The footer of every list: they refill in their own order and send a photo after each machine.
+function listFooter(tasks, settings) {
+  const parts = tasks.some((task) => isSlot(task.due_time) && task.due_time !== "ANY")
+    ? ` Morning visits by ${prettyTime(settings.morning_ends)}, afternoon by ${prettyTime(settings.afternoon_ends)}, the rest by ${prettyTime(settings.day_close_time)}.`
+    : ` Please finish by ${prettyTime(settings.day_close_time)}.`;
+  return `Refill them in any order.${parts}\nAfter each machine, send its photo here and choose the site. 📸`;
+}
+const visitsForTemplate = (tasks) => tasks.map((task) => `${task.location_name}${tagOf(task.due_time)}`).join("; ").slice(0, 900);
 
 // The evening before: one message per refiller with all of tomorrow's visits.
 async function sendDayBefore(settings, { onlyPhone = null, force = false } = {}) {
@@ -364,7 +464,7 @@ async function sendDayBefore(settings, { onlyPhone = null, force = false } = {})
   const { rows } = await db.query(
     `SELECT * FROM refill_tasks WHERE due_date = $1 AND status = 'scheduled' AND day_before_sent_at IS NULL
        AND refiller_phone IS NOT NULL ${onlyPhone ? "AND refiller_phone = $2" : ""}
-     ORDER BY refiller_phone, due_time`,
+     ORDER BY refiller_phone, due_at, location_name`,
     onlyPhone ? [tomorrow, onlyPhone] : [tomorrow]
   );
   const byPhone = new Map();
@@ -377,9 +477,9 @@ async function sendDayBefore(settings, { onlyPhone = null, force = false } = {})
       "",
       ...tasks.map(visitLine),
       "",
-      "After refilling each machine, send a photo of it here and choose the site. 📸",
+      listFooter(tasks, settings),
     ].join("\n");
-    const result = await sendReminder(phone, text, [name || "there", String(tasks.length), `tomorrow (${prettyDate(tomorrow)})`, tasks.map((task) => `${prettyTime(task.due_time)} ${task.location_name}`).join("; ").slice(0, 900)], tasks.map((task) => task.id));
+    const result = await sendReminder(phone, text, [name || "there", String(tasks.length), `tomorrow (${prettyDate(tomorrow)})`, visitsForTemplate(tasks)], tasks.map((task) => task.id));
     await db.query(
       "UPDATE refill_tasks SET day_before_sent_at = CASE WHEN $2 THEN NOW() ELSE day_before_sent_at END, reminder_error = $3 WHERE id = ANY($1)",
       [tasks.map((task) => task.id), result.ok, result.ok ? null : result.error]
@@ -388,12 +488,42 @@ async function sendDayBefore(settings, { onlyPhone = null, force = false } = {})
   return rows.length;
 }
 
-// An hour (adjustable) before each visit.
+// Morning: today's list. Afternoon: only what's still pending. (Both once a day, per refiller.)
+async function sendDailyList(settings, kind) {
+  const today = istDate();
+  const at = kind === "morning" ? settings.morning_list_time : settings.afternoon_reminder_time;
+  const column = kind === "morning" ? "morning_sent_at" : "afternoon_sent_at";
+  if (new Date() < istToUtc(today, at) || new Date() > istToUtc(today, settings.day_close_time)) return 0;
+  const { rows } = await db.query(
+    `SELECT * FROM refill_tasks
+     WHERE due_date = $1 AND refiller_phone IS NOT NULL AND ${column} IS NULL
+       AND ${kind === "morning" ? "status = 'scheduled'" : "status IN ('scheduled', 'rejected') AND due_at > NOW()"}
+     ORDER BY refiller_phone, due_at, location_name`,
+    [today]
+  );
+  const byPhone = new Map();
+  rows.forEach((task) => byPhone.set(task.refiller_phone, [...(byPhone.get(task.refiller_phone) || []), task]));
+  for (const [phone, tasks] of byPhone) {
+    const name = tasks[0].refiller_name || "";
+    const lines = tasks.map((task, index) => `${visitLine(task, index)}${task.status === "rejected" ? " (redo: photo not accepted)" : ""}`);
+    const text = kind === "morning"
+      ? [`Good morning ${name} ☀️`, `Your Snackit refills today, ${prettyDate(today)}:`, "", ...lines, "", listFooter(tasks, settings)].join("\n")
+      : [`⏳ ${name ? `${name}, still` : "Still"} pending today:`, "", ...lines, "", `Please finish by ${prettyTime(settings.day_close_time)} and send each machine's photo here. 📸`].join("\n");
+    const result = await sendReminder(phone, text, [name || "there", String(tasks.length), kind === "morning" ? "today" : "still pending today", visitsForTemplate(tasks)], tasks.map((task) => task.id));
+    await db.query(
+      `UPDATE refill_tasks SET ${column} = CASE WHEN $2 THEN NOW() ELSE ${column} END, reminder_error = $3 WHERE id = ANY($1)`,
+      [tasks.map((task) => task.id), result.ok, result.ok ? null : result.error]
+    );
+  }
+  return rows.length;
+}
+
+// Before each visit that has a clock time (an hour by default).
 async function sendHourBefore(settings) {
   const minutes = Number(settings.hour_before_minutes) || 60;
   const { rows } = await db.query(
     `SELECT * FROM refill_tasks WHERE status = 'scheduled' AND hour_before_sent_at IS NULL AND refiller_phone IS NOT NULL
-       AND due_at > NOW() AND due_at <= NOW() + ($1 * INTERVAL '1 minute')`,
+       AND ${EXACT_TIME_SQL} AND due_at > NOW() AND due_at <= NOW() + ($1 * INTERVAL '1 minute')`,
     [minutes]
   );
   for (const task of rows) {
@@ -424,15 +554,17 @@ function refillAudience(internalUsers) {
 async function markMissed(settings) {
   const grace = Number(settings.grace_minutes) || 120;
   const { rows } = await db.query(
+    // Anytime / part-of-day visits: missed once their deadline passes. Clock-time visits: after the grace time.
     `UPDATE refill_tasks SET status = 'missed', missed_at = NOW()
-     WHERE status = 'scheduled' AND due_at + ($1 * INTERVAL '1 minute') < NOW()
+     WHERE status = 'scheduled'
+       AND ((${EXACT_TIME_SQL} AND due_at + ($1 * INTERVAL '1 minute') < NOW()) OR (NOT (${EXACT_TIME_SQL}) AND due_at < NOW()))
      RETURNING *`,
     [grace]
   );
   if (rows.length && pushToUsers) {
     pushToUsers(refillAudience(global.internalUsers), {
       title: `⚠️ ${rows.length} refill${rows.length === 1 ? "" : "s"} missed`,
-      body: rows.slice(0, 4).map((task) => `${task.refiller_name || "?"} · ${task.location_name} (${prettyTime(task.due_time)})`).join("\n"),
+      body: rows.slice(0, 4).map((task) => `${task.refiller_name || "?"} · ${task.location_name}${tagOf(task.due_time)}`).join("\n"),
       view: "refills",
     });
   }
@@ -446,6 +578,8 @@ export async function refillTick() {
     const settings = await getSettings();
     if (settings.reminders_enabled !== "false") {
       await sendDayBefore(settings);
+      await sendDailyList(settings, "morning");
+      await sendDailyList(settings, "afternoon");
       await sendHourBefore(settings);
     }
     await markMissed(settings);
@@ -491,7 +625,7 @@ async function siteRows(refillerPhone, page) {
   for (const task of tasks) {
     if (seen.has(task.location_id)) continue;
     seen.add(task.location_id);
-    const when = task.due_date === today ? `today ${prettyTime(task.due_time)}` : `yesterday ${prettyTime(task.due_time)}`;
+    const when = `${task.due_date === today ? "today" : "yesterday"}${tagOf(task.due_time)}`;
     const label = task.status === "rejected" ? "Redo" : task.status === "missed" ? "Missed" : "Due";
     rows.push({ id: `RFP:${task.location_id}`, title: task.location_name, description: `${label} ${when}${task.machine_code ? ` · ${task.machine_code}` : ""}` });
   }
@@ -545,8 +679,11 @@ async function completeTask(refiller, locationId) {
   const { rows: candidates } = await db.query(
     `SELECT * FROM refill_tasks
      WHERE refiller_phone = $1 AND location_id = $2 AND status = ANY($3) AND due_date BETWEEN $4 AND $5
-     ORDER BY ABS(EXTRACT(EPOCH FROM (due_at - NOW()))) LIMIT 1`,
-    [refiller.phone, locationId, OPEN_STATUSES, addDays(istDate(), -1), istDate()]
+     -- The visit whose time is still running first (for 2-3 visits a day: the current one), then the earliest.
+     ORDER BY (CASE WHEN ${EXACT_TIME_SQL} THEN due_at + ($6 * INTERVAL '1 minute') ELSE due_at END) < NOW(),
+              CASE WHEN ${EXACT_TIME_SQL} THEN due_at + ($6 * INTERVAL '1 minute') ELSE due_at END
+     LIMIT 1`,
+    [refiller.phone, locationId, OPEN_STATUSES, addDays(istDate(), -1), istDate(), Number((await getSettings()).grace_minutes) || 120]
   );
   let task = candidates[0];
   if (!task) {
@@ -564,7 +701,10 @@ async function completeTask(refiller, locationId) {
     );
     task = inserted.rows[0];
   }
-  const minutesLate = Math.round((Date.now() - new Date(task.due_at).getTime()) / 60000);
+  // Clock-time visits: minutes after the time (can be early). Anytime / part of day: minutes after the deadline, else 0.
+  const rawLate = Math.round((Date.now() - new Date(task.due_at).getTime()) / 60000);
+  const clockTime = validTime(task.due_time);
+  const minutesLate = clockTime ? rawLate : Math.max(0, rawLate);
   const updated = await db.query(
     `UPDATE refill_tasks SET status = 'done', photos = $2::jsonb, completed_at = NOW(), minutes_late = $3, reject_reason = NULL
      WHERE id = $1 RETURNING *`,
@@ -573,7 +713,11 @@ async function completeTask(refiller, locationId) {
   await db.query("DELETE FROM refill_photo_batches WHERE refiller_phone = $1", [refiller.phone]);
   const settings = await getSettings();
   const grace = Number(settings.grace_minutes) || 120;
-  const timing = task.unscheduled ? "Recorded as an extra visit." : minutesLate > grace ? `⚠️ ${minutesLate} min after the scheduled time.` : minutesLate > 0 ? `On time (within the allowed window).` : "On time ✅";
+  const timing = task.unscheduled
+    ? "Recorded as an extra visit."
+    : !clockTime
+      ? (minutesLate > 0 ? `⚠️ Done after the deadline (${whenLabel(task.due_time, settings)}).` : "Done in time ✅")
+      : minutesLate > grace ? `⚠️ ${minutesLate} min after the scheduled time.` : minutesLate > 0 ? `On time (within the allowed window).` : "On time ✅";
   await sendWhatsApp(refiller.phone, `✅ Thank you${refiller.name ? `, ${refiller.name}` : ""}!\n\nRefill at *${task.location_name}* recorded at ${prettyTime(istTime())} with ${photos.length} photo${photos.length === 1 ? "" : "s"}.\n${timing}\n\nYour supervisor will verify it.`);
   if (pushToUsers) {
     pushToUsers(refillAudience(global.internalUsers), {
@@ -588,7 +732,7 @@ async function completeTask(refiller, locationId) {
 async function todaySummary(refiller) {
   const today = istDate();
   const { rows } = await db.query(
-    "SELECT * FROM refill_tasks WHERE refiller_phone = $1 AND due_date = $2 AND status <> 'cancelled' ORDER BY due_time",
+    "SELECT * FROM refill_tasks WHERE refiller_phone = $1 AND due_date = $2 AND status <> 'cancelled' ORDER BY due_at, location_name",
     [refiller.phone, today]
   );
   if (!rows.length) return `Hi ${refiller.name || ""} 👋 You have no refills scheduled today.\n\nIf you refill a machine, send its photo here and choose the site. 📸`;
@@ -598,7 +742,7 @@ async function todaySummary(refiller) {
     "",
     ...rows.map((task, index) => `${visitLine(task, index)}  ${icon[task.status] || ""}`),
     "",
-    "After refilling, send the machine photo here and choose the site. 📸",
+    listFooter(rows, await getSettings()),
   ].join("\n");
 }
 
@@ -651,14 +795,14 @@ function actorName(user) {
 function cleanSchedule(body) {
   const mode = body.mode === "interval" ? "interval" : "weekly";
   const days = [...new Set((body.days || []).map(Number).filter((day) => day >= 0 && day <= 6))].sort();
-  const times = [...new Set((body.times || []).filter(validTime))].sort();
+  const times = sortTimes([...new Set((body.times || []).filter((time) => validTime(time) || isSlot(time)))]);
   const intervalDays = Math.max(1, Math.min(60, Number(body.interval_days) || 1));
   const timeRefillers = Object.fromEntries(Object.entries(body.time_refillers || {})
     .filter(([time, id]) => times.includes(time) && Number(id) > 0)
     .map(([time, id]) => [time, Number(id)]));
   const startDate = validDate(body.start_date) ? body.start_date : istDate();
   const endDate = validDate(body.end_date) ? body.end_date : null;
-  if (!times.length) throw new Error("Add at least one refill time");
+  if (!times.length) throw new Error("Add at least one visit");
   if (mode === "weekly" && !days.length) throw new Error("Pick at least one day");
   return {
     mode, days, times, interval_days: mode === "interval" ? intervalDays : null,
@@ -690,7 +834,7 @@ export function registerRefillRoutes(app, { auth }) {
     try {
       await fn(req, res);
     } catch (err) {
-      const known = /^(Add at least|Pick at least|Invalid|Choose)/.test(err.message);
+      const known = /^(Add at least|Pick at least|Invalid|Choose|The day)/.test(err.message);
       if (!known) console.log(`${label} ERROR:`, err.message);
       res.status(known ? 400 : 500).json({ error: known ? err.message : "Server error" });
     }
@@ -701,7 +845,7 @@ export function registerRefillRoutes(app, { auth }) {
     await generateTasks();
     const date = validDate(req.query.date) ? req.query.date : istDate();
     const [tasks, locations, refillers, settings, pending, shifts] = await Promise.all([
-      db.query("SELECT * FROM refill_tasks WHERE due_date = $1 AND status <> 'cancelled' ORDER BY due_time, location_name", [date]),
+      db.query("SELECT * FROM refill_tasks WHERE due_date = $1 AND status <> 'cancelled' ORDER BY due_at, location_name", [date]),
       db.query(`SELECT l.id, l.name, l.machine_code, l.refiller_id, r.name AS refiller_name, row_to_json(s) AS schedule
                 FROM audit_locations l LEFT JOIN audit_refillers r ON r.id = l.refiller_id
                 LEFT JOIN refill_schedules s ON s.location_id = l.id ORDER BY r.name NULLS LAST, l.name`),
@@ -780,7 +924,7 @@ export function registerRefillRoutes(app, { auth }) {
   // One-off visit (outside the regular schedule).
   app.post("/refills/tasks", auth, guard, handle("REFILL TASK CREATE", async (req, res) => {
     const { location_id: locationId, due_date: dueDate, due_time: dueTime, notes } = req.body || {};
-    if (!validDate(dueDate) || !validTime(dueTime)) throw new Error("Invalid date or time");
+    if (!validDate(dueDate) || !(validTime(dueTime) || isSlot(dueTime))) throw new Error("Invalid date or time");
     const site = await db.query(
       `SELECT l.*, r.id AS rid, r.name AS rname, r.phone AS rphone FROM audit_locations l
        LEFT JOIN audit_refillers r ON r.id = COALESCE($2::int, l.refiller_id) WHERE l.id = $1`,
@@ -791,10 +935,10 @@ export function registerRefillRoutes(app, { auth }) {
     const { rows } = await db.query(
       `INSERT INTO refill_tasks (location_id, location_name, machine_code, refiller_id, refiller_name, refiller_phone, due_date, due_time, due_at, notes, created_by, base_refiller_id)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $4) RETURNING *`,
-      [location.id, location.name, location.machine_code, location.rid, location.rname, phoneDigits(location.rphone) || null, dueDate, dueTime, istToUtc(dueDate, dueTime), String(notes || "").trim() || null, actorName(req.user)]
+      [location.id, location.name, location.machine_code, location.rid, location.rname, phoneDigits(location.rphone) || null, dueDate, dueTime, dueAtFor(dueDate, dueTime, await getSettings()), String(notes || "").trim() || null, actorName(req.user)]
     );
     await generateTasks({ force: true }); // a shift on that day applies to it too
-    res.locals.activity = { section: "Refills", action: `Added a one-off refill at ${location.name} for ${dueDate} ${dueTime} (${location.rname || "no refiller"})` };
+    res.locals.activity = { section: "Refills", action: `Added a one-off refill at ${location.name} for ${dueDate} ${whenLabel(dueTime)} (${location.rname || "no refiller"})` };
     res.status(201).json(rows[0]);
   }));
 
@@ -804,7 +948,8 @@ export function registerRefillRoutes(app, { auth }) {
     const task = rows[0];
     if (!task) return res.status(404).json({ error: "Task not found" });
     if (!task.refiller_phone) return res.status(400).json({ error: "No phone number saved for this refiller" });
-    const when = task.due_date === istDate() ? `today at ${prettyTime(task.due_time)}` : `${prettyDate(task.due_date)} at ${prettyTime(task.due_time)}`;
+    const settings = await getSettings();
+    const when = `${task.due_date === istDate() ? "today" : prettyDate(task.due_date)}, ${whenLabel(task.due_time, settings)}`;
     const result = await sendReminder(
       task.refiller_phone,
       `⏰ Refill reminder\n\n📍 ${task.location_name}${task.machine_code ? ` (${task.machine_code})` : ""}\n🕐 ${when}\n\nAfter refilling, send a photo of the machine here and choose the site.`,
@@ -821,7 +966,7 @@ export function registerRefillRoutes(app, { auth }) {
     const schedule = await saveSchedule(Number(req.params.locationId), fields);
     const site = await db.query("SELECT name FROM audit_locations WHERE id = $1", [req.params.locationId]);
     const when = fields.mode === "interval" ? `every ${fields.interval_days} day${fields.interval_days === 1 ? "" : "s"}` : fields.days.map((day) => DAY_NAMES[day]).join(", ");
-    res.locals.activity = { section: "Refills", action: `Set refill schedule for ${site.rows[0]?.name || "site"}: ${when} at ${fields.times.join(", ")}${fields.active ? "" : " (paused)"}` };
+    res.locals.activity = { section: "Refills", action: `Set refill schedule for ${site.rows[0]?.name || "site"}: ${when}, ${fields.times.map((time) => whenLabel(time)).join(", ")}${fields.active ? "" : " (paused)"}` };
     res.json(schedule);
   }));
 
@@ -949,9 +1094,14 @@ export function registerRefillRoutes(app, { auth }) {
 
   app.put("/refills/settings", auth, guard, handle("REFILL SETTINGS", async (req, res) => {
     const next = {};
-    if (req.body?.day_before_time !== undefined) {
-      if (!validTime(req.body.day_before_time)) throw new Error("Invalid reminder time");
-      next.day_before_time = req.body.day_before_time;
+    for (const key of ["day_before_time", "morning_list_time", "afternoon_reminder_time", "day_close_time", "morning_ends", "afternoon_ends"]) {
+      if (req.body?.[key] === undefined) continue;
+      if (!validTime(req.body[key])) throw new Error("Invalid reminder time");
+      next[key] = req.body[key];
+    }
+    const merged = { ...(await getSettings()), ...next };
+    if (!(merged.morning_ends < merged.afternoon_ends && merged.afternoon_ends <= merged.day_close_time)) {
+      throw new Error("The day's parts must be in order: morning ends before afternoon ends, and afternoon by the day's close");
     }
     for (const key of ["hour_before_minutes", "grace_minutes"]) {
       if (req.body?.[key] !== undefined) next[key] = String(Math.max(5, Math.min(24 * 60, Number(req.body[key]) || 60)));
@@ -961,7 +1111,10 @@ export function registerRefillRoutes(app, { auth }) {
       await db.query("INSERT INTO refill_settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", [key, value]);
     }
     res.locals.activity = { section: "Refills", action: `Changed refill reminder settings (${Object.entries(next).map(([key, value]) => `${key.replace(/_/g, " ")}: ${value}`).join(", ")})` };
-    res.json(await getSettings());
+    const saved = await getSettings();
+    // Upcoming anytime / part-of-day visits take the new deadlines.
+    if (["day_close_time", "morning_ends", "afternoon_ends"].some((key) => key in next)) await refreshSlotDeadlines(saved);
+    res.json(saved);
   }));
 
   // Sends tomorrow's list to one refiller now (to check their phone and the template work).
@@ -984,7 +1137,8 @@ export function registerRefillRoutes(app, { auth }) {
          COUNT(*) FILTER (WHERE status = 'verified')::int AS verified,
          COUNT(*) FILTER (WHERE status = 'missed')::int AS missed,
          COUNT(*) FILTER (WHERE status = 'rejected' OR rejected_count > 0)::int AS rejected,
-         COUNT(*) FILTER (WHERE status IN ('done', 'verified') AND NOT unscheduled AND minutes_late <= $2)::int AS on_time,
+         COUNT(*) FILTER (WHERE status IN ('done', 'verified') AND NOT unscheduled
+           AND ((${EXACT_TIME_SQL} AND minutes_late <= $2) OR (NOT (${EXACT_TIME_SQL}) AND COALESCE(minutes_late, 0) <= 0)))::int AS on_time,
          COUNT(*) FILTER (WHERE unscheduled)::int AS extra,
          ROUND(AVG(minutes_late) FILTER (WHERE status IN ('done', 'verified') AND NOT unscheduled AND minutes_late > 0))::int AS avg_late
        FROM refill_tasks
