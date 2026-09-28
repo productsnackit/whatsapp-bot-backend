@@ -27,6 +27,29 @@ export async function ensureWhatsAppOutbox(database) {
     )
   `);
   await db.query("DELETE FROM wa_outbox WHERE created_at < NOW() - INTERVAL '7 days'");
+  // When each refiller last messaged us: WhatsApp's 24-hour window for normal messages.
+  await db.query("ALTER TABLE audit_refillers ADD COLUMN IF NOT EXISTS last_message_at TIMESTAMPTZ").catch(() => {});
+}
+
+const digitsOf = (phone) => {
+  const digits = String(phone || "").replace(/\D/g, "");
+  return digits.length === 10 ? `91${digits}` : digits;
+};
+
+// Called for every message a refiller sends us.
+export async function noteRefillerMessage(phone) {
+  if (!db) return;
+  const { rows } = await db.query("SELECT id, phone FROM audit_refillers WHERE phone IS NOT NULL AND phone <> ''");
+  const ids = rows.filter((row) => digitsOf(row.phone) === digitsOf(phone)).map((row) => row.id);
+  if (ids.length) await db.query("UPDATE audit_refillers SET last_message_at = NOW() WHERE id = ANY($1)", [ids]).catch(() => {});
+}
+
+// True only when we know the refiller messaged us in the last 23½ hours (a little margin).
+export async function refillerWindowOpen(phone) {
+  if (!db) return false;
+  const { rows } = await db.query("SELECT phone, last_message_at FROM audit_refillers WHERE last_message_at IS NOT NULL").catch(() => ({ rows: [] }));
+  const last = rows.filter((row) => digitsOf(row.phone) === digitsOf(phone)).map((row) => new Date(row.last_message_at).getTime()).sort((a, b) => b - a)[0];
+  return Boolean(last && Date.now() - last < 23.5 * 3600000);
 }
 
 // kind: "capa" or "refill"; handler({ refIds, ok, status, error, viaTemplate }) updates their rows.
@@ -50,7 +73,23 @@ async function remember(result, { kind, refIds, to, template, noWindowError }) {
 // Sends a free-form message; if WhatsApp refuses it straight away for the 24-hour rule, the
 // template goes instead. Either way the message is remembered for its later delivery status.
 // template: { name, lang, params, buttons } or null when none is set up.
+// When the refiller hasn't messaged us in 24 hours (or we don't know), a normal message would
+// be dropped, so the template goes first; only if the template itself fails is the normal one tried.
 export async function sendWithFallback({ kind, refIds = [], to, send, template = null, noWindowError }) {
+  if (template && !(await refillerWindowOpen(to))) {
+    const viaTemplate = await sendTemplate(to, template);
+    if (viaTemplate.ok) {
+      await remember(viaTemplate, { kind, refIds, to, template: null, noWindowError });
+      return { ...viaTemplate, viaTemplate: true };
+    }
+    console.log(`WhatsApp template "${template.name}" to ${to} failed, trying a normal message:`, viaTemplate.error);
+    const plain = await send();
+    if (plain.ok) {
+      await remember(plain, { kind, refIds, to, template: null, noWindowError });
+      return plain;
+    }
+    return { ...plain, error: plain.code === REENGAGEMENT_ERROR ? `Template "${template.name}" failed: ${viaTemplate.error}` : plain.error };
+  }
   let result = await send();
   if (!result.ok && result.code === REENGAGEMENT_ERROR) {
     if (!template) return { ...result, error: noWindowError || result.error };

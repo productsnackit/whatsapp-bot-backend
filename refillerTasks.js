@@ -12,7 +12,7 @@
 ========================================================= */
 import { sendWhatsApp, sendWhatsAppButtons } from "./whatsapp.js";
 import { handleRefillMessage, sendRefillSummary } from "./refillSchedule.js";
-import { sendWithFallback, onDeliveryUpdate } from "./whatsappOutbox.js";
+import { sendWithFallback, onDeliveryUpdate, noteRefillerMessage } from "./whatsappOutbox.js";
 
 // "+91 91106 23553", "9110623553" and "919110623553" all become "919110623553".
 export function phoneDigits(phone) {
@@ -144,6 +144,8 @@ async function answerTask(db, refiller, ticket, resolved) {
 export async function handleRefillerWhatsApp(db, msg) {
   const refiller = await findRefiller(db, msg?.from);
   if (!refiller) return false;
+  // Opens WhatsApp's 24-hour window: normal messages reach them until then.
+  await noteRefillerMessage(refiller.phone);
 
   const buttonId = msg.interactive?.button_reply?.id || msg.button?.payload || "";
   const tapped = buttonId.match(/^CAPA_(YES|NO):(\d+)$/);
