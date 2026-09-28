@@ -157,6 +157,8 @@ export async function ensureRefillTables(database, { sendPush } = {}) {
     )
   `);
   await db.query("ALTER TABLE refill_tasks ADD COLUMN IF NOT EXISTS shifted_from TEXT, ADD COLUMN IF NOT EXISTS base_refiller_id INTEGER");
+  // A site can share its visits: { "16:00": refillerId } gives that visit time to another refiller.
+  await db.query("ALTER TABLE refill_schedules ADD COLUMN IF NOT EXISTS time_refillers JSONB NOT NULL DEFAULT '{}'::jsonb");
 }
 
 async function getSettings() {
@@ -178,8 +180,14 @@ function occursOn(schedule, date) {
   return (schedule.days || []).includes(weekday(date));
 }
 
+// The refiller who normally does a visit time: the one set for that time, else the
+// schedule's cover refiller, else the site's refiller.
+function usualFor(schedule, time, fallback) {
+  return Number(schedule?.time_refillers?.[time]) || schedule?.usual_refiller_id || fallback || null;
+}
+
 // Who does a site's visit on a date: a temporary shift if one covers that day (the newest
-// wins), otherwise the site's usual refiller (or the schedule's cover refiller).
+// wins), otherwise the visit's usual refiller.
 function refillerOn(locationId, date, usualId, shifts) {
   const shift = shifts
     .filter((item) => item.location_id === locationId && item.from_date <= date && item.to_date >= date)
@@ -207,8 +215,9 @@ export async function generateTasks({ force = false } = {}) {
     for (let offset = 0; offset < HORIZON_DAYS; offset += 1) {
       const date = addDays(today, offset);
       if (!occursOn(schedule, date)) continue;
-      const who = refillerOn(schedule.location_id, date, schedule.usual_refiller_id, shifts);
       for (const time of schedule.times) {
+        const usual = usualFor(schedule, time);
+        const who = refillerOn(schedule.location_id, date, usual, shifts);
         const dueAt = istToUtc(date, time);
         if (dueAt < new Date()) continue; // never create visits in the past
         await db.query(
@@ -216,7 +225,7 @@ export async function generateTasks({ force = false } = {}) {
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
            ON CONFLICT (schedule_id, due_date, due_time) DO NOTHING`,
           [schedule.id, schedule.location_id, schedule.location_name, schedule.machine_code, who.id, nameOf(who.id), phoneOf(who.id), date, time, dueAt,
-            who.shifted ? nameOf(schedule.usual_refiller_id) : null, schedule.usual_refiller_id]
+            who.shifted ? nameOf(usual) : null, usual]
         );
       }
     }
@@ -240,7 +249,7 @@ async function syncFutureTasks({ today, schedules, shifts, locations, nameOf, ph
     const site = bySite.get(task.location_id);
     if (!site) continue;
     const usual = task.schedule_id
-      ? bySchedule.get(task.schedule_id)?.usual_refiller_id ?? site.refiller_id
+      ? usualFor(bySchedule.get(task.schedule_id), task.due_time, site.refiller_id)
       : task.base_refiller_id ?? task.refiller_id;
     const who = refillerOn(task.location_id, task.due_date, usual, shifts);
     const moved = (who.id || null) !== (task.refiller_id || null);
@@ -420,13 +429,17 @@ export async function refillTick() {
 
 /* ---------- Refiller on WhatsApp: photo → pick site ---------- */
 
+// Their own sites, plus sites where one of the visit times is theirs.
 async function refillerSites(refillerPhone) {
   const { rows } = await db.query(`
     SELECT l.id, l.name, l.machine_code, r.phone
-    FROM audit_locations l JOIN audit_refillers r ON r.id = l.refiller_id
+    FROM audit_locations l
+    JOIN audit_refillers r ON r.id = l.refiller_id
+      OR r.id IN (SELECT value::int FROM refill_schedules s, jsonb_each_text(s.time_refillers) WHERE s.location_id = l.id AND value ~ '^[0-9]+$')
     ORDER BY l.name
   `);
-  return rows.filter((row) => phoneDigits(row.phone) === refillerPhone);
+  const seen = new Set();
+  return rows.filter((row) => phoneDigits(row.phone) === refillerPhone && !seen.has(row.id) && seen.add(row.id));
 }
 
 async function openTasks(refillerPhone) {
@@ -611,6 +624,9 @@ function cleanSchedule(body) {
   const days = [...new Set((body.days || []).map(Number).filter((day) => day >= 0 && day <= 6))].sort();
   const times = [...new Set((body.times || []).filter(validTime))].sort();
   const intervalDays = Math.max(1, Math.min(60, Number(body.interval_days) || 1));
+  const timeRefillers = Object.fromEntries(Object.entries(body.time_refillers || {})
+    .filter(([time, id]) => times.includes(time) && Number(id) > 0)
+    .map(([time, id]) => [time, Number(id)]));
   const startDate = validDate(body.start_date) ? body.start_date : istDate();
   const endDate = validDate(body.end_date) ? body.end_date : null;
   if (!times.length) throw new Error("Add at least one refill time");
@@ -619,6 +635,7 @@ function cleanSchedule(body) {
     mode, days, times, interval_days: mode === "interval" ? intervalDays : null,
     start_date: startDate, end_date: endDate,
     refiller_id: body.refiller_id ? Number(body.refiller_id) : null,
+    time_refillers: timeRefillers,
     notes: String(body.notes || "").trim().slice(0, 300) || null,
     active: body.active !== false,
   };
@@ -626,13 +643,13 @@ function cleanSchedule(body) {
 
 async function saveSchedule(locationId, fields) {
   const { rows } = await db.query(
-    `INSERT INTO refill_schedules (location_id, refiller_id, mode, days, interval_days, start_date, end_date, times, notes, active)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+    `INSERT INTO refill_schedules (location_id, refiller_id, mode, days, interval_days, start_date, end_date, times, notes, active, time_refillers)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
      ON CONFLICT (location_id) DO UPDATE SET refiller_id = EXCLUDED.refiller_id, mode = EXCLUDED.mode, days = EXCLUDED.days,
        interval_days = EXCLUDED.interval_days, start_date = EXCLUDED.start_date, end_date = EXCLUDED.end_date,
-       times = EXCLUDED.times, notes = EXCLUDED.notes, active = EXCLUDED.active, updated_at = NOW()
+       times = EXCLUDED.times, notes = EXCLUDED.notes, active = EXCLUDED.active, time_refillers = EXCLUDED.time_refillers, updated_at = NOW()
      RETURNING *`,
-    [locationId, fields.refiller_id, fields.mode, fields.days, fields.interval_days, fields.start_date, fields.end_date, fields.times, fields.notes, fields.active]
+    [locationId, fields.refiller_id, fields.mode, fields.days, fields.interval_days, fields.start_date, fields.end_date, fields.times, fields.notes, fields.active, JSON.stringify(fields.time_refillers || {})]
   );
   await rebuildSchedule(rows[0].id);
   return rows[0];
@@ -818,14 +835,17 @@ export function registerRefillRoutes(app, { auth }) {
         await db.query("UPDATE audit_locations SET refiller_id = $2, updated_at = NOW() WHERE id = $1", [locationId, refiller.id]);
       }
       const existing = (await db.query("SELECT * FROM refill_schedules WHERE location_id = $1", [locationId])).rows[0];
-      const times = existing?.times?.length === visits ? existing.times : TIMETABLE_TIMES[visits];
+      const keepTimes = existing?.times?.length === visits;
+      const times = keepTimes ? existing.times : TIMETABLE_TIMES[visits];
+      // Visit times shared with other refillers stay shared while the times are unchanged.
+      const timeRefillers = keepTimes ? existing.time_refillers || {} : {};
       const { rows } = await db.query(
-        `INSERT INTO refill_schedules (location_id, refiller_id, mode, days, interval_days, start_date, end_date, times, notes, active)
-         VALUES ($1, NULL, 'weekly', $2, NULL, $3, NULL, $4, $5, TRUE)
+        `INSERT INTO refill_schedules (location_id, refiller_id, mode, days, interval_days, start_date, end_date, times, notes, active, time_refillers)
+         VALUES ($1, NULL, 'weekly', $2, NULL, $3, NULL, $4, $5, TRUE, $6)
          ON CONFLICT (location_id) DO UPDATE SET refiller_id = NULL, mode = 'weekly', days = EXCLUDED.days, interval_days = NULL,
-           end_date = NULL, times = EXCLUDED.times, active = TRUE, updated_at = NOW()
+           end_date = NULL, times = EXCLUDED.times, active = TRUE, time_refillers = EXCLUDED.time_refillers, updated_at = NOW()
          RETURNING id`,
-        [locationId, days, existing?.start_date && existing.start_date <= today ? existing.start_date : today, times, existing?.notes || null]
+        [locationId, days, existing?.start_date && existing.start_date <= today ? existing.start_date : today, times, existing?.notes || null, JSON.stringify(timeRefillers)]
       );
       touched.push(rows[0].id);
     }
