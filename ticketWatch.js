@@ -187,10 +187,12 @@ function refundChecks(tickets, settings) {
 export async function addTicketWatch(rows) {
   if (!db || !rows.length) return rows;
   try {
+    // The tickets list already carries these columns; other callers get them looked up.
+    const haveColumns = "upi_image_hash" in rows[0] && "last_customer_message_at" in rows[0];
     const [settings, replies, hashes] = await Promise.all([
       getWatchSettings(),
       teamReplies(rows.map((row) => row.id)),
-      db.query("SELECT id, upi_image_hash, last_customer_message_at FROM tickets WHERE id = ANY($1)", [rows.map((row) => row.id)]),
+      haveColumns ? { rows: [] } : db.query("SELECT id, upi_image_hash, last_customer_message_at FROM tickets WHERE id = ANY($1)", [rows.map((row) => row.id)]),
     ]);
     const extra = new Map(hashes.rows.map((row) => [row.id, row]));
     const full = rows.map((row) => ({ ...row, ...extra.get(row.id) }));

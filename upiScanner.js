@@ -23,6 +23,8 @@ let workerPromise = null;
 let idleTimer = null;
 let queue = Promise.resolve();
 const IDLE_MS = 5 * 60 * 1000;
+// Told when a screenshot has been read, so open dashboards refresh the tickets list.
+let scanListener = null;
 // Bumped when the reader gets better; open tickets read by an older version are read again.
 const SCAN_VERSION = 2;
 
@@ -413,7 +415,7 @@ function closeWhenIdle() {
 export function scanUpiScreenshot(ticketId) {
   if (!db) return Promise.resolve(null);
   clearTimeout(idleTimer);
-  const job = queue.then(() => scanNow(ticketId)).finally(closeWhenIdle);
+  const job = queue.then(() => scanNow(ticketId)).then((scan) => { if (scan) scanListener?.(); return scan; }).finally(closeWhenIdle);
   queue = job.catch((err) => console.error(`UPI SCAN ERROR ticket #${ticketId}:`, err.message));
   return job;
 }
@@ -453,7 +455,15 @@ export async function readMissedScreenshots(limit = 40) {
   }
 }
 
-export function registerUpiScanRoutes(app, { auth }) {
+export function registerUpiScanRoutes(app, { auth, onScanned }) {
+  scanListener = onScanned || null;
+
+  // The full text read from a screenshot ("Show all text read"); the tickets list leaves it out.
+  app.get("/tickets/:id/scan-text", auth, async (req, res) => {
+    const { rows } = await db.query("SELECT upi_scan->>'text' AS text FROM tickets WHERE id = $1", [req.params.id]).catch(() => ({ rows: [] }));
+    res.json({ text: rows[0]?.text || "" });
+  });
+
   // Read (or re-read) a ticket's UPI screenshot on demand.
   app.post("/tickets/:id/scan-upi", auth, async (req, res) => {
     try {

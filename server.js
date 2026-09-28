@@ -2,6 +2,7 @@ import "dotenv/config";
 
 /* ================= IMPORTS ================= */
 import express from "express";
+import compression from "compression";
 import http from "http";
 import cors from "cors";
 import axios from "axios";
@@ -47,8 +48,24 @@ const io = new Server(httpServer, {
   },
 });
 
+// Replies are gzipped: the tickets list is several times smaller over the network.
+app.use(compression());
 app.use(cors());
 app.use(express.json({ limit: "25mb" }));
+
+// Tells open dashboards that tickets changed, so they refresh the list straight away
+// (a signal only, no ticket data). Many changes close together send one signal.
+let ticketsChangedTimer = null;
+function ticketsChanged() {
+  clearTimeout(ticketsChangedTimer);
+  ticketsChangedTimer = setTimeout(() => io.emit("tickets-changed", { at: Date.now() }), 400);
+}
+app.use((req, res, next) => {
+  const customerMessage = req.path === "/webhook" && req.method === "POST" && req.body?.entry?.[0]?.changes?.[0]?.value?.messages?.length;
+  const ticketChange = req.method !== "GET" && /^\/(ticket|tickets|admin\/(send|takeover|release|tickets|messages))(\/|$)/.test(req.path);
+  if (customerMessage || ticketChange) res.on("finish", () => { if (res.statusCode < 400) ticketsChanged(); });
+  next();
+});
 // Internal chat, employees and logins are saved to the database after each change.
 app.use(["/internal", "/login", "/me"], internalSaveMiddleware);
 app.use(activityMiddleware);
@@ -609,6 +626,7 @@ async function updateTicket(id, fields) {
   );
 
   await refreshCustomerRisk(id, current?.phone);
+  ticketsChanged();
 
   // Read the payment screenshot in the background; the customer's reply isn't delayed.
   if (nextFields.upi_image) scanUpiScreenshot(id).catch(() => {});
@@ -2394,7 +2412,10 @@ app.get("/tickets", auth, async (req, res) => {
         upi_id,
         image,
         upi_image,
-        upi_scan,
+        -- Everything read from the screenshot except its full text (loaded when opened).
+        upi_scan - 'text' AS upi_scan,
+        upi_image_hash,
+        last_customer_message_at,
         upi_utr,
         images_deleted_at,
         screenshot_upi_id,
@@ -3028,7 +3049,7 @@ setCapaEscalationPush((payload) => sendPushToUsers(db, ["admin", ...global.inter
 registerPushRoutes(app, { db, auth });
 registerFindingsRoutes(app, { db, auth });
 registerExpiryRoutes(app, { db, auth });
-registerUpiScanRoutes(app, { auth });
+registerUpiScanRoutes(app, { auth, onScanned: () => ticketsChanged() });
 registerTicketChatRoutes(app, { db, auth });
 registerActivityRoutes(app, { auth });
 registerImageRetentionRoutes(app, { auth });
