@@ -26,7 +26,7 @@ const IDLE_MS = 5 * 60 * 1000;
 // Told when a screenshot has been read, so open dashboards refresh the tickets list.
 let scanListener = null;
 // Bumped when the reader gets better; open tickets read by an older version are read again.
-const SCAN_VERSION = 3;
+const SCAN_VERSION = 4;
 
 export async function ensureUpiScanColumns(database) {
   db = database;
@@ -64,6 +64,16 @@ async function prepareImages(buffer) {
   const clean = await (isDark ? base.clone().negate({ alpha: false }) : base.clone()).normalise().png().toBuffer();
   const blackWhite = await base.clone().threshold(140).png().toBuffer();
   return [clean, blackWhite];
+}
+
+// White text on a coloured banner (BHIM green, Paytm blue, PhonePe purple): the darkest of the
+// three colour channels keeps white text bright and makes any colour dark; flipped, that is
+// dark text on a light page, which OCR reads well. Used only when the amount is still unclear.
+async function prepareBannerImage(buffer) {
+  const { data, info } = await sharp(buffer).rotate().removeAlpha().resize({ width: 1000 }).raw().toBuffer({ resolveWithObject: true });
+  const out = Buffer.alloc(info.width * info.height);
+  for (let i = 0, p = 0; p < out.length; i += info.channels, p += 1) out[p] = Math.min(data[i], data[i + 1], data[i + 2]);
+  return sharp(out, { raw: { width: info.width, height: info.height, channels: 1 } }).negate().normalise().png().toBuffer();
 }
 
 const APPS = [
@@ -252,10 +262,13 @@ function amountVotes(text) {
       const year = !big[1] && value >= 2000 && value <= 2100 && Number.isInteger(value);
       // A lone single digit is usually an icon read as text, not an amount.
       const iconNoise = !big[1] && digits.length === 1;
+      // "Paid" / "Payment successful" just above it, or paise ("25.00"), make it the payment's amount.
+      const statusAbove = /\b(paid|paid successfully|payment successful|successful|success|sent|received|debited|completed|amount)\W*$/i.test(lines[index - 1] || "");
+      const paise = /\.\d{2}$/.test(raw);
       if (!accountSuffix && !year && !iconNoise && digits.length <= 6) {
-        if (big[1]) add(value, 2.5);
+        if (big[1]) add(value, statusAbove ? 3.5 : 2.5);
         else {
-          add(value, 1);
+          add(value, statusAbove ? 3 : paise ? 1.5 : 1);
           add(withoutMisreadRupee(raw), 0.5);
         }
       }
@@ -328,17 +341,38 @@ function looksLikeRupee(grid) {
     && grid[0][1] + grid[0][2] > 1.0; // bar across the top
 }
 
+// Whether the text in this box is light on dark (white on a green BHIM banner in an otherwise
+// white screenshot): decided by the pixels just around the word, not by the whole screenshot.
+async function isLightInk(image, bbox) {
+  const meta = await sharp(image).metadata();
+  const pad = 6;
+  const left = Math.max(0, bbox.x0 - pad);
+  const top = Math.max(0, bbox.y0 - pad);
+  const width = Math.min(meta.width, bbox.x1 + pad) - left;
+  const height = Math.min(meta.height, bbox.y1 + pad) - top;
+  const { data, info } = await sharp(image).extract({ left, top, width, height }).greyscale().raw().toBuffer({ resolveWithObject: true });
+  let sum = 0;
+  let count = 0;
+  for (let y = 0; y < info.height; y += 1) {
+    for (let x = 0; x < info.width; x += 1) {
+      if (y >= pad && y < info.height - pad && x >= pad && x < info.width - pad) continue;
+      sum += data[(y * info.width + x) * info.channels];
+      count += 1;
+    }
+  }
+  return count > 0 && sum / count < 128;
+}
+
 // Numbers in one OCR reading whose first "digit" is really ₹: { "325" → "₹25" }.
 async function rupeeFixes(image, data) {
   const fixes = new Map();
-  const { channels } = await sharp(image).stats();
-  const lightInk = channels[0].mean < 128;
   for (const block of data.blocks || []) {
     for (const paragraph of block.paragraphs || []) {
       for (const line of paragraph.lines || []) {
         for (const word of line.words || []) {
           const text = String(word.text || "");
           if (!/^[237][\d,]*\d(?:\.\d{1,2})?$/.test(text) || (word.symbols || []).length < 2) continue;
+          const lightInk = await isLightInk(image, word.bbox).catch(() => false);
           if (looksLikeRupee(await inkGrid(image, word.symbols[0].bbox, lightInk).catch(() => null))) fixes.set(text, `₹${text.slice(1)}`);
         }
       }
@@ -435,8 +469,18 @@ export async function readUpiImage(buffer) {
   }
   const [first, second] = passes.map((data) => parseUpiText(data.text));
   const result = Object.fromEntries(Object.entries(first).map(([key, value]) => [key, (Array.isArray(value) ? value.length : value != null) ? value : second[key]]));
-  // The amount is voted on across both readings (see voteAmount).
-  const vote = voteAmount(passes.map((pass) => applyFixes(pass.text, fixes)));
+  // The amount is voted on across the readings (see voteAmount). If it's still unclear, the
+  // screenshot is read once more for white text on a coloured banner.
+  let vote = voteAmount(passes.map((pass) => applyFixes(pass.text, fixes)));
+  if (vote.uncertain || vote.amount == null) {
+    const banner = await prepareBannerImage(buffer).catch(() => null);
+    if (banner) {
+      const { data } = await worker.recognize(banner, {}, { text: true, blocks: true });
+      passes.push(data);
+      for (const [wrong, right] of await rupeeFixes(banner, data).catch(() => new Map())) fixes.set(wrong, right);
+      vote = voteAmount(passes.map((pass) => applyFixes(pass.text, fixes)));
+    }
+  }
   result.amount = vote.amount;
   result.amount_uncertain = vote.uncertain;
   result.amount_options = vote.options;
