@@ -35,7 +35,10 @@ export async function ensureUpiScanColumns(database) {
       ADD COLUMN IF NOT EXISTS upi_scan JSONB,
       ADD COLUMN IF NOT EXISTS upi_utr TEXT,
       ADD COLUMN IF NOT EXISTS screenshot_upi_id TEXT,
-      ADD COLUMN IF NOT EXISTS upi_scanned_at TIMESTAMPTZ
+      ADD COLUMN IF NOT EXISTS upi_scanned_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS payments JSONB,
+      ADD COLUMN IF NOT EXISTS product_received BOOLEAN,
+      ADD COLUMN IF NOT EXISTS charged_times INTEGER
   `);
   await db.query("CREATE INDEX IF NOT EXISTS tickets_upi_utr_idx ON tickets (upi_utr)");
 }
@@ -448,7 +451,10 @@ async function buildFlags(ticket, result) {
   if (typed.includes("@") && result.payer_upi && !matchesTyped) flags.push(`Customer typed UPI ID ${typed}, screenshot shows ${result.payer_upi}.`);
   if (result.utr) {
     const duplicate = await db.query(
-      "SELECT id, phone FROM tickets WHERE upi_utr = $1 AND id <> $2 ORDER BY id LIMIT 3",
+      `SELECT id, phone FROM tickets
+       WHERE id <> $2 AND (upi_utr = $1
+         OR EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(payments, '[]'::jsonb)) p WHERE p->>'utr' = $1))
+       ORDER BY id LIMIT 3`,
       [result.utr, ticket.id]
     );
     if (duplicate.rows.length) flags.push(`Same transaction already used in ticket ${duplicate.rows.map((row) => `#${row.id} (${row.phone})`).join(", ")}.`);
@@ -489,7 +495,9 @@ export async function readUpiImage(buffer) {
 
 async function scanNow(ticketId) {
   const { rows } = await db.query(
-    "SELECT id, phone, upi_id, upi_image, refund_amount::text AS refund_amount, upi_scan->>'amount' AS old_amount FROM tickets WHERE id = $1",
+    `SELECT id, phone, upi_id, upi_image, refund_amount::text AS refund_amount, upi_scan->>'amount' AS old_amount,
+       jsonb_array_length(COALESCE(payments, '[]'::jsonb)) AS payment_count
+     FROM tickets WHERE id = $1`,
     [ticketId]
   );
   const ticket = rows[0];
@@ -517,8 +525,9 @@ async function scanNow(ticketId) {
   // The amount paid also becomes the refund amount when nobody has set one yet (editable on the
   // dashboard), but only when the reading is sure. A refund amount that an earlier reading
   // filled in (it still equals that reading) follows the new reading; one a person typed is kept.
+  // "Charged more than once" tickets have several payments: their refund is worked out from all of them.
   const current = Number(String(ticket.refund_amount || "").trim() || 0);
-  const autoFilled = !current || (ticket.old_amount != null && current === Number(ticket.old_amount));
+  const autoFilled = !ticket.payment_count && (!current || (ticket.old_amount != null && current === Number(ticket.old_amount)));
   const newRefund = result.amount != null && !result.amount_uncertain ? String(result.amount) : null;
   const saveScan = () => db.query(
     `UPDATE tickets SET upi_scan = $1, upi_utr = $2, screenshot_upi_id = $3, upi_scanned_at = NOW(),
@@ -568,6 +577,7 @@ export async function readMissedScreenshots(limit = 40) {
       `UPDATE tickets SET refund_amount = (upi_scan->>'amount')::numeric
        WHERE upi_scan->>'amount' ~ '^[0-9]+(\\.[0-9]+)?$' AND COALESCE(NULLIF(refund_amount::text, '')::numeric, 0) = 0
          AND COALESCE(upi_scan->>'amount_uncertain', 'false') <> 'true'
+         AND jsonb_array_length(COALESCE(payments, '[]'::jsonb)) = 0
        RETURNING id`
     ).catch((err) => { console.log("REFUND AMOUNT FILL SKIPPED:", err.message); return { rows: [] }; });
     if (filled.rows.length) console.log(`💰 Refund amount filled from screenshots on ${filled.rows.length} ticket(s)`);

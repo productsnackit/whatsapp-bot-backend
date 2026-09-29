@@ -32,6 +32,7 @@ import { registerTicketCleanupRoutes } from "./ticketCleanup.js";
 import { ensureSiteMatching, matchSite, registerSiteRoutes } from "./siteMatcher.js";
 import { ensureTicketWatch, addTicketWatch, alertOverdueTickets, fingerprintMissedScreenshots, registerTicketWatchRoutes } from "./ticketWatch.js";
 import { ensureTicketChatSchema, registerTicketChatRoutes, storeIncomingMedia, saveTicketMessage, applyStatusUpdates } from "./ticketChat.js";
+import { CHARGED_MORE_THAN_ONCE, PRODUCT_QUESTION, COUNT_QUESTION, paymentPrompt, parseChargeCount, extractTransactionIds, paymentId, refundFor, receivedMessage, doneMessage, mergePayments } from "./multiPayment.js";
 
 /* ================= CLOUDINARY ================= */
 cloudinary.config({
@@ -650,7 +651,7 @@ function getRefundStage(value, state, currentStage = "RAISED") {
   const normalized = String(value || "").toLowerCase();
   if (["refunded", "auto_refunded", "resolved", "closed"].includes(normalized)) return "PROCESSED";
   if (state === "DONE" || normalized === "processing") return "UNDER_REVIEW";
-  if (["STEP1", "STEP2", "STEP2_RETRY", "STEP3", "EXP_IMG", "EXP_UPI", "EXP_UPI_IMG", "PRICE_IMG", "PRICE_UPI", "PRICE_UPI_IMG", "DAM_IMG", "DAM_UPI", "DAM_UPI_IMG"].includes(state)) return "VERIFYING";
+  if (["STEP1", "STEP2", "STEP2_RETRY", "STEP3", "EXP_IMG", "EXP_UPI", "EXP_UPI_IMG", "PRICE_IMG", "PRICE_UPI", "PRICE_UPI_IMG", "DAM_IMG", "DAM_UPI", "DAM_UPI_IMG", "MULTI_PRODUCT", "MULTI_COUNT", "MULTI_PAY"].includes(state)) return "VERIFYING";
   return currentStage || "RAISED";
 }
 
@@ -732,7 +733,8 @@ async function isDuplicateTransaction(transactionId, ticketId) {
   const result = await db.query(
     `SELECT id FROM tickets
      WHERE id <> $1
-       AND (upi_id = $2 OR paytm_transaction_id = $2)
+       AND (upi_id = $2 OR paytm_transaction_id = $2
+         OR EXISTS (SELECT 1 FROM jsonb_array_elements(COALESCE(payments, '[]'::jsonb)) p WHERE p->>'utr' = $2 OR p->>'app_id' = $2))
        AND LOWER(COALESCE(status, '')) NOT IN ('closed', 'auto_closed')
      LIMIT 1`,
     [ticketId, transactionId]
@@ -758,7 +760,14 @@ async function readPaymentScreenshot(mediaUrl) {
   try {
     const file = await axios.get(uploaded, { responseType: "arraybuffer", timeout: 20000 });
     const { result } = await readUpiImage(Buffer.from(file.data));
-    return { url: uploaded, utr: result.utr || null };
+    return {
+      url: uploaded,
+      utr: result.utr || null,
+      app_id: result.app_txn_id || null,
+      app: result.app || null,
+      amount: result.amount ?? null,
+      amount_uncertain: Boolean(result.amount_uncertain),
+    };
   } catch (err) {
     console.log("PAYMENT SCREENSHOT READ ERROR:", err.message);
     return { url: uploaded, utr: null };
@@ -803,6 +812,102 @@ async function finishWithTypedId({ ticketId, from, transactionId, doneMessage })
   const verified = await checkPaytm(ticketId, transactionId, from);
   await updateTicket(ticketId, { upi_id: transactionId, transaction_verified: verified, state: "DONE", status: "PROCESSING" });
   return sendWhatsApp(from, doneMessage);
+}
+
+/* ---------- Charged more than once (see multiPayment.js) ---------- */
+
+// One customer's payments are added one message at a time, so two screenshots sent together are both kept.
+const paymentLocks = new Map();
+function withTicketLock(ticketId, task) {
+  const next = (paymentLocks.get(ticketId) || Promise.resolve()).catch(() => {}).then(task);
+  paymentLocks.set(ticketId, next);
+  next.catch(() => {}).finally(() => { if (paymentLocks.get(ticketId) === next) paymentLocks.delete(ticketId); });
+  return next;
+}
+
+async function paymentUsedElsewhere(ids, ticketId) {
+  for (const id of ids) if (await isDuplicateTransaction(id, ticketId)) return true;
+  return false;
+}
+
+const customerPhone = (phone) => (phone && !String(phone).startsWith("91") ? `91${phone}` : phone);
+
+// Submits the ticket with the payments sent so far; the refund amount is filled in when every amount is clear.
+async function finishChargedPayments(ticket, to, { idle = false } = {}) {
+  const payments = ticket.payments || [];
+  const withId = payments.find((payment) => paymentId(payment));
+  const withImage = payments.find((payment) => payment.image);
+  const refund = refundFor(payments, ticket.product_received);
+  await updateTicket(ticket.id, {
+    upi_id: withId ? paymentId(withId) : null,
+    ...(withImage ? { upi_image: withImage.image } : {}),
+    ...(refund != null ? { refund_amount: refund } : {}),
+    state: "DONE",
+    status: "PROCESSING",
+  });
+  return sendWhatsApp(to, doneMessage(payments, ticket.product_received, { idle }));
+}
+
+// A message at the "send payment k of n" step, or a payment sent after the ticket was submitted.
+async function handleChargedPayment({ ticketId, from, text, isImage, mediaUrl, mediaType }) {
+  if (isVideo(mediaType)) return sendWhatsApp(from, "❌ Please send an *IMAGE* (screenshot), not a video.");
+  const incoming = { typed: extractTransactionIds(text) };
+  if (isImage && mediaUrl) {
+    await sendWhatsApp(from, "⏳ Reading your payment screenshot...");
+    const read = await readPaymentScreenshot(mediaUrl);
+    if (!read) return sendWhatsApp(from, "❌ Upload failed. Please send the screenshot again.");
+    incoming.screenshot = { utr: read.utr, app_id: read.app_id, app: read.app, amount: read.amount, amount_uncertain: read.amount_uncertain, image: read.url, source: "screenshot" };
+  }
+  const finished = /^(done|finish(ed)?|submit|no more|that'?s all|thats all)[.!]?$/i.test(String(text || "").trim());
+
+  return withTicketLock(ticketId, async () => {
+    const ticket = (await db.query("SELECT * FROM tickets WHERE id = $1", [ticketId])).rows[0];
+    if (!ticket) return null;
+    if (isClosedTicket(ticket)) return sendWhatsApp(from, "Your previous ticket is closed. Reply with 1 to start a new request, or type menu to see the available options.");
+    const late = ticket.state !== "MULTI_PAY";
+    const total = Number(ticket.charged_times) || 2;
+    const withIds = (list) => (list || []).filter((payment) => paymentId(payment)).length;
+
+    if (!incoming.screenshot && !incoming.typed.length) {
+      if (late) return sendWhatsApp(from, "✅ Your ticket is already raised. Our team will assist you shortly.");
+      if (finished) {
+        if (!(ticket.payments || []).length) return sendWhatsApp(from, `Please send at least one payment first.\n\n${paymentPrompt(1, total)}`);
+        return finishChargedPayments(ticket, from);
+      }
+      return sendWhatsApp(from, `❌ Please send the screenshot of the payment, or type its transaction ID.\n\n${paymentPrompt(withIds(ticket.payments) + 1, total)}`);
+    }
+
+    const merged = await mergePayments(ticket.payments, incoming, (ids) => paymentUsedElsewhere(ids, ticketId));
+    if (merged.added) {
+      await db.query("UPDATE tickets SET payments = $2, updated_at = NOW() WHERE id = $1", [ticketId, JSON.stringify(merged.payments)]);
+      ticketsChanged();
+    }
+    const notes = merged.notes.length ? `${merged.notes.join("\n")}\n\n` : "";
+    const askForId = "We saved your screenshot, but couldn't read the transaction ID clearly.\n\nPlease type the transaction ID (UTR / UPI Ref No.) shown on it.";
+
+    if (late) {
+      if (!merged.added) return sendWhatsApp(from, notes.trim() || "✅ Your ticket is already raised. Our team will assist you shortly.");
+      // The refund amount follows the added payment, unless someone on the team typed a different one.
+      const before = refundFor(ticket.payments, ticket.product_received);
+      const after = refundFor(merged.payments, ticket.product_received);
+      const current = Number(ticket.refund_amount) || 0;
+      const changes = {};
+      if (after != null && (!current || current === before)) changes.refund_amount = after;
+      if (!ticket.upi_image && merged.added.image) changes.upi_image = merged.added.image;
+      if (Object.keys(changes).length) await updateTicket(ticketId, changes);
+      return sendWhatsApp(from, `${notes}✅ This payment has been added to your ticket.${merged.needsId ? `\n\n${askForId}` : ""}`);
+    }
+
+    if (merged.needsId) return sendWhatsApp(from, `${notes}${askForId}`);
+    const count = withIds(merged.payments);
+    if (count >= total) {
+      if (notes) await sendWhatsApp(from, notes.trim());
+      return finishChargedPayments({ ...ticket, payments: merged.payments }, from);
+    }
+    if (!merged.added) return sendWhatsApp(from, `${notes}${paymentPrompt(count + 1, total)}`);
+    const received = count - withIds(ticket.payments) > 1 ? `✅ ${count} of ${total} payments received.` : receivedMessage(merged.added, count);
+    return sendWhatsApp(from, `${notes}${received}\n\n${paymentPrompt(count + 1, total)}`);
+  });
 }
 
 const DONE_REFUND = `✅ *TICKET SUBMITTED SUCCESSFULLY!*
@@ -861,8 +966,9 @@ What's your refund issue?
 2️⃣ Product Issue
 3️⃣ Charged Higher Price
 4️⃣ Received Damaged Product
+5️⃣ Charged More Than Once
 
-Please reply with the number (1-4)`;
+Please reply with the number (1-5)`;
 const AUTO_CLOSE_TICKET_MINUTES = 5; // Auto-close after 5 minutes of inactivity
 
 function isPaytmVerificationEnabled() {
@@ -919,6 +1025,17 @@ async function autoCloseInactiveTickets() {
     );
 
     for (const ticket of result.rows) {
+      // "Charged more than once": finding every payment takes time, so after 30 quiet minutes the
+      // payments already sent are submitted instead of the ticket being closed.
+      if (ticket.state === "MULTI_PAY" && (ticket.payments || []).length) {
+        const quietMinutes = (Date.now() - new Date(ticket.last_customer_message_at || ticket.updated_at).getTime()) / 60000;
+        if (quietMinutes < Math.max(30, closeMinutes)) continue;
+        await withTicketLock(ticket.id, async () => {
+          const fresh = (await db.query("SELECT * FROM tickets WHERE id = $1", [ticket.id])).rows[0];
+          if (fresh?.state === "MULTI_PAY") await finishChargedPayments(fresh, customerPhone(fresh.phone), { idle: true });
+        }).catch((err) => console.log("CHARGED PAYMENTS SUBMIT ERROR:", err.message));
+        continue;
+      }
       await closeInactiveTicket(ticket);
     }
   } catch (err) {
@@ -1035,6 +1152,10 @@ async function processMessage(jobData) {
 
     // Already closed or done states
     if (state === "DONE") {
+      // "Charged more than once": a payment sent after the ticket was submitted is still added to it.
+      if (subIssue === CHARGED_MORE_THAN_ONCE && (isImage || extractTransactionIds(text).length)) {
+        return handleChargedPayment({ ticketId, from, text, isImage, mediaUrl, mediaType });
+      }
       return sendWhatsApp(
         from,
         "✅ Your ticket is already raised. Our team will assist you shortly."
@@ -1164,12 +1285,13 @@ If the amount is not refunded, reply with *1* to raise a ticket.`
           "2": "Product Issue",
           "3": "Charged Higher MRP",
           "4": "Received Damaged Product",
+          "5": CHARGED_MORE_THAN_ONCE,
         };
 
         if (!map[message]) {
           return sendWhatsApp(
             from,
-            `❌ Invalid choice. Please reply with *1*, *2*, *3*, or *4* only.`
+            `❌ Invalid choice. Please reply with *1*, *2*, *3*, *4*, or *5* only.`
           );
         }
 
@@ -2145,6 +2267,45 @@ Thank you for your patience!`
           );
         }
       }
+
+      // CHARGED MORE THAN ONCE (see multiPayment.js)
+      if (subIssue === CHARGED_MORE_THAN_ONCE) {
+        if (state === "LOCATION") {
+          if (!text || text.length < 5) {
+            return sendWhatsApp(from, `❌ Please provide a valid location. Include store name and city.`);
+          }
+          await updateTicket(ticketId, { location: text, state: "MULTI_PRODUCT" });
+          return sendWhatsApp(from, PRODUCT_QUESTION);
+        }
+
+        if (state === "MULTI_PRODUCT") {
+          const gotProduct = message === "1" || /^yes\b/.test(message) ? true : message === "2" || /^no\b/.test(message) ? false : null;
+          if (gotProduct === null) return sendWhatsApp(from, `❌ Invalid option. Please reply with *1* or *2* only.`);
+          await updateTicket(ticketId, { product_received: gotProduct, state: "MULTI_COUNT" });
+          return sendWhatsApp(from, COUNT_QUESTION);
+        }
+
+        if (state === "MULTI_COUNT") {
+          // A screenshot straight away: taken as the first of two payments.
+          if (isImage) {
+            await updateTicket(ticketId, { charged_times: 2, payments: "[]", state: "MULTI_PAY" });
+            return handleChargedPayment({ ticketId, from, text, isImage, mediaUrl, mediaType });
+          }
+          const count = parseChargeCount(text);
+          if (count === 1) {
+            return sendWhatsApp(from, `This option is for payments charged more than once. If you were charged only once, type *restart* and choose the issue that matches.
+
+Otherwise, reply with the number of times you were charged, e.g. *2*`);
+          }
+          if (!count || count > 10) return sendWhatsApp(from, `❌ Please reply with a number from 2 to 10, e.g. *2*`);
+          await updateTicket(ticketId, { charged_times: count, payments: "[]", state: "MULTI_PAY" });
+          return sendWhatsApp(from, paymentPrompt(1, count));
+        }
+
+        if (state === "MULTI_PAY") {
+          return handleChargedPayment({ ticketId, from, text, isImage, mediaUrl, mediaType });
+        }
+      }
     }
 
     // ===== PRODUCT ENQUIRY LOGIC =====
@@ -2424,6 +2585,9 @@ app.get("/tickets", auth, async (req, res) => {
         site_name,
         site_match,
         upi_utr,
+        payments,
+        product_received,
+        charged_times,
         images_deleted_at,
         screenshot_upi_id,
         refund_amount,

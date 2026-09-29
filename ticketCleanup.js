@@ -15,7 +15,7 @@ export function registerTicketCleanupRoutes(app, { auth, db, onChanged }) {
 
   async function find(key) {
     const { rows: tickets } = await db.query(
-      `SELECT id, created_at, status, state, sub_issue, location, image, upi_image FROM tickets WHERE ${SAME_NUMBER} ORDER BY id DESC`,
+      `SELECT id, created_at, status, state, sub_issue, location, image, upi_image, payments FROM tickets WHERE ${SAME_NUMBER} ORDER BY id DESC`,
       [key]
     );
     const ids = tickets.map((ticket) => ticket.id);
@@ -23,7 +23,7 @@ export function registerTicketCleanupRoutes(app, { auth, db, onChanged }) {
       db.query("SELECT COUNT(*)::int AS n, ARRAY_REMOVE(ARRAY_AGG(media_url), NULL) AS media FROM messages WHERE ticket_id = ANY($1)", [ids]),
       db.query(`SELECT COUNT(*)::int AS n FROM feedback WHERE ticket_id = ANY($2) OR ${SAME_NUMBER}`, [key, ids]).catch(() => ({ rows: [{ n: 0 }] })),
     ]);
-    const photos = [...tickets.flatMap((ticket) => [ticket.image, ticket.upi_image]), ...(messages.rows[0].media || [])].filter((url) => /^https?:\/\//.test(url || ""));
+    const photos = [...new Set([...tickets.flatMap((ticket) => [ticket.image, ticket.upi_image, ...(ticket.payments || []).map((payment) => payment.image)]), ...(messages.rows[0].media || [])])].filter((url) => /^https?:\/\//.test(url || ""));
     return { tickets, ids, messages: messages.rows[0].n, feedback: feedback.rows[0].n, photos };
   }
 
@@ -35,7 +35,7 @@ export function registerTicketCleanupRoutes(app, { auth, db, onChanged }) {
       const found = await find(key);
       res.json({
         phone: key,
-        tickets: found.tickets.map(({ image, upi_image: upiImage, ...ticket }) => ticket),
+        tickets: found.tickets.map(({ image, upi_image: upiImage, payments, ...ticket }) => ticket),
         messages: found.messages,
         feedback: found.feedback,
         photos: found.photos.length,

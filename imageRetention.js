@@ -75,7 +75,7 @@ export async function destroyFiles(urls) {
 async function cleanTickets(days) {
   if (!days) return { tickets: 0, files: 0 };
   const { rows } = await db.query(
-    `SELECT id, image, upi_image FROM tickets
+    `SELECT id, image, upi_image, payments FROM tickets
      WHERE images_deleted_at IS NULL
        AND (image IS NOT NULL OR upi_image IS NOT NULL)
        AND (UPPER(COALESCE(state, '')) = 'CLOSED' OR LOWER(COALESCE(status, '')) = ANY($1))
@@ -86,9 +86,16 @@ async function cleanTickets(days) {
   let files = 0;
   for (const ticket of rows) {
     const media = await db.query("SELECT id, media_url FROM messages WHERE ticket_id = $1 AND media_url IS NOT NULL", [ticket.id]);
-    const urls = [ticket.image, ticket.upi_image, ...media.rows.map((row) => row.media_url)].filter(Boolean);
+    // "Charged more than once" tickets keep a screenshot for each payment too.
+    const paymentImages = (ticket.payments || []).map((payment) => payment.image);
+    const urls = [...new Set([ticket.image, ticket.upi_image, ...paymentImages, ...media.rows.map((row) => row.media_url)].filter(Boolean))];
     files += await destroyFiles(urls);
-    await db.query("UPDATE tickets SET image = NULL, upi_image = NULL, images_deleted_at = NOW() WHERE id = $1", [ticket.id]);
+    await db.query(
+      `UPDATE tickets SET image = NULL, upi_image = NULL, images_deleted_at = NOW(),
+         payments = (SELECT jsonb_agg(p - 'image') FROM jsonb_array_elements(payments) p)
+       WHERE id = $1`,
+      [ticket.id]
+    );
     await db.query("UPDATE messages SET media_url = NULL, media_deleted_at = NOW() WHERE ticket_id = $1 AND media_url IS NOT NULL", [ticket.id]);
   }
   return { tickets: rows.length, files };
