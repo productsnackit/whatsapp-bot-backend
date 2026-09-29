@@ -26,7 +26,7 @@ const IDLE_MS = 5 * 60 * 1000;
 // Told when a screenshot has been read, so open dashboards refresh the tickets list.
 let scanListener = null;
 // Bumped when the reader gets better; open tickets read by an older version are read again.
-const SCAN_VERSION = 2;
+const SCAN_VERSION = 3;
 
 export async function ensureUpiScanColumns(database) {
   db = database;
@@ -106,12 +106,45 @@ function roleOf(lines, index) {
   return fromAt > toAt ? "payer" : "payee";
 }
 
-function findUtr(text) {
-  const joined = text.replace(/(\d)[ ](?=\d)/g, "$1");
-  const labelled = joined.match(/(?:utr|upi\s*ref(?:erence)?(?:\s*(?:no|number|id))?|upi\s*transaction\s*id|transaction\s*id|txn\s*id|ref(?:erence)?\s*(?:no|number)|rrn)[\s.:#-]*\n?\s*([0-9]{12})\b/i);
-  if (labelled) return labelled[1];
-  const bare = joined.match(/(?<![0-9])([0-9]{12})(?![0-9])/);
-  return bare ? bare[1] : null;
+/* ---------- Transaction IDs ----------
+   Every UPI payment has a 12-digit UPI reference (UTR / RRN), which banks use; each app
+   labels it its own way. Apps also show their own ID in their own format. Both are kept:
+     PhonePe:    "UTR: 320611846360"             · "PhonePe Transaction ID: T2609291346455865133796"
+     Paytm:      "UPI Ref No: 627262914457"      · sometimes "Order ID" / "Transaction ID" (long number)
+     Google Pay: "UPI transaction ID: 66310…"    · "Google transaction ID: CICAgPii0sS80g"      */
+const UTR_LABEL = String.raw`(?:\bu[t1il]r\b(?:\s*(?:no|number))?|upi\s*ref(?:erence)?\.?(?:\s*(?:no|number|id))?|upi\s*transaction\s*id|\brrn\b|bank\s*ref(?:erence)?\.?(?:\s*(?:no|number))?)`;
+const OTHER_ID_LABEL = String.raw`(?:transaction\s*id|txn\s*id|ref(?:erence)?\.?\s*(?:no|number))`;
+const TWELVE = String.raw`[\s.:#-]*\n?\s*([0-9]{12})(?![0-9])`;
+
+export function findIds(text, app) {
+  // "3206 1184 6360" → "320611846360"
+  const joined = String(text || "").replace(/(\d)[ ](?=\d)/g, "$1");
+  const utr = joined.match(new RegExp(UTR_LABEL + TWELVE, "i"))?.[1]
+    || joined.match(new RegExp(OTHER_ID_LABEL + TWELVE, "i"))?.[1]
+    || joined.match(/(?<![0-9A-Za-z])([0-9]{12})(?![0-9])/)?.[1]
+    || null;
+
+  let appId = null;
+  let appLabel = null;
+  // PhonePe: T + 22 digits, e.g. T2609291346455865133796 (OCR may read the T as 7, 1 or I, or drop it).
+  const phonepe = joined.match(/phone\s*pe\s*transaction\s*id[\s:]*\n?\s*([T7I1l]?\d{21,23})\b/i) || joined.match(/\b(T\d{21,23})\b/);
+  if (phonepe) {
+    const raw = phonepe[1];
+    appId = /^[T7I1l]\d{22}$/.test(raw) ? `T${raw.slice(1)}` : /^\d{22}$/.test(raw) ? `T${raw}` : raw;
+    appLabel = "PhonePe transaction ID";
+  }
+  const google = !appId && joined.match(/google\s*transaction\s*id[\s:]*\n?\s*([A-Za-z0-9]{10,24})\b/i);
+  if (google) {
+    appId = google[1];
+    appLabel = "Google transaction ID";
+  }
+  // Paytm and others: a long order / transaction ID that isn't the 12-digit UPI reference.
+  const other = !appId && joined.match(/(?:order\s*id|paytm\s*transaction\s*id|transaction\s*id|txn\s*id)[\s.:#-]*\n?\s*([A-Za-z0-9]{14,32})\b/i);
+  if (other && other[1] !== utr) {
+    appId = other[1];
+    appLabel = `${app || "App"} ${/order/i.test(other[0]) ? "order ID" : "transaction ID"}`;
+  }
+  return { utr, app_txn_id: appId, app_txn_label: appLabel };
 }
 
 /* ---------- Amount ----------
@@ -125,6 +158,51 @@ const RUPEE = "(₹|rs\\.?|inr|[rzxft%<&$€£¥?])";
 const NUMBER = "(\\d{1,3}(?:,\\d{2,3})+(?:\\.\\d{1,2})?|\\d{1,6}(?:\\.\\d{1,2})?)";
 // Most vending purchases are small; a bigger amount is shown but always checked by a person.
 const MAX_PLAUSIBLE_AMOUNT = Number(process.env.UPI_MAX_AMOUNT) || 2000;
+
+// "Rupees Twenty Five Only" (Paytm and others print the amount in words too).
+const NUMBER_WORDS = {
+  zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10,
+  eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15, sixteen: 16, seventeen: 17, eighteen: 18, nineteen: 19,
+  twenty: 20, thirty: 30, forty: 40, fourty: 40, fifty: 50, sixty: 60, seventy: 70, eighty: 80, ninety: 90,
+};
+const SCALE_WORDS = { hundred: 100, thousand: 1000, lakh: 100000, lakhs: 100000 };
+function editDistanceSmall(a, b) {
+  const row = Array.from({ length: b.length + 1 }, (_, index) => index);
+  for (let i = 1; i <= a.length; i += 1) {
+    let diagonal = row[0];
+    row[0] = i;
+    for (let j = 1; j <= b.length; j += 1) {
+      const above = row[j];
+      row[j] = Math.min(row[j] + 1, row[j - 1] + 1, diagonal + (a[i - 1] === b[j - 1] ? 0 : 1));
+      diagonal = above;
+    }
+  }
+  return row[b.length];
+}
+function closeWord(word, list) {
+  if (list[word] !== undefined) return word;
+  if (word.length < 4) return null;
+  // One OCR slip allowed: "flve", "twentv".
+  return Object.keys(list).find((known) => Math.abs(known.length - word.length) <= 1 && editDistanceSmall(known, word) <= 1) || null;
+}
+export function amountFromWords(text) {
+  const match = String(text || "").match(/\brupees?\b([a-z\s-]{3,120}?)\bonly\b/i);
+  if (!match) return null;
+  let total = 0;
+  let current = 0;
+  let seen = false;
+  for (const raw of match[1].toLowerCase().split(/[\s-]+/).filter(Boolean)) {
+    if (raw === "and") continue;
+    const number = closeWord(raw, NUMBER_WORDS);
+    const scale = !number && closeWord(raw, SCALE_WORDS);
+    if (number) { current += NUMBER_WORDS[number]; seen = true; }
+    else if (scale === "hundred") { current = (current || 1) * 100; seen = true; }
+    else if (scale) { total += (current || 1) * SCALE_WORDS[scale]; current = 0; seen = true; }
+    else if (raw === "paise" || raw === "paisa") break;
+    else return null; // a word we don't understand: don't guess
+  }
+  return seen ? total + current : null;
+}
 
 function amountValue(raw) {
   const value = Number(String(raw || "").replace(/,/g, ""));
@@ -144,7 +222,12 @@ function amountVotes(text) {
   const add = (value, weight) => { if (value != null) votes.push({ value, weight }); };
   const phrase = new RegExp(`\\b(?:payment of|amount paid|you paid|paid|amount|debited|sent|total)\\b\\s*:?\\s*${RUPEE}?\\s?${NUMBER}(?![\\d:])(?!\\s*(?:${MONTHS}|am\\b|pm\\b|%))`, "i");
   const realRupee = new RegExp(`(?:₹|\\brs\\.?|\\binr)\\s?${NUMBER}(?![\\d:])`, "gi");
-  const alone = new RegExp(`^${RUPEE}?\\s?${NUMBER}$`, "i");
+  // The big amount on its own line; icons beside it (a tick badge read as "&", "©", "@") are allowed.
+  const alone = new RegExp(`^${RUPEE}?\\s?${NUMBER}(?:\\s+(?:[^\\w\\s]{1,3}|[a-z]))?$`, "i");
+
+  // The amount in words is the most reliable reading there is.
+  const inWords = amountFromWords(lines.join(" "));
+  if (inWords) add(amountValue(String(inWords)), 4);
 
   lines.forEach((line, index) => {
     // "Payment of ₹25 completed", "Paid ₹25", "Amount: ₹25", "₹25 debited".
@@ -167,7 +250,9 @@ function amountVotes(text) {
       // Not an amount: account suffixes ("0548", or 4 digits under the bank's name) and years.
       const accountSuffix = /^0/.test(raw) || (digits.length === 4 && /\bbank\b/i.test(lines[index - 1] || ""));
       const year = !big[1] && value >= 2000 && value <= 2100 && Number.isInteger(value);
-      if (!accountSuffix && !year && digits.length <= 6) {
+      // A lone single digit is usually an icon read as text, not an amount.
+      const iconNoise = !big[1] && digits.length === 1;
+      if (!accountSuffix && !year && !iconNoise && digits.length <= 6) {
         if (big[1]) add(value, 2.5);
         else {
           add(value, 1);
@@ -181,6 +266,16 @@ function amountVotes(text) {
 
 // texts: every OCR reading of the same screenshot.
 export function voteAmount(texts) {
+  // The amount in words, confirmed by the digits (the big "₹120 ✓" is often read as "31200"
+  // or "120@", which still contain 120), is certain whatever else was read.
+  const inWords = texts.map(amountFromWords).find(Boolean);
+  if (inWords) {
+    const digitRuns = texts.flatMap((text) => String(text || "").replace(/,/g, "").match(/\d+/g) || []);
+    // Only a number of about the same length confirms it (not a 12-digit UTR that happens to contain "5").
+    const confirms = (run) => run.includes(String(inWords)) && run.length <= String(inWords).length + 2;
+    if (digitRuns.some(confirms)) return { amount: inWords, uncertain: false, options: [inWords] };
+  }
+
   const totals = new Map();
   let all = 0;
   for (const text of texts) {
@@ -294,7 +389,7 @@ export function parseUpiText(text) {
   if (!payer) payer = upiIds.map((item) => item.id).find((id) => id !== payee) || null;
 
   return {
-    utr: findUtr(text),
+    ...findIds(text, APPS.find(([, pattern]) => pattern.test(text))?.[0] || null),
     amount: findAmount(lines),
     payer_upi: payer,
     upi_ids: upiIds.map((item) => item.id),
