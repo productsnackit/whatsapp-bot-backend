@@ -417,7 +417,7 @@ async function buildFlags(ticket, result) {
       "SELECT id, phone FROM tickets WHERE upi_utr = $1 AND id <> $2 ORDER BY id LIMIT 3",
       [result.utr, ticket.id]
     );
-    if (duplicate.rows.length) flags.push(`Same UTR already used in ticket ${duplicate.rows.map((row) => `#${row.id} (${row.phone})`).join(", ")}.`);
+    if (duplicate.rows.length) flags.push(`Same transaction already used in ticket ${duplicate.rows.map((row) => `#${row.id} (${row.phone})`).join(", ")}.`);
   }
   return flags;
 }
