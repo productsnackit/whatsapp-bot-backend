@@ -34,6 +34,7 @@ import { ensureTicketWatch, addTicketWatch, alertOverdueTickets, fingerprintMiss
 import { ensureTicketChatSchema, registerTicketChatRoutes, storeIncomingMedia, saveTicketMessage, applyStatusUpdates } from "./ticketChat.js";
 import { ensureCallLog, registerCallLogRoutes, handleCallLogWhatsApp } from "./callLog.js";
 import { ensureCapaOverdue, capaOverdueTick, registerCapaOverdueRoutes, handleCapaOverdueWhatsApp } from "./capaOverdue.js";
+import { ensureAttention, attentionReason, isExpectedAnswer, alertAdmins, registerAttentionRoutes } from "./attention.js";
 import { CHARGED_MORE_THAN_ONCE, PRODUCT_QUESTION, COUNT_QUESTION, paymentPrompt, parseChargeCount, extractTransactionIds, paymentId, refundFor, receivedMessage, doneMessage, mergePayments } from "./multiPayment.js";
 
 /* ================= CLOUDINARY ================= */
@@ -282,6 +283,7 @@ async function ensureSupportColumns() {
     `);
     await db.query("ALTER TABLE feedback ADD COLUMN IF NOT EXISTS ticket_id INTEGER REFERENCES tickets(id)");
     await ensureUpiScanColumns(db);
+    await ensureAttention(db);
     await ensureTicketChatSchema(db);
     await db.query(`
       INSERT INTO machines (name, location)
@@ -816,6 +818,33 @@ async function finishWithTypedId({ ticketId, from, transactionId, doneMessage })
   return sendWhatsApp(from, doneMessage);
 }
 
+/* ---------- Needs a person (see attention.js) ---------- */
+
+// Admin Mode (the bot stops replying), high priority, a "Needs attention" badge, and a
+// WhatsApp + push alert to the admins.
+async function handOffToAdmin(ticket, from, text, reason) {
+  const closed = isClosedTicket(ticket);
+  await updateTicket(ticket.id, {
+    takeover: true,
+    priority: "high",
+    status: "OPEN",
+    ...(closed ? { category: "MENU", state: "MENU", reopened_at: new Date() } : {}),
+    attention_at: new Date(),
+    attention_reason: reason,
+    attention_text: String(text || "").slice(0, 1000) || null,
+  });
+  console.log(`🔔 Ticket #${ticket.id} needs attention: ${reason}`);
+  sendPushToUsers(db, ["admin"], {
+    title: `Ticket #${ticket.id} needs attention`,
+    body: `${reason}${text ? `: "${text}"` : ""}`.slice(0, 180),
+    view: "tickets",
+    ticketId: String(ticket.id),
+    phone: from,
+  });
+  alertAdmins(ticket, text, reason).catch((err) => console.log("ATTENTION ALERT ERROR:", err.message));
+  return sendWhatsApp(from, "A support specialist will continue this conversation shortly. Please keep this chat open.");
+}
+
 /* ---------- Charged more than once (see multiPayment.js) ---------- */
 
 // One customer's payments are added one message at a time, so two screenshots sent together are both kept.
@@ -1116,11 +1145,6 @@ async function processMessage(jobData) {
     console.log("CATEGORY:", category);
     console.log("SUB ISSUE:", subIssue);
 
-    if (message === "agent" || message === "human" || message === "support") {
-      await updateTicket(ticketId, { takeover: true, priority: "high", status: "OPEN", state: state === "CLOSED" ? "MENU" : state });
-      return sendWhatsApp(from, "A support specialist will continue this conversation shortly. Please keep this chat open.");
-    }
-
     if (message === "menu" || message === "back") {
       await updateTicket(ticketId, { category: "MENU", state: "MENU", status: "OPEN", takeover: false });
       return sendWhatsApp(from, "Main menu\n\n1. Refund support\n2. Product enquiry\n3. Share feedback\n\nReply with 1, 2, or 3.");
@@ -1143,6 +1167,22 @@ async function processMessage(jobData) {
       console.log("Admin handling this chat");
       return;
     }
+
+    // No "talk to admin" option in the menus: the bot reads the message and hands the chat to the
+    // team when they ask for a person, are upset, or write something the options don't cover (see attention.js).
+    const choiceKey = getRetryKey(ticketId, `CHOICE-${category}-${state}`);
+    const reason = attentionReason({
+      category, state, text, isImage,
+      hasTransactionIds: extractTransactionIds(text).length > 0,
+      misses: getRetryCount(choiceKey),
+    });
+    if (reason) {
+      resetRetry(choiceKey);
+      return handOffToAdmin(existingTicket, from, text, reason);
+    }
+    const expected = isImage ? null : isExpectedAnswer(category, state, text);
+    if (expected === true) resetRetry(choiceKey);
+    else if (expected === false) incrementRetry(choiceKey);
 
         // Recover tickets stuck after max retries — otherwise these get zero replies forever
     if (["FAILED_STEP1", "FAILED_STEP2", "FAILED_STEP3"].includes(state)) {
@@ -2590,6 +2630,9 @@ app.get("/tickets", auth, async (req, res) => {
         payments,
         product_received,
         charged_times,
+        attention_at,
+        attention_reason,
+        attention_text,
         images_deleted_at,
         screenshot_upi_id,
         refund_amount,
@@ -3249,6 +3292,7 @@ registerPushRoutes(app, { db, auth });
 registerFindingsRoutes(app, { db, auth });
 registerCallLogRoutes(app, { auth });
 registerCapaOverdueRoutes(app, { auth });
+registerAttentionRoutes(app, { auth });
 registerExpiryRoutes(app, { db, auth });
 registerUpiScanRoutes(app, { auth, onScanned: () => ticketsChanged() });
 registerTicketChatRoutes(app, { db, auth });
