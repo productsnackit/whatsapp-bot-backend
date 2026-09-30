@@ -33,6 +33,7 @@ import { ensureSiteMatching, matchSite, registerSiteRoutes } from "./siteMatcher
 import { ensureTicketWatch, addTicketWatch, alertOverdueTickets, fingerprintMissedScreenshots, registerTicketWatchRoutes } from "./ticketWatch.js";
 import { ensureTicketChatSchema, registerTicketChatRoutes, storeIncomingMedia, saveTicketMessage, applyStatusUpdates } from "./ticketChat.js";
 import { ensureCallLog, registerCallLogRoutes, handleCallLogWhatsApp } from "./callLog.js";
+import { ensureCapaOverdue, capaOverdueTick, registerCapaOverdueRoutes } from "./capaOverdue.js";
 import { CHARGED_MORE_THAN_ONCE, PRODUCT_QUESTION, COUNT_QUESTION, paymentPrompt, parseChargeCount, extractTransactionIds, paymentId, refundFor, receivedMessage, doneMessage, mergePayments } from "./multiPayment.js";
 
 /* ================= CLOUDINARY ================= */
@@ -3247,6 +3248,7 @@ setCapaEscalationPush((payload) => sendPushToUsers(db, ["admin", ...global.inter
 registerPushRoutes(app, { db, auth });
 registerFindingsRoutes(app, { db, auth });
 registerCallLogRoutes(app, { auth });
+registerCapaOverdueRoutes(app, { auth });
 registerExpiryRoutes(app, { db, auth });
 registerUpiScanRoutes(app, { auth, onScanned: () => ticketsChanged() });
 registerTicketChatRoutes(app, { db, auth });
@@ -4688,6 +4690,10 @@ try {
   // Old photos are deleted from Cloudinary to stay within the free plan (see imageRetention.js).
   await ensureImageRetention(db).catch((err) => console.error("IMAGE CLEAN-UP SETUP ERROR:", err.message));
   await ensureCallLog(db, { onChange: () => io.emit("call-log-changed") }).catch((err) => console.error("CALL LOG SETUP ERROR:", err.message));
+  // CAPA tasks open for 24 hours: WhatsApp alert to Monish (Admin Settings), then a 10 am daily reminder.
+  await ensureCapaOverdue(db).catch((err) => console.error("CAPA OVERDUE SETUP ERROR:", err.message));
+  setInterval(capaOverdueTick, 5 * 60 * 1000);
+  setTimeout(capaOverdueTick, 90 * 1000);
   setTimeout(cleanOldImages, 5 * 60 * 1000);
   setInterval(cleanOldImages, 6 * 60 * 60 * 1000);
 } catch (err) {
