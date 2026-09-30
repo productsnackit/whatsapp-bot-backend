@@ -13,7 +13,7 @@ import { v2 as cloudinary } from "cloudinary";
 
 import { getOrCreateTicket, verifyPaymentOnPaytm, storePaytmVerification } from "./ticketService.js";
 import db from "./db.js";
-import { sendWhatsApp } from "./whatsapp.js";
+import { sendWhatsApp, sendWhatsAppTemplate } from "./whatsapp.js";
 import { registerAuditRoutes } from "./auditRoutes.js";
 import { registerPushRoutes, sendPushToUsers, pushUserKey } from "./pushNotifications.js";
 import { handleRefillerWhatsApp, setCapaEscalationPush } from "./refillerTasks.js";
@@ -27,7 +27,7 @@ import { registerAnalyticsOverview } from "./analyticsOverview.js";
 import { registerFindingsRoutes } from "./findingsRoutes.js";
 import { registerExpiryRoutes } from "./expiryRoutes.js";
 import { ensureUpiScanColumns, scanUpiScreenshot, registerUpiScanRoutes, readUpiImage, readMissedScreenshots } from "./upiScanner.js";
-import { ensureWhatsAppOutbox, applyOutboxStatuses, noteInbound } from "./whatsappOutbox.js";
+import { ensureWhatsAppOutbox, applyOutboxStatuses, noteInbound, refillerWindowOpen } from "./whatsappOutbox.js";
 import { registerTicketCleanupRoutes } from "./ticketCleanup.js";
 import { ensureSiteMatching, matchSite, registerSiteRoutes } from "./siteMatcher.js";
 import { ensureTicketWatch, addTicketWatch, alertOverdueTickets, fingerprintMissedScreenshots, registerTicketWatchRoutes } from "./ticketWatch.js";
@@ -2673,6 +2673,35 @@ app.get("/product-leads", auth, async (req, res) => {
 /* =========================================================
     TICKET ACTION
 ========================================================= */
+/* The status message for Refunded / Auto-refunded / Resolved / Closed. Within 24 hours of the
+   customer's last message it goes as a normal message (free); after that WhatsApp drops normal
+   messages, so the button's approved template goes instead (same text, with the ticket number).
+   Template names can be changed with env vars, e.g. TICKET_TEMPLATE_REFUNDED. Returns a note for
+   the dashboard when the customer may not get the message. */
+const STATUS_TEMPLATES = {
+  REFUNDED: process.env.TICKET_TEMPLATE_REFUNDED || "ticket_refunded",
+  AUTO_REFUNDED: process.env.TICKET_TEMPLATE_AUTO_REFUNDED || "ticket_auto_refunded",
+  RESOLVED: process.env.TICKET_TEMPLATE_RESOLVED || "ticket_resolved",
+  CLOSED: process.env.TICKET_TEMPLATE_CLOSED || "ticket_closed",
+};
+
+async function sendStatusMessage(phone, action, message, ticketId) {
+  if (await refillerWindowOpen(phone)) {
+    await sendWhatsApp(phone, message);
+    return "";
+  }
+  const name = STATUS_TEMPLATES[action];
+  const sent = await sendWhatsAppTemplate(phone, name, process.env.TICKET_TEMPLATE_LANG || "en", [String(ticketId)]);
+  if (sent.ok) {
+    console.log(`📨 Ticket #${ticketId}: customer outside 24 hours, sent template ${name}`);
+    return `The customer last messaged more than 24 hours ago, so the "${name}" template was sent.`;
+  }
+  // Template not approved yet (or another problem): the normal message is still tried.
+  console.log(`Ticket #${ticketId}: template ${name} failed (${sent.error}), sending a normal message`);
+  await sendWhatsApp(phone, message);
+  return `⚠ The customer last messaged more than 24 hours ago and the "${name}" template could not be sent (${sent.error}). They may not receive this message.`;
+}
+
 app.post("/ticket/action", auth, async (req, res) => {
   try {
     console.log("🔥 API CALLED");
@@ -2740,12 +2769,11 @@ app.post("/ticket/action", auth, async (req, res) => {
       phone = "91" + phone;
     }
 
+    // Only the status message: customers aren't asked for a rating afterwards
+    // (they can still choose "Feedback" from the bot's menu).
+    let delivery = "";
     if (phone) {
-      console.log("📲 Sending WhatsApp to:", phone);
-      // Only the status message: customers aren't asked for a rating afterwards
-      // (they can still choose "Feedback" from the bot's menu).
-      await sendWhatsApp(phone, message);
-      console.log("✅ WhatsApp sent");
+      delivery = await sendStatusMessage(phone, action, message, ticket.id);
     } else {
       console.log("❌ No phone found");
     }
@@ -2755,7 +2783,7 @@ app.post("/ticket/action", auth, async (req, res) => {
 
     console.log("✅ DONE");
 
-    res.json({ success: true });
+    res.json({ success: true, delivery });
   } catch (err) {
     console.log("❌ ERROR:", err.message);
     res.status(500).json({ error: "Server error" });
