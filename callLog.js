@@ -3,8 +3,8 @@
     Any task or concern (a client's phone call, a site issue, something a colleague
     needs) is logged on the dashboard and assigned to an employee. It goes straight to
     their WhatsApp with three buttons:
-      Started  → In progress (time to start is recorded)
-      Done     → Done (time to complete is recorded); they can reply with a note or photo
+      Processing → In progress (time to start is recorded)
+      Resolved   → Done (time to complete is recorded); they can reply with a note or photo
       Forward  → they pick a colleague from a list; the task moves to them with its history
     Every step is kept in the task's history, so the page shows who had it, for how long,
     and how long each person takes on average.
@@ -13,7 +13,7 @@
     messages within 24 hours of the person's last message to us; after that the approved
     template CALL_TEMPLATE_NAME (default "call_log_task", language CALL_TEMPLATE_LANG, "en")
     is sent: body {{1}} task ref, {{2}} the task, {{3}} raised by, {{4}} due; quick-reply
-    buttons "Started", "Done", "Forward" in that order.
+    buttons "Processing", "Resolved", "Forward" in that order.
 ========================================================= */
 import { sendWhatsApp, sendWhatsAppButtons, sendWhatsAppList } from "./whatsapp.js";
 import { sendWithFallback, onDeliveryUpdate, noteInbound, refillerWindowOpen } from "./whatsappOutbox.js";
@@ -131,14 +131,14 @@ function taskText(task, { forwardedBy, note } = {}) {
     `👤 Raised by ${task.raised_by || "the team"}`,
     note ? `\n💬 ${forwardedBy}: ${note}` : "",
     "",
-    "Tap *Started* when you begin and *Done* when it's finished. Can't do it? Tap *Forward* to pass it to a colleague.",
+    "Tap *Processing* when you begin and *Resolved* when it's finished. Can't do it? Tap *Forward* to pass it to a colleague.",
   ];
   return lines.filter((line, index) => line !== "" || lines[index - 1] !== "").join("\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
 const taskButtons = (id) => [
-  { id: `CALL_START:${id}`, title: "Started" },
-  { id: `CALL_DONE:${id}`, title: "Done" },
+  { id: `CALL_START:${id}`, title: "Processing" },
+  { id: `CALL_DONE:${id}`, title: "Resolved" },
   { id: `CALL_FWD:${id}`, title: "Forward" },
 ];
 
@@ -261,21 +261,21 @@ export async function handleCallLogWhatsApp(msg) {
       return true;
     }
     if (task.status === "Done" && action !== "FWD" && action !== "TO") {
-      await sendWhatsApp(phone, `${task.ref} is already done ✅`);
+      await sendWhatsApp(phone, `${task.ref} is already resolved ✅`);
       return true;
     }
 
     if (action === "START") {
       await startTask(task, byName);
-      await sendWhatsAppButtons(phone, `👍 ${task.ref} marked as *started*.\n\nTap *Done* when it's finished.`, taskButtons(task.id).slice(1));
+      await sendWhatsAppButtons(phone, `👍 ${task.ref} marked as *processing*.\n\nTap *Resolved* when it's finished.`, taskButtons(task.id).slice(1));
     } else if (action === "DONE") {
       const done = await completeTask(task, byName);
       await openNoteWindow(task.id, phone, "done");
       const took = duration(new Date(done.done_at) - new Date(done.assigned_at));
-      await sendWhatsApp(phone, `✅ ${task.ref} marked *done*${took ? ` (${took})` : ""}. Thank you!\n\nWant to add what was done? Reply with a note or photo in the next 15 minutes.`);
+      await sendWhatsApp(phone, `✅ ${task.ref} marked *resolved*${took ? ` (${took})` : ""}. Thank you!\n\nWant to add what was done? Reply with a note or photo in the next 15 minutes.`);
     } else if (action === "FWD") {
       if (task.status === "Done") {
-        await sendWhatsApp(phone, `${task.ref} is already done ✅`);
+        await sendWhatsApp(phone, `${task.ref} is already resolved ✅`);
         return true;
       }
       const choices = forwardChoices(task, employee);
@@ -303,7 +303,7 @@ export async function handleCallLogWhatsApp(msg) {
     return true;
   }
 
-  // A note or photo right after "Done" or "Forward".
+  // A note or photo right after "Resolved" or "Forward".
   const { rows } = await db.query(
     "SELECT * FROM call_logs WHERE note_phone = $1 AND note_open_until > NOW() ORDER BY note_open_until DESC LIMIT 1",
     [phone]
