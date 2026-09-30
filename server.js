@@ -32,6 +32,7 @@ import { registerTicketCleanupRoutes } from "./ticketCleanup.js";
 import { ensureSiteMatching, matchSite, registerSiteRoutes } from "./siteMatcher.js";
 import { ensureTicketWatch, addTicketWatch, alertOverdueTickets, fingerprintMissedScreenshots, registerTicketWatchRoutes } from "./ticketWatch.js";
 import { ensureTicketChatSchema, registerTicketChatRoutes, storeIncomingMedia, saveTicketMessage, applyStatusUpdates } from "./ticketChat.js";
+import { ensureCallLog, registerCallLogRoutes, handleCallLogWhatsApp } from "./callLog.js";
 import { CHARGED_MORE_THAN_ONCE, PRODUCT_QUESTION, COUNT_QUESTION, paymentPrompt, parseChargeCount, extractTransactionIds, paymentId, refundFor, receivedMessage, doneMessage, mergePayments } from "./multiPayment.js";
 
 /* ================= CLOUDINARY ================= */
@@ -3245,6 +3246,7 @@ registerAuditRoutes(app, { db, auth, uploadImage: (dataUrl) => uploadToCloudinar
 setCapaEscalationPush((payload) => sendPushToUsers(db, ["admin", ...global.internalUsers.filter((user) => hasPage(accessFor(user), "audit")).map((user) => user.username)], payload));
 registerPushRoutes(app, { db, auth });
 registerFindingsRoutes(app, { db, auth });
+registerCallLogRoutes(app, { auth });
 registerExpiryRoutes(app, { db, auth });
 registerUpiScanRoutes(app, { auth, onScanned: () => ticketsChanged() });
 registerTicketChatRoutes(app, { db, auth });
@@ -3984,6 +3986,13 @@ app.post("/webhook", async (req, res) => {
     // Anyone who messages us can get normal messages for 24 hours; after that only templates.
     await noteInbound(msg.from);
 
+    // Employees answer their Call Log tasks here (Started / Done / Forward, and a note after).
+    try {
+      if (await handleCallLogWhatsApp(msg)) return res.sendStatus(200);
+    } catch (err) {
+      console.log("CALL LOG MESSAGE ERROR:", err.message);
+    }
+
     // Refillers answer their CAPA tasks here; they never get the customer menu or a ticket.
     try {
       if (await handleRefillerWhatsApp(db, msg)) return res.sendStatus(200);
@@ -4142,10 +4151,23 @@ app.delete("/internal/users/:id", auth, (req, res) => {
   }
 });
 
+// An employee's WhatsApp number (for Call Log tasks): "" to clear, else stored as 91XXXXXXXXXX.
+function employeeWhatsApp(value, user = null) {
+  const digits = String(value || "").replace(/\D/g, "");
+  if (!digits) return { phone: "" };
+  const phone = digits.length === 10 ? `91${digits}` : digits;
+  if (!/^91[6-9]\d{9}$/.test(phone)) return { error: "Enter a 10-digit Indian mobile number for WhatsApp" };
+  const other = global.internalUsers.find((item) => item !== user && item.phone === phone);
+  if (other) return { error: `${other.name} already has this WhatsApp number` };
+  return { phone };
+}
+
 app.post("/internal/users", auth, (req, res) => {
   try {
     if (!req.user?.isAdmin) return res.status(403).json({ error: "Admin access required" });
     const { name, department, role, tags } = req.body || {};
+    const whatsapp = employeeWhatsApp(req.body?.phone);
+    if (whatsapp.error) return res.status(400).json({ error: whatsapp.error });
 
     if (!name || !department || !role) {
       return res.status(400).json({ error: "Name, department and role are required" });
@@ -4168,6 +4190,7 @@ app.post("/internal/users", auth, (req, res) => {
       department: String(department).trim(),
       role: String(role).trim(),
       tags: getInternalTagList(tags ? String(tags).split(",") : []),
+      phone: whatsapp.phone,
       ...accessFields(req.body || {}),
     };
 
@@ -4187,10 +4210,15 @@ app.patch("/internal/users/:id", auth, (req, res) => {
     const user = global.internalUsers.find((item) => String(item.id) === String(req.params.id));
     if (!user) return res.status(404).json({ error: "Employee not found" });
 
-    const { name, department, role, tags, username } = req.body || {};
+    const { name, department, role, tags, username, phone } = req.body || {};
     const before = accessFor(user);
-    const beforeProfile = JSON.stringify([user.name, user.department, user.role, user.tags, user.username]);
-    const snapshot = { name: user.name, department: user.department, role: user.role, tags: (user.tags || []).join(","), username: user.username };
+    const beforeProfile = JSON.stringify([user.name, user.department, user.role, user.tags, user.username, user.phone || ""]);
+    const snapshot = { name: user.name, department: user.department, role: user.role, tags: (user.tags || []).join(","), username: user.username, phone: user.phone || "" };
+    if (phone !== undefined) {
+      const whatsapp = employeeWhatsApp(phone, user);
+      if (whatsapp.error) return res.status(400).json({ error: whatsapp.error });
+      user.phone = whatsapp.phone;
+    }
     const access = accessFields(req.body || {});
     if (username !== undefined) {
       const next = String(username).trim();
@@ -4207,9 +4235,9 @@ app.patch("/internal/users/:id", auth, (req, res) => {
     Object.assign(user, access);
 
     const after = accessFor(user);
-    const labels = { name: "name", department: "department", role: "job title", tags: "tags", username: "username" };
-    const current = { name: user.name, department: user.department, role: user.role, tags: (user.tags || []).join(","), username: user.username };
-    const changes = JSON.stringify([user.name, user.department, user.role, user.tags, user.username]) === beforeProfile
+    const labels = { name: "name", department: "department", role: "job title", tags: "tags", username: "username", phone: "WhatsApp" };
+    const current = { name: user.name, department: user.department, role: user.role, tags: (user.tags || []).join(","), username: user.username, phone: user.phone || "" };
+    const changes = JSON.stringify([user.name, user.department, user.role, user.tags, user.username, user.phone || ""]) === beforeProfile
       ? []
       : Object.keys(labels).filter((key) => snapshot[key] !== current[key]).map((key) => `${labels[key]}: ${snapshot[key] || "—"} → ${current[key] || "—"}`);
     const accessNote = before.accessRole !== after.accessRole || before.pages.join() !== after.pages.join()
@@ -4659,6 +4687,7 @@ try {
   setTimeout(() => readMissedScreenshots(), 60 * 1000);
   // Old photos are deleted from Cloudinary to stay within the free plan (see imageRetention.js).
   await ensureImageRetention(db).catch((err) => console.error("IMAGE CLEAN-UP SETUP ERROR:", err.message));
+  await ensureCallLog(db, { onChange: () => io.emit("call-log-changed") }).catch((err) => console.error("CALL LOG SETUP ERROR:", err.message));
   setTimeout(cleanOldImages, 5 * 60 * 1000);
   setInterval(cleanOldImages, 6 * 60 * 60 * 1000);
 } catch (err) {
