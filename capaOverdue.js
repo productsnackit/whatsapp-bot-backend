@@ -7,10 +7,16 @@
 
     Outside WhatsApp's 24-hour window the approved template CAPA_OVERDUE_TEMPLATE
     (default "capa_overdue", language CAPA_OVERDUE_TEMPLATE_LANG, "en") is sent:
-    body {{1}} what is overdue (a task ref, or "3 tasks"), {{2}} the details.
+    body {{1}} what is overdue (a task ref, or "3 tasks"), {{2}} the details, and one
+    quick-reply button "Mark resolved".
+
+    Tapping "Mark resolved" (or picking a task from the list sent for several) marks the
+    CAPA task resolved on the dashboard as "<name> (WhatsApp)", tells the refiller, and
+    asks who fixed it (refiller / team or person / themselves); a name or note typed
+    in the next 15 minutes is saved with the task.
 ========================================================= */
-import { sendWhatsAppPayload } from "./whatsapp.js";
-import { sendWithFallback } from "./whatsappOutbox.js";
+import { sendWhatsApp, sendWhatsAppPayload, sendWhatsAppButtons, sendWhatsAppList } from "./whatsapp.js";
+import { sendWithFallback, noteInbound } from "./whatsappOutbox.js";
 
 export const OVERDUE_HOURS = 24;
 const DIGEST_HOUR_IST = 10;
@@ -70,24 +76,137 @@ function listMessage(tasks, title) {
 // Template parameters can't hold line breaks.
 const oneLine = (text) => String(text || "").replace(/\s*\n+\s*/g, " | ").replace(/\s{4,}/g, "   ").slice(0, 900) || "-";
 
-async function sendToContacts(contacts, text, headline, details) {
+// One task: a "Mark resolved" button. Several: the text, then a list to pick the resolved one.
+async function sendToContacts(contacts, text, headline, details, tasks) {
   let sent = 0;
+  const single = tasks.length === 1;
+  const payload = single ? `CAPA_OD_YES:${tasks[0].id}` : "CAPA_OD_LIST";
   for (const contact of contacts) {
     const to = phoneDigits(contact.phone);
     const result = await sendWithFallback({
       kind: "capa_overdue",
       to,
-      send: () => sendWhatsAppPayload({ messaging_product: "whatsapp", to, type: "text", text: { body: text } }),
+      send: async () => {
+        if (single) return sendWhatsAppButtons(to, text, [{ id: payload, title: "Mark resolved" }]);
+        const first = await sendWhatsAppPayload({ messaging_product: "whatsapp", to, type: "text", text: { body: text } });
+        if (first.ok) await sendResolveList(to, tasks);
+        return first;
+      },
       template: process.env.CAPA_OVERDUE_TEMPLATE === "off" ? null : {
         name: process.env.CAPA_OVERDUE_TEMPLATE || "capa_overdue",
         lang: process.env.CAPA_OVERDUE_TEMPLATE_LANG || "en",
         params: [oneLine(headline), oneLine(details)],
+        buttons: [payload],
       },
     }).catch((err) => ({ ok: false, error: err.message }));
     if (result.ok) sent += 1;
     else console.log(`CAPA OVERDUE ALERT to ${contact.name} failed:`, result.error);
   }
   return sent;
+}
+
+/* ---------- "Mark resolved" on WhatsApp ---------- */
+
+const NOTE_WINDOW_MS = 15 * 60 * 1000;
+const WHO_FIXED = { R: "Refiller fixed it", T: "Team / person fixed it", S: "Fixed it myself" };
+
+// Open overdue tasks as a tappable list (WhatsApp shows up to 10).
+async function sendResolveList(to, tasks) {
+  const open = tasks.filter((task) => task.status === "OPEN").slice(0, 10);
+  if (!open.length) return null;
+  return sendWhatsAppList(
+    to,
+    open.length === 1 ? "Tap below once it's fixed." : "Which task is fixed? Pick one; send the list again with *resolved* to mark another.",
+    "Mark resolved",
+    "Overdue CAPA tasks",
+    open.map((task) => ({ id: `CAPA_OD_YES:${task.id}`, title: task.ref.slice(0, 24), description: `${task.defect || "Issue"} · ${task.location || ""}`.slice(0, 72) }))
+  );
+}
+
+async function contactFor(phone) {
+  const { rows } = await db.query("SELECT name, phone FROM capa_overdue_contacts");
+  return rows.find((row) => phoneDigits(row.phone) === phone) || null;
+}
+
+async function overdueTasks() {
+  const { rows } = await db.query(`SELECT * FROM audit_capa WHERE ${overdueSql} ORDER BY created_at`);
+  return rows;
+}
+
+// Returns true when the message was an overdue contact answering (it never reaches the customer bot).
+export async function handleCapaOverdueWhatsApp(msg) {
+  if (!db || !msg?.from) return false;
+  const phone = phoneDigits(msg.from);
+  const choice = msg.interactive?.button_reply?.id || msg.interactive?.list_reply?.id || msg.button?.payload || "";
+  const tapped = choice.match(/^CAPA_OD_(YES|LIST|HOW)(?::(\d+))?(?::([RTS]))?$/);
+  const text = String(msg.text?.body || "").trim();
+
+  if (tapped || /^(resolved|mark resolved|overdue)$/i.test(text)) {
+    const contact = await contactFor(phone);
+    if (!contact) return false;
+    await noteInbound(phone);
+    const [, action = "LIST", id, how] = tapped || [];
+
+    if (action === "LIST") {
+      const tasks = await overdueTasks();
+      if (!tasks.length) await sendWhatsApp(phone, `No overdue CAPA tasks right now, ${contact.name}. 👍`);
+      else await sendResolveList(phone, tasks);
+      return true;
+    }
+
+    const { rows } = await db.query("SELECT * FROM audit_capa WHERE id = $1", [id]);
+    const task = rows[0];
+    if (!task) {
+      await sendWhatsApp(phone, "That task could not be found. It may have been removed.");
+      return true;
+    }
+
+    if (action === "HOW") {
+      await db.query(
+        `UPDATE audit_capa SET resolution_note = $2, resolve_note_phone = $3, resolve_note_until = NOW() + ($4 * INTERVAL '1 millisecond') WHERE id = $1`,
+        [task.id, WHO_FIXED[how], phone, NOTE_WINDOW_MS]
+      );
+      const ask = how === "T" ? "Who fixed it? Reply with their name (and anything worth noting)." : "Anything to note? Reply in the next 15 minutes, or ignore this.";
+      await sendWhatsApp(phone, `Saved: ${WHO_FIXED[how].toLowerCase()}. ${ask}`);
+      return true;
+    }
+
+    // YES: mark resolved.
+    if (task.status === "RESOLVED") {
+      await sendWhatsApp(phone, `${task.ref} is already resolved${task.resolved_by ? ` (by ${task.resolved_by.replace(" (WhatsApp)", "")})` : ""}. ✅`);
+      return true;
+    }
+    await db.query(
+      "UPDATE audit_capa SET status = 'RESOLVED', resolved_by = $2, resolved_at = NOW(), note_open_until = NULL WHERE id = $1",
+      [task.id, `${contact.name} (WhatsApp)`]
+    );
+    console.log(`✅ ${task.ref} resolved by ${contact.name} from the overdue alert`);
+    if (task.refiller_phone) {
+      const to = phoneDigits(task.refiller_phone);
+      await sendWhatsAppPayload({ messaging_product: "whatsapp", to, type: "text", text: { body: `${task.ref} at ${task.location} is marked resolved by ${contact.name}. No action needed. Thank you!` } }).catch(() => {});
+    }
+    await sendWhatsAppButtons(phone, `✅ ${task.ref} (${task.defect || "task"} · ${task.location || ""}) is marked *resolved* on the dashboard.\n\nWho fixed it?`, [
+      { id: `CAPA_OD_HOW:${task.id}:R`, title: "Refiller" },
+      { id: `CAPA_OD_HOW:${task.id}:T`, title: "Team / person" },
+      { id: `CAPA_OD_HOW:${task.id}:S`, title: "I fixed it" },
+    ]);
+    const left = (await overdueTasks()).length;
+    if (left) await sendWhatsApp(phone, `${left} more overdue task${left === 1 ? "" : "s"}. Reply *resolved* to see the list.`);
+    return true;
+  }
+
+  // A name or note right after "Who fixed it?".
+  if (msg.type !== "text" || !text) return false;
+  const { rows } = await db.query(
+    "SELECT id, ref, resolution_note FROM audit_capa WHERE resolve_note_phone = $1 AND resolve_note_until > NOW() ORDER BY resolve_note_until DESC LIMIT 1",
+    [phone]
+  ).catch(() => ({ rows: [] }));
+  if (!rows[0]) return false;
+  await noteInbound(phone);
+  const note = [rows[0].resolution_note, text].filter(Boolean).join(": ").slice(0, 500);
+  await db.query("UPDATE audit_capa SET resolution_note = $2, resolve_note_until = NULL WHERE id = $1", [rows[0].id, note]);
+  await sendWhatsApp(phone, `📝 Saved on ${rows[0].ref}. Thank you!`);
+  return true;
 }
 
 export async function ensureCapaOverdue(database) {
@@ -106,7 +225,13 @@ export async function ensureCapaOverdue(database) {
 // The audit tables are created as the server starts; the column is added once they exist.
 async function addColumn() {
   if (ready) return;
-  await db.query("ALTER TABLE audit_capa ADD COLUMN IF NOT EXISTS overdue_alerted_at TIMESTAMPTZ");
+  await db.query(`
+    ALTER TABLE audit_capa
+      ADD COLUMN IF NOT EXISTS overdue_alerted_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS resolution_note TEXT,
+      ADD COLUMN IF NOT EXISTS resolve_note_phone TEXT,
+      ADD COLUMN IF NOT EXISTS resolve_note_until TIMESTAMPTZ
+  `);
   ready = true;
 }
 
@@ -126,9 +251,9 @@ export async function capaOverdueTick() {
     const { rows: fresh } = await db.query(`SELECT * FROM audit_capa WHERE ${overdueSql} AND overdue_alerted_at IS NULL ORDER BY created_at`);
     if (fresh.length) {
       if (fresh.length <= MAX_SINGLE_ALERTS) {
-        for (const task of fresh) await sendToContacts(contacts, singleMessage(task), task.ref, summaryLine(task).replace(`${task.ref}: `, ""));
+        for (const task of fresh) await sendToContacts(contacts, singleMessage(task), task.ref, summaryLine(task).replace(`${task.ref}: `, ""), [task]);
       } else {
-        await sendToContacts(contacts, listMessage(fresh, `⚠️ *${fresh.length} CAPA tasks not resolved in ${OVERDUE_HOURS} hours*`), `${fresh.length} tasks`, fresh.map(summaryLine).join(" | "));
+        await sendToContacts(contacts, listMessage(fresh, `⚠️ *${fresh.length} CAPA tasks not resolved in ${OVERDUE_HOURS} hours*`), `${fresh.length} tasks`, fresh.map(summaryLine).join(" | "), fresh);
       }
       await db.query("UPDATE audit_capa SET overdue_alerted_at = NOW() WHERE id = ANY($1)", [fresh.map((task) => task.id)]);
       console.log(`⚠️ CAPA overdue alert: ${fresh.map((task) => task.ref).join(", ")} → ${contacts.map((contact) => contact.name).join(", ")}`);
@@ -150,7 +275,7 @@ export async function capaOverdueTick() {
     );
     if (still.length) {
       const title = `⏰ *${still.length} CAPA task${still.length === 1 ? "" : "s"} still not resolved*`;
-      await sendToContacts(contacts, listMessage(still, title), `${still.length} task${still.length === 1 ? "" : "s"} still open`, still.map(summaryLine).join(" | "));
+      await sendToContacts(contacts, listMessage(still, title), `${still.length} task${still.length === 1 ? "" : "s"} still open`, still.map(summaryLine).join(" | "), still);
       console.log(`⏰ CAPA overdue daily reminder: ${still.length} task(s)`);
     }
   } catch (err) {

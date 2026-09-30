@@ -33,7 +33,7 @@ import { ensureSiteMatching, matchSite, registerSiteRoutes } from "./siteMatcher
 import { ensureTicketWatch, addTicketWatch, alertOverdueTickets, fingerprintMissedScreenshots, registerTicketWatchRoutes } from "./ticketWatch.js";
 import { ensureTicketChatSchema, registerTicketChatRoutes, storeIncomingMedia, saveTicketMessage, applyStatusUpdates } from "./ticketChat.js";
 import { ensureCallLog, registerCallLogRoutes, handleCallLogWhatsApp } from "./callLog.js";
-import { ensureCapaOverdue, capaOverdueTick, registerCapaOverdueRoutes } from "./capaOverdue.js";
+import { ensureCapaOverdue, capaOverdueTick, registerCapaOverdueRoutes, handleCapaOverdueWhatsApp } from "./capaOverdue.js";
 import { CHARGED_MORE_THAN_ONCE, PRODUCT_QUESTION, COUNT_QUESTION, paymentPrompt, parseChargeCount, extractTransactionIds, paymentId, refundFor, receivedMessage, doneMessage, mergePayments } from "./multiPayment.js";
 
 /* ================= CLOUDINARY ================= */
@@ -3993,6 +3993,13 @@ app.post("/webhook", async (req, res) => {
       if (await handleCallLogWhatsApp(msg)) return res.sendStatus(200);
     } catch (err) {
       console.log("CALL LOG MESSAGE ERROR:", err.message);
+    }
+
+    // Monish (CAPA overdue alerts) taps "Mark resolved" or says who fixed it.
+    try {
+      if (await handleCapaOverdueWhatsApp(msg)) return res.sendStatus(200);
+    } catch (err) {
+      console.log("CAPA OVERDUE MESSAGE ERROR:", err.message);
     }
 
     // Refillers answer their CAPA tasks here; they never get the customer menu or a ticket.
