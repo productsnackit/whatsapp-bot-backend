@@ -34,7 +34,7 @@ import { ensureTicketWatch, addTicketWatch, alertOverdueTickets, fingerprintMiss
 import { ensureTicketChatSchema, registerTicketChatRoutes, storeIncomingMedia, saveTicketMessage, applyStatusUpdates } from "./ticketChat.js";
 import { ensureCallLog, registerCallLogRoutes, handleCallLogWhatsApp } from "./callLog.js";
 import { ensureCapaOverdue, capaOverdueTick, registerCapaOverdueRoutes, handleCapaOverdueWhatsApp } from "./capaOverdue.js";
-import { ensureAttention, attentionReason, isExpectedAnswer, alertAdmins, registerAttentionRoutes } from "./attention.js";
+import { ensureAttention, attentionReason, isExpectedAnswer, alertAdmins, registerAttentionRoutes, locationProblem, LOCATION_AGAIN } from "./attention.js";
 import { CHARGED_MORE_THAN_ONCE, PRODUCT_QUESTION, COUNT_QUESTION, paymentPrompt, parseChargeCount, extractTransactionIds, paymentId, refundFor, receivedMessage, doneMessage, mergePayments } from "./multiPayment.js";
 
 /* ================= CLOUDINARY ================= */
@@ -1353,6 +1353,22 @@ Please share the machine location along with the company/store name.
 
 Example: "Bangalore Airport Terminal 2, TCS Canteen"`
         );
+      }
+
+      // Location step (every refund issue): a reply that isn't a place is asked again, so the
+      // ticket gets a real location; after two more tries the chat goes to the team.
+      if (state === "LOCATION" && text && text.trim().length >= 5) {
+        const locationKey = getRetryKey(ticketId, "LOCATION_CHECK");
+        const problem = locationProblem(text, await matchSite(text).catch(() => null));
+        if (problem) {
+          incrementRetry(locationKey);
+          if (getRetryCount(locationKey) >= 3) {
+            resetRetry(locationKey);
+            return handOffToAdmin(existingTicket, from, text, "Couldn't give the machine location");
+          }
+          return sendWhatsApp(from, LOCATION_AGAIN);
+        }
+        resetRetry(locationKey);
       }
 
       // PRODUCT NOT DISPENSED

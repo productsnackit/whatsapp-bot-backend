@@ -175,3 +175,28 @@ export function registerAttentionRoutes(app, { auth }) {
     res.json(rows);
   }));
 }
+
+/* ---------- The location step ---------- */
+// Words that mean a place (a building, floor, area or city).
+const PLACE_WORDS = /\b(floor|flr|tower|block|building|bldg|office|cafe|cafeteria|canteen|pantry|lobby|gate|campus|park|road|rd|street|nagar|layout|colony|mall|hospital|college|university|school|station|airport|terminal|phase|wing|level|near|opp|opposite|behind|beside|metro|sez|tech|hub|plaza|complex|cent(er|re)|ground|basement|reception|hostel|gym|hotel|apartments?|society|sector|city|bangalore|bengaluru|hyderabad|chennai|pune|mumbai|delhi|noida|gurgaon|gurugram|whitefield|manyata|koramangala|hsr|marathahalli|electronic city)\b/i;
+// Words that mean the customer is explaining or asking, not naming a place.
+const NOT_A_PLACE = /₹|\b(refund|money|amount|paid|pay|payment|charged|deducted|debited|transactions?|txn|upi|rs|rupees?|help|please|pls|need|want|why|when|how|what|not (working|dispensed|received|coming)|didn'?t|did not|issue|problem|stuck|cancel|ok|okay|yes|no|thanks?|thank you|hi|hello|hey)\b/i;
+
+// Why this isn't a location (null when it looks like one). site: the siteMatcher result.
+export function locationProblem(text, site) {
+  const value = String(text || "").trim();
+  if (!value || site?.site_id) return null;
+  if (/^[\d\s+\-()]+$/.test(value)) return "Only numbers";
+  if (/\S+@\S+/.test(value)) return "A UPI ID or email";
+  if (/\d{10,}/.test(value.replace(/\s/g, ""))) return "A phone number or transaction ID";
+  if (PLACE_WORDS.test(value)) return null;
+  if (NOT_A_PLACE.test(value) || value.includes("?")) return "Not a place";
+  return null;
+}
+
+export const LOCATION_AGAIN = `📍 *Please send the machine location*
+
+We need where the machine is, for example:
+"Bangalore Airport Terminal 2, TCS Canteen" or "Strides 2, 4th floor cafeteria"
+
+You can tell our team about the problem after this.`;
