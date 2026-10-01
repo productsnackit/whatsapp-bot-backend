@@ -13,7 +13,7 @@
       • WhatsApp buttons take him through the steps:
         Received → Processing → Ordered → Goods received → Sent.
     Outside WhatsApp's 24-hour window the approved template "supply_buyer_list" is used:
-    {{1}} = "The stock list for Tue, 6 Oct", {{2}} = items, {{3}} = the link; button "Received".
+    "Hi, {{1}} is ready: {{2}} items to buy. Open it to update …: {{3}} Thank you." ({{1}} = "the stock list for Tue, 6 Oct"); button "Received".
 ========================================================= */
 import crypto from "crypto";
 import { masterOf, buyingOf, masterWorkbook, roundById } from "./directSupply.js";
@@ -167,7 +167,7 @@ export async function sendListToBuyer(roundOrId, kind = "new") {
     const next = nextStep(round.buyer_status);
     if (next) await sendWhatsAppButtons(to, isUpdate ? "Tap to say you've seen the change." : "Tap when you've seen the list.", [{ id: `SB:${round.id}:${next}`, title: next }]);
   } else {
-    const result = await sendWhatsAppTemplate(to, TEMPLATE, "en", [`${isUpdate ? "The updated stock list" : "The stock list"} for ${label}`, String(rows.length), url], [`SB:${round.id}:Received`]);
+    const result = await sendWhatsAppTemplate(to, TEMPLATE, "en", [`${isUpdate ? "the updated stock list" : "the stock list"} for ${label}`, String(rows.length), url], [`SB:${round.id}:Received`]);
     if (!result.ok) {
       return { ok: false, error: `${contact.name || "The buyer"} hasn't messaged the Snackit number in the last 24 hours, and the "${TEMPLATE}" template didn't go (${result.error}). Ask them to send "hi" to the Snackit number, or create the template in Meta.` };
     }
