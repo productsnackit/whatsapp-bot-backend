@@ -2667,9 +2667,8 @@ app.get("/tickets", auth, async (req, res) => {
         created_at,
         updated_at
       FROM tickets
-      -- Refund tickets, plus any chat the bot handed to the team (it may have happened at the
-      -- main menu, before a category was chosen) or an admin took over.
-      WHERE category = 'REFUND' OR attention_at IS NOT NULL OR COALESCE(takeover, FALSE) = TRUE
+      -- Every ticket: refunds, product enquiries, feedback, and chats that stopped at the main
+      -- menu ("Not chosen yet"), so no ticket number is missing on the dashboard.
       ORDER BY id DESC
     `);
 
