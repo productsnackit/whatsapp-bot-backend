@@ -359,7 +359,7 @@ export function registerSupplyBillingRoutes(app, { auth }) {
   /* ---------- Settings: Snackit's details on invoices, and companies' billing details ---------- */
   app.get("/supply/seller", auth, handle("SUPPLY SELLER", async (req, res) => res.json(await seller())));
   app.put("/supply/seller", auth, handle("SUPPLY SELLER SAVE", async (req, res) => {
-    const keys = ["name", "address", "gstin", "phone", "email", "upi", "bank", "terms"];
+    const keys = ["name", "address", "gstin", "phone", "email", "upi", "bank", "terms", "public_url"];
     const value = Object.fromEntries(keys.map((key) => [key, String(req.body?.[key] || "").slice(0, 600)]));
     await db.query(
       `INSERT INTO app_settings (key, value, updated_at) VALUES ('supply_seller', $1, NOW())

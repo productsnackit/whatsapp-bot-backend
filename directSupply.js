@@ -320,6 +320,29 @@ function masterWorkbook(round, sheet, buying = null) {
   return XLSX.write(workbook, { type: "buffer", bookType: "xlsx" });
 }
 
+/* Saves an order's lines. A line with product_id (picked from the item list) is that item; a
+   typed name is matched like a pasted order, and a name nobody has seen (not close to a known
+   item) becomes a new item, so the same spelling from another company combines straight away. */
+export async function saveOrderLines(orderId, roundId, companyId, lines) {
+  let created = 0;
+  const typed = await withMatches(lines.filter((line) => !line.product_id));
+  const picked = lines.filter((line) => line.product_id).map((line) => ({ ...line, suggestion_id: null }));
+  for (const line of [...picked, ...typed]) {
+    let productId = line.product_id;
+    if (!productId && !line.suggestion_id) {
+      productId = await createProduct(line.name, line.unit);
+      created += 1;
+    }
+    await db.query(
+      `INSERT INTO supply_lines (order_id, round_id, company_id, raw_name, qty, unit, product_id, suggestion_id, problem)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      [orderId, roundId, companyId, line.name, line.qty, line.unit, productId, productId ? null : line.suggestion_id, line.qty > 0 ? null : "Quantity missing"]
+    );
+  }
+  await db.query("UPDATE supply_rounds SET updated_at = NOW() WHERE id = $1", [roundId]);
+  return created;
+}
+
 async function roundById(id) {
   const { rows } = await db.query("SELECT * FROM supply_rounds WHERE id = $1", [id]);
   return rows[0] ? { ...rows[0], delivery_date: plainDate(rows[0].delivery_date) } : null;
@@ -469,22 +492,7 @@ export function registerDirectSupplyRoutes(app, { auth }) {
       "INSERT INTO supply_orders (round_id, company_id, source, raw_text, file_name, created_by) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
       [round.id, companyId, req.body?.source === "file" ? "file" : "text", String(req.body?.raw_text || "").slice(0, 20000) || null, req.body?.file_name || null, userName(req.user)]
     );
-    let created = 0;
-    for (const line of await withMatches(lines)) {
-      let productId = line.product_id;
-      // A name nobody has seen, and not close to a known item: it becomes a new item, so the
-      // same spelling from another company combines straight away.
-      if (!productId && !line.suggestion_id) {
-        productId = await createProduct(line.name, line.unit);
-        created += 1;
-      }
-      await db.query(
-        `INSERT INTO supply_lines (order_id, round_id, company_id, raw_name, qty, unit, product_id, suggestion_id, problem)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-        [order[0].id, round.id, companyId, line.name, line.qty, line.unit, productId, productId ? null : line.suggestion_id, line.qty > 0 ? null : "Quantity missing"]
-      );
-    }
-    await db.query("UPDATE supply_rounds SET updated_at = NOW() WHERE id = $1", [round.id]);
+    const created = await saveOrderLines(order[0].id, round.id, companyId, lines);
     res.locals.activity = { section: "Direct Supply", action: `Added ${company[0].name}'s order (${lines.length} items) to ${round.ref}` };
     res.status(201).json({ order_id: order[0].id, new_items: created });
   }));

@@ -35,6 +35,8 @@ import { ensureTicketChatSchema, registerTicketChatRoutes, storeIncomingMedia, s
 import { ensureCallLog, registerCallLogRoutes, handleCallLogWhatsApp } from "./callLog.js";
 import { ensureDirectSupply, registerDirectSupplyRoutes } from "./directSupply.js";
 import { ensureSupplyBilling, registerSupplyBillingRoutes } from "./supplyBilling.js";
+import { ensureSupplyOrderLink, registerSupplyOrderLinkRoutes } from "./supplyOrderLink.js";
+import { initSupplyReports, registerSupplyReportRoutes } from "./supplyReports.js";
 import { ensureCapaOverdue, capaOverdueTick, registerCapaOverdueRoutes, handleCapaOverdueWhatsApp } from "./capaOverdue.js";
 import { ensureAttention, attentionReason, isExpectedAnswer, alertAdmins, registerAttentionRoutes, locationProblem, LOCATION_AGAIN } from "./attention.js";
 import { CHARGED_MORE_THAN_ONCE, PRODUCT_QUESTION, COUNT_QUESTION, paymentPrompt, parseChargeCount, extractTransactionIds, paymentId, refundFor, receivedMessage, doneMessage, mergePayments } from "./multiPayment.js";
@@ -3312,6 +3314,8 @@ registerFindingsRoutes(app, { db, auth });
 registerCallLogRoutes(app, { auth });
 registerDirectSupplyRoutes(app, { auth });
 registerSupplyBillingRoutes(app, { auth });
+registerSupplyOrderLinkRoutes(app, { auth });
+registerSupplyReportRoutes(app, { auth });
 registerCapaOverdueRoutes(app, { auth });
 registerAttentionRoutes(app, { auth });
 registerExpiryRoutes(app, { db, auth });
@@ -4764,6 +4768,8 @@ try {
   await ensureCallLog(db, { onChange: () => io.emit("call-log-changed") }).catch((err) => console.error("CALL LOG SETUP ERROR:", err.message));
   await ensureDirectSupply(db).catch((err) => console.error("DIRECT SUPPLY SETUP ERROR:", err.message));
   await ensureSupplyBilling(db).catch((err) => console.error("SUPPLY BILLING SETUP ERROR:", err.message));
+  await ensureSupplyOrderLink(db, { onChanged: () => io.emit("supply-changed") }).catch((err) => console.error("SUPPLY ORDER LINK SETUP ERROR:", err.message));
+  initSupplyReports(db);
   // CAPA tasks open for 24 hours: WhatsApp alert to Monish (Admin Settings), then a 10 am daily reminder.
   await ensureCapaOverdue(db).catch((err) => console.error("CAPA OVERDUE SETUP ERROR:", err.message));
   setInterval(capaOverdueTick, 5 * 60 * 1000);
