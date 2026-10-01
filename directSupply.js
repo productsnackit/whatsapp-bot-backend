@@ -1,11 +1,15 @@
 /* =========================================================
-    DIRECT SUPPLY (phase 1: orders → master sheet)
+    DIRECT SUPPLY (orders → master sheet → buying → margin)
     Snackit supplies snacks, drinks and fruit straight to companies. Company admins
     send their orders on WhatsApp (text or Excel); each order is pasted or uploaded
     here against a supply round (one delivery date). The master sheet combines every
     company's order: the same item (after cleaning the name, or confirmed "same item")
     is added up, with a column per company. The stock buyer gets it on WhatsApp as a
     summary and an Excel file, or downloads it.
+    Phase 2: vendors and their rates (every rate is kept with its date, so fruit prices can
+    be followed), the cheapest current rate per item, purchases (what was really bought, from
+    whom, at what price), selling prices (a default per item, or per company) and the margin.
+    An item can have "pieces per box", so "2 box" from one company adds to pieces from another.
     Items the system isn't sure about ("Lays Clasic 52g" vs "Lays Classic 52g") are
     listed under "Check names" until someone says same item / new item; the answer is
     remembered for next time.
@@ -85,11 +89,55 @@ export async function ensureDirectSupply(database) {
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
     CREATE INDEX IF NOT EXISTS supply_lines_round_idx ON supply_lines (round_id);
+    ALTER TABLE supply_products
+      ADD COLUMN IF NOT EXISTS pack_size NUMERIC,
+      ADD COLUMN IF NOT EXISTS sell_price NUMERIC;
+    CREATE TABLE IF NOT EXISTS supply_vendors (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL UNIQUE,
+      contact_name TEXT,
+      phone TEXT,
+      location TEXT,
+      notes TEXT,
+      active BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS supply_prices (
+      id SERIAL PRIMARY KEY,
+      product_id INTEGER NOT NULL REFERENCES supply_products(id) ON DELETE CASCADE,
+      vendor_id INTEGER NOT NULL REFERENCES supply_vendors(id) ON DELETE CASCADE,
+      unit TEXT NOT NULL,
+      price NUMERIC NOT NULL,
+      round_id INTEGER REFERENCES supply_rounds(id) ON DELETE SET NULL,
+      recorded_by TEXT,
+      recorded_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS supply_prices_item_idx ON supply_prices (product_id, unit, recorded_at DESC);
+    CREATE TABLE IF NOT EXISTS supply_purchases (
+      id SERIAL PRIMARY KEY,
+      round_id INTEGER NOT NULL REFERENCES supply_rounds(id) ON DELETE CASCADE,
+      product_id INTEGER REFERENCES supply_products(id) ON DELETE SET NULL,
+      vendor_id INTEGER REFERENCES supply_vendors(id) ON DELETE SET NULL,
+      unit TEXT NOT NULL,
+      qty NUMERIC NOT NULL,
+      price NUMERIC NOT NULL,
+      notes TEXT,
+      bought_by TEXT,
+      bought_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS supply_company_prices (
+      company_id INTEGER NOT NULL REFERENCES supply_companies(id) ON DELETE CASCADE,
+      product_id INTEGER NOT NULL REFERENCES supply_products(id) ON DELETE CASCADE,
+      unit TEXT NOT NULL,
+      price NUMERIC NOT NULL,
+      updated_at TIMESTAMPTZ DEFAULT NOW(),
+      PRIMARY KEY (company_id, product_id, unit)
+    );
   `);
 }
 
 async function products() {
-  const { rows } = await db.query("SELECT id, name, key, unit, category, aliases FROM supply_products ORDER BY name");
+  const { rows } = await db.query("SELECT id, name, key, unit, category, aliases, pack_size, sell_price FROM supply_products ORDER BY name");
   return rows;
 }
 
@@ -139,7 +187,7 @@ async function withMatches(lines) {
    Lines still waiting for "same item?" are combined under their own name and marked. */
 async function masterOf(roundId) {
   const { rows: lines } = await db.query(
-    `SELECT l.*, p.name AS product_name, p.category, s.name AS suggestion_name, c.name AS company_name
+    `SELECT l.*, p.name AS product_name, p.category, p.unit AS product_unit, p.pack_size, s.name AS suggestion_name, c.name AS company_name
      FROM supply_lines l
      JOIN supply_companies c ON c.id = l.company_id
      LEFT JOIN supply_products p ON p.id = l.product_id
@@ -151,24 +199,31 @@ async function masterOf(roundId) {
     .sort((a, b) => a.name.localeCompare(b.name));
   const rows = new Map();
   for (const line of lines) {
+    // "2 box" of an item with pieces per box set (and counted in pieces) adds to the pieces.
+    const perBox = Number(line.pack_size) || 0;
+    const boxed = line.unit === "box" && perBox > 0 && line.product_unit && line.product_unit !== "box";
+    const unit = boxed ? line.product_unit : line.unit;
+    const amount = boxed ? Number(line.qty) * perBox : Number(line.qty);
     const itemKey = line.product_id ? `p${line.product_id}` : `n${cleanName(line.raw_name)}`;
-    const key = `${itemKey}|${line.unit}`;
+    const key = `${itemKey}|${unit}`;
     if (!rows.has(key)) {
       rows.set(key, {
         key,
         product_id: line.product_id,
         name: line.product_name || displayName(line.raw_name),
         category: line.category || "",
-        unit: line.unit,
+        unit,
         total: 0,
+        from_boxes: 0,
         by_company: {},
         to_check: false,
         spellings: new Set(),
       });
     }
     const row = rows.get(key);
-    row.total += Number(line.qty);
-    row.by_company[line.company_id] = (row.by_company[line.company_id] || 0) + Number(line.qty);
+    row.total += amount;
+    if (boxed) row.from_boxes += Number(line.qty);
+    row.by_company[line.company_id] = (row.by_company[line.company_id] || 0) + amount;
     row.spellings.add(line.raw_name);
     if (!line.product_id) row.to_check = true;
   }
@@ -183,15 +238,83 @@ async function masterOf(roundId) {
   return { companies, master, checks, problems, line_count: lines.length };
 }
 
-function masterWorkbook(round, sheet) {
-  const header = ["Item", "Unit", "Total", ...sheet.companies.map((company) => company.name)];
+/* Buying for a round, per master-sheet item: the latest rate from each vendor (cheapest first),
+   what was bought, what is still short, the selling value (company price, else the item's
+   default price) and the margin. Cost is what was spent, plus the best rate for anything short. */
+async function buyingOf(roundId, sheet) {
+  const ids = sheet.master.filter((row) => row.product_id).map((row) => row.product_id);
+  const [quotes, purchases, companyPrices, items] = await Promise.all([
+    db.query(
+      `SELECT DISTINCT ON (q.product_id, q.unit, q.vendor_id) q.product_id, q.unit, q.vendor_id, q.price, q.recorded_at, v.name AS vendor_name
+       FROM supply_prices q JOIN supply_vendors v ON v.id = q.vendor_id
+       WHERE q.product_id = ANY($1) ORDER BY q.product_id, q.unit, q.vendor_id, q.recorded_at DESC`,
+      [ids]
+    ),
+    db.query(
+      `SELECT pu.*, v.name AS vendor_name FROM supply_purchases pu LEFT JOIN supply_vendors v ON v.id = pu.vendor_id
+       WHERE pu.round_id = $1 ORDER BY pu.bought_at`,
+      [roundId]
+    ),
+    db.query("SELECT * FROM supply_company_prices WHERE product_id = ANY($1)", [ids]),
+    db.query("SELECT id, unit, sell_price FROM supply_products WHERE id = ANY($1)", [ids]),
+  ]);
+  const itemById = new Map(items.rows.map((item) => [item.id, item]));
+  const totals = { estimate: 0, spent: 0, cost: 0, selling: 0, priced_items: 0, items: 0, missing_rates: 0, missing_prices: 0, short_items: 0 };
+  const rows = sheet.master.map((row) => {
+    const rates = quotes.rows.filter((quote) => quote.product_id === row.product_id && quote.unit === row.unit)
+      .map((quote) => ({ vendor_id: quote.vendor_id, vendor_name: quote.vendor_name, price: Number(quote.price), recorded_at: quote.recorded_at }))
+      .sort((a, b) => a.price - b.price);
+    const bought = purchases.rows.filter((item) => item.product_id === row.product_id && item.unit === row.unit)
+      .map((item) => ({ id: item.id, vendor_id: item.vendor_id, vendor_name: item.vendor_name, qty: Number(item.qty), price: Number(item.price), bought_by: item.bought_by, bought_at: item.bought_at, notes: item.notes }));
+    const boughtQty = bought.reduce((sum, item) => sum + item.qty, 0);
+    const spent = bought.reduce((sum, item) => sum + item.qty * item.price, 0);
+    const best = rates[0] || null;
+    const short = Math.max(0, row.total - boughtQty);
+    const estimate = best ? row.total * best.price : null;
+    const cost = spent + (short > 0 && best ? short * best.price : 0);
+    const item = itemById.get(row.product_id);
+    let selling = 0;
+    let pricedAll = row.product_id != null;
+    for (const [companyId, amount] of Object.entries(row.by_company)) {
+      const special = companyPrices.rows.find((price) => price.company_id === Number(companyId) && price.product_id === row.product_id && price.unit === row.unit);
+      const price = special ? Number(special.price) : item && item.unit === row.unit && item.sell_price != null ? Number(item.sell_price) : null;
+      if (price == null) pricedAll = false;
+      else selling += amount * price;
+    }
+    const costKnown = boughtQty > 0 || best != null;
+    totals.items += 1;
+    if (estimate != null) totals.estimate += estimate;
+    totals.spent += spent;
+    if (costKnown) totals.cost += cost;
+    if (pricedAll) { totals.selling += selling; totals.priced_items += 1; }
+    if (!best && !boughtQty) totals.missing_rates += 1;
+    if (!pricedAll) totals.missing_prices += 1;
+    if (short > 0 && row.total > 0) totals.short_items += 1;
+    return {
+      key: row.key, product_id: row.product_id, name: row.name, unit: row.unit, need: row.total,
+      rates, best, estimate, bought, bought_qty: Number(qtyText(boughtQty)), spent, short: Number(qtyText(short)),
+      cost: costKnown ? cost : null, selling: pricedAll ? selling : null,
+      margin: pricedAll && costKnown ? selling - cost : null,
+    };
+  });
+  const comparable = rows.filter((row) => row.margin != null);
+  totals.margin = comparable.reduce((sum, row) => sum + row.margin, 0);
+  totals.margin_selling = comparable.reduce((sum, row) => sum + row.selling, 0);
+  totals.margin_percent = totals.margin_selling ? Math.round((totals.margin / totals.margin_selling) * 1000) / 10 : null;
+  return { rows, totals };
+}
+
+function masterWorkbook(round, sheet, buying = null) {
+  const bestOf = (row) => buying?.rows.find((item) => item.key === row.key)?.best || null;
+  const header = ["Item", "Unit", "Total", ...sheet.companies.map((company) => company.name), "Best rate (₹)", "Vendor"];
   const rows = sheet.master.map((row) => [
     row.name + (row.to_check ? " (check name)" : ""), row.unit, row.total,
     ...sheet.companies.map((company) => (row.by_company[company.id] ? Number(qtyText(row.by_company[company.id])) : "")),
+    bestOf(row)?.price ?? "", bestOf(row)?.vendor_name ?? "",
   ]);
   const title = `Snackit Direct Supply · ${round.ref} · Delivery ${dayLabel(round.delivery_date)}${round.title ? ` · ${round.title}` : ""}`;
   const worksheet = XLSX.utils.aoa_to_sheet([[title], [], header, ...rows]);
-  worksheet["!cols"] = [{ wch: 36 }, { wch: 8 }, { wch: 9 }, ...sheet.companies.map(() => ({ wch: 16 }))];
+  worksheet["!cols"] = [{ wch: 36 }, { wch: 8 }, { wch: 9 }, ...sheet.companies.map(() => ({ wch: 16 })), { wch: 12 }, { wch: 20 }];
   const workbook = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(workbook, worksheet, "Master sheet");
   return XLSX.write(workbook, { type: "buffer", bookType: "xlsx" });
@@ -214,17 +337,19 @@ export function registerDirectSupplyRoutes(app, { auth }) {
 
   // Everything the page needs to start: companies, items and the supply rounds.
   app.get("/supply/overview", auth, handle("SUPPLY OVERVIEW", async (req, res) => {
-    const [companies, items, rounds] = await Promise.all([
+    const [companies, items, rounds, vendors] = await Promise.all([
       db.query("SELECT * FROM supply_companies ORDER BY active DESC, name"),
       products(),
       db.query(`SELECT r.*, COUNT(DISTINCT o.company_id)::int AS company_count, COUNT(l.id)::int AS line_count
                 FROM supply_rounds r LEFT JOIN supply_orders o ON o.round_id = r.id LEFT JOIN supply_lines l ON l.order_id = o.id
                 GROUP BY r.id ORDER BY r.delivery_date DESC, r.id DESC LIMIT 200`),
+      db.query("SELECT * FROM supply_vendors ORDER BY active DESC, name"),
     ]);
     const { rows: buyer } = await db.query("SELECT value FROM app_settings WHERE key = 'supply_buyer_id'").catch(() => ({ rows: [] }));
     res.json({
       companies: companies.rows,
-      products: items,
+      vendors: vendors.rows,
+      products: items.map((item) => ({ ...item, pack_size: item.pack_size == null ? null : Number(item.pack_size), sell_price: item.sell_price == null ? null : Number(item.sell_price) })),
       rounds: rounds.rows.map((round) => ({ ...round, delivery_date: plainDate(round.delivery_date) })),
       units: UNITS,
       buyer_id: buyer[0]?.value || null,
@@ -300,7 +425,8 @@ export function registerDirectSupplyRoutes(app, { auth }) {
        WHERE o.round_id = $1 GROUP BY o.id, c.name ORDER BY c.name, o.id`,
       [round.id]
     );
-    res.json({ round, orders, ...(await masterOf(round.id)) });
+    const sheet = await masterOf(round.id);
+    res.json({ round, orders, ...sheet, buying: await buyingOf(round.id, sheet) });
   }));
 
   /* ---------- Orders ---------- */
@@ -407,9 +533,14 @@ export function registerDirectSupplyRoutes(app, { auth }) {
 
   /* ---------- Items ---------- */
   app.patch("/supply/products/:id", auth, handle("SUPPLY PRODUCT", async (req, res) => {
-    const fields = ["name", "unit", "category"].filter((key) => req.body?.[key] !== undefined);
+    const fields = ["name", "unit", "category", "pack_size", "sell_price"].filter((key) => req.body?.[key] !== undefined);
     if (!fields.length) return res.status(400).json({ error: "Nothing to change" });
-    const values = fields.map((key) => (key === "name" ? displayName(req.body.name) : String(req.body[key] || "").trim() || null));
+    for (const key of ["pack_size", "sell_price"]) {
+      if (fields.includes(key) && req.body[key] !== "" && req.body[key] !== null && !(Number(req.body[key]) >= 0)) return res.status(400).json({ error: "Enter a number" });
+    }
+    const values = fields.map((key) => (key === "name" ? displayName(req.body.name)
+      : ["pack_size", "sell_price"].includes(key) ? (req.body[key] === "" || req.body[key] === null ? null : Number(req.body[key]))
+        : String(req.body[key] || "").trim() || null));
     const { rows } = await db.query(
       `UPDATE supply_products SET ${fields.map((key, index) => `${key} = $${index + 2}`).join(", ")} WHERE id = $1 RETURNING *`,
       [req.params.id, ...values]
@@ -437,11 +568,123 @@ export function registerDirectSupplyRoutes(app, { auth }) {
     res.json({ success: true });
   }));
 
+  /* ---------- Vendors, rates, purchases, selling prices (phase 2) ---------- */
+  app.get("/supply/vendors", auth, handle("SUPPLY VENDORS", async (req, res) => {
+    const { rows } = await db.query(
+      `SELECT v.*, COUNT(DISTINCT q.product_id)::int AS rated_items, MAX(q.recorded_at) AS last_rate_at
+       FROM supply_vendors v LEFT JOIN supply_prices q ON q.vendor_id = v.id GROUP BY v.id ORDER BY v.active DESC, v.name`
+    );
+    res.json(rows);
+  }));
+
+  app.post("/supply/vendors", auth, handle("SUPPLY VENDOR", async (req, res) => {
+    const name = String(req.body?.name || "").trim().slice(0, 120);
+    if (!name) return res.status(400).json({ error: "Vendor name is required" });
+    const { rows } = await db.query(
+      "INSERT INTO supply_vendors (name, contact_name, phone, location, notes) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (name) DO NOTHING RETURNING *",
+      [name, req.body?.contact_name || null, req.body?.phone || null, req.body?.location || null, req.body?.notes || null]
+    );
+    if (!rows.length) return res.status(400).json({ error: `${name} is already in the list` });
+    res.locals.activity = { section: "Direct Supply", action: `Added vendor ${name}` };
+    res.status(201).json(rows[0]);
+  }));
+
+  app.patch("/supply/vendors/:id", auth, handle("SUPPLY VENDOR UPDATE", async (req, res) => {
+    const fields = ["name", "contact_name", "phone", "location", "notes", "active"].filter((key) => req.body?.[key] !== undefined);
+    if (!fields.length) return res.status(400).json({ error: "Nothing to change" });
+    const { rows } = await db.query(
+      `UPDATE supply_vendors SET ${fields.map((key, index) => `${key} = $${index + 2}`).join(", ")} WHERE id = $1 RETURNING *`,
+      [req.params.id, ...fields.map((key) => req.body[key])]
+    );
+    if (!rows.length) return res.status(404).json({ error: "Vendor not found" });
+    res.json(rows[0]);
+  }));
+
+  // A vendor's rate for an item (per unit). Every rate is kept, so the history shows price changes.
+  app.post("/supply/prices", auth, handle("SUPPLY RATE", async (req, res) => {
+    const price = Number(req.body?.price);
+    if (!(price >= 0) || req.body?.price === "" || req.body?.price == null) return res.status(400).json({ error: "Enter the rate" });
+    if (!req.body?.product_id || !req.body?.vendor_id) return res.status(400).json({ error: "Choose the item and the vendor" });
+    const unit = UNITS.includes(req.body?.unit) ? req.body.unit : "pcs";
+    await db.query(
+      "INSERT INTO supply_prices (product_id, vendor_id, unit, price, round_id, recorded_by) VALUES ($1, $2, $3, $4, $5, $6)",
+      [req.body.product_id, req.body.vendor_id, unit, price, req.body?.round_id || null, userName(req.user)]
+    );
+    res.status(201).json({ success: true });
+  }));
+
+  app.get("/supply/products/:id/prices", auth, handle("SUPPLY RATE HISTORY", async (req, res) => {
+    const { rows } = await db.query(
+      `SELECT q.id, q.unit, q.price, q.recorded_at, q.recorded_by, v.name AS vendor_name
+       FROM supply_prices q JOIN supply_vendors v ON v.id = q.vendor_id WHERE q.product_id = $1 ORDER BY q.recorded_at DESC LIMIT 100`,
+      [req.params.id]
+    );
+    res.json(rows.map((row) => ({ ...row, price: Number(row.price) })));
+  }));
+
+  // What was really bought for a round. The price paid also goes into the vendor's rates.
+  app.post("/supply/rounds/:id/purchases", auth, handle("SUPPLY PURCHASE", async (req, res) => {
+    const round = await roundById(req.params.id);
+    if (!round) return res.status(404).json({ error: "Not found" });
+    const qty = Number(req.body?.qty);
+    const price = Number(req.body?.price);
+    if (!(qty > 0)) return res.status(400).json({ error: "Enter the quantity bought" });
+    if (!(price >= 0) || req.body?.price === "" || req.body?.price == null) return res.status(400).json({ error: "Enter the price paid per unit" });
+    if (!req.body?.product_id || !req.body?.vendor_id) return res.status(400).json({ error: "Choose the item and the vendor" });
+    const unit = UNITS.includes(req.body?.unit) ? req.body.unit : "pcs";
+    const by = userName(req.user);
+    await db.query(
+      "INSERT INTO supply_purchases (round_id, product_id, vendor_id, unit, qty, price, notes, bought_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+      [round.id, req.body.product_id, req.body.vendor_id, unit, qty, price, String(req.body?.notes || "").slice(0, 300) || null, by]
+    );
+    await db.query(
+      "INSERT INTO supply_prices (product_id, vendor_id, unit, price, round_id, recorded_by) VALUES ($1, $2, $3, $4, $5, $6)",
+      [req.body.product_id, req.body.vendor_id, unit, price, round.id, by]
+    );
+    await db.query("UPDATE supply_rounds SET updated_at = NOW() WHERE id = $1", [round.id]);
+    res.locals.activity = { section: "Direct Supply", action: `Recorded purchase for ${round.ref}: ${qty} ${unit} at ₹${price}` };
+    res.status(201).json({ success: true });
+  }));
+
+  app.delete("/supply/purchases/:id", auth, handle("SUPPLY PURCHASE DELETE", async (req, res) => {
+    const { rows } = await db.query("DELETE FROM supply_purchases WHERE id = $1 RETURNING id", [req.params.id]);
+    if (!rows.length) return res.status(404).json({ error: "Not found" });
+    res.json({ success: true });
+  }));
+
+  // Selling prices: each item's default, and any company that pays differently.
+  app.get("/supply/selling-prices", auth, handle("SUPPLY SELLING", async (req, res) => {
+    const [items, special] = await Promise.all([
+      db.query("SELECT id, name, unit, category, sell_price FROM supply_products ORDER BY category NULLS LAST, name"),
+      db.query("SELECT company_id, product_id, unit, price FROM supply_company_prices"),
+    ]);
+    res.json({ items: items.rows.map((item) => ({ ...item, sell_price: item.sell_price == null ? null : Number(item.sell_price) })), company_prices: special.rows.map((row) => ({ ...row, price: Number(row.price) })) });
+  }));
+
+  app.put("/supply/company-prices", auth, handle("SUPPLY COMPANY PRICE", async (req, res) => {
+    const { company_id: companyId, product_id: productId } = req.body || {};
+    const unit = UNITS.includes(req.body?.unit) ? req.body.unit : "pcs";
+    if (!companyId || !productId) return res.status(400).json({ error: "Choose the company and item" });
+    if (req.body?.price === "" || req.body?.price == null) {
+      await db.query("DELETE FROM supply_company_prices WHERE company_id = $1 AND product_id = $2 AND unit = $3", [companyId, productId, unit]);
+      return res.json({ success: true });
+    }
+    const price = Number(req.body.price);
+    if (!(price >= 0)) return res.status(400).json({ error: "Enter a number" });
+    await db.query(
+      `INSERT INTO supply_company_prices (company_id, product_id, unit, price) VALUES ($1, $2, $3, $4)
+       ON CONFLICT (company_id, product_id, unit) DO UPDATE SET price = EXCLUDED.price, updated_at = NOW()`,
+      [companyId, productId, unit, price]
+    );
+    res.json({ success: true });
+  }));
+
   /* ---------- Master sheet out ---------- */
   app.get("/supply/rounds/:id/master.xlsx", auth, handle("SUPPLY EXCEL", async (req, res) => {
     const round = await roundById(req.params.id);
     if (!round) return res.status(404).json({ error: "Not found" });
-    const buffer = masterWorkbook(round, await masterOf(round.id));
+    const sheet = await masterOf(round.id);
+    const buffer = masterWorkbook(round, sheet, await buyingOf(round.id, sheet));
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
     res.setHeader("Content-Disposition", `attachment; filename="Snackit-${round.ref}-master-${round.delivery_date}.xlsx"`);
     res.send(buffer);
@@ -466,8 +709,12 @@ export function registerDirectSupplyRoutes(app, { auth }) {
     }
     const sheet = await masterOf(round.id);
     if (!sheet.master.length) return res.status(400).json({ error: "There are no orders in this round yet" });
+    const buying = await buyingOf(round.id, sheet);
     const toBuy = sheet.master.filter((row) => row.total > 0);
-    const lines = toBuy.slice(0, 60).map((row) => `• ${row.name}: *${row.total} ${row.unit}*${row.to_check ? " (check name)" : ""}`);
+    const lines = toBuy.slice(0, 60).map((row) => {
+      const best = buying.rows.find((item) => item.key === row.key)?.best;
+      return `• ${row.name}: *${row.total} ${row.unit}*${best ? ` · best ₹${best.price}/${row.unit} at ${best.vendor_name}` : ""}${row.to_check ? " (check name)" : ""}`;
+    });
     const body = [
       `🛒 *Stock to buy · ${round.ref}*`,
       `Delivery: ${dayLabel(round.delivery_date)}${round.title ? ` · ${round.title}` : ""}`,
@@ -483,7 +730,7 @@ export function registerDirectSupplyRoutes(app, { auth }) {
     const file = await storeDashboardFile({
       name: `Snackit-${round.ref}-master-${round.delivery_date}.xlsx`,
       type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-      data: masterWorkbook(round, sheet).toString("base64"),
+      data: masterWorkbook(round, sheet, buying).toString("base64"),
     });
     const document = await sendStoredFile(to, file, `${round.ref} master sheet`);
     await db.query(
