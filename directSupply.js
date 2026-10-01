@@ -371,7 +371,8 @@ export function registerDirectSupplyRoutes(app, { auth }) {
   }));
 
   app.patch("/supply/companies/:id", auth, handle("SUPPLY COMPANY UPDATE", async (req, res) => {
-    const fields = ["name", "contact_name", "contact_phone", "location", "active"].filter((key) => req.body?.[key] !== undefined);
+    const fields = ["name", "contact_name", "contact_phone", "location", "active", "billing_name", "address", "gstin", "payment_days"].filter((key) => req.body?.[key] !== undefined);
+    if (fields.includes("payment_days")) req.body.payment_days = req.body.payment_days === "" || req.body.payment_days == null ? null : Math.max(0, Math.round(Number(req.body.payment_days)) || 0);
     if (!fields.length) return res.status(400).json({ error: "Nothing to change" });
     const { rows } = await db.query(
       `UPDATE supply_companies SET ${fields.map((key, index) => `${key} = $${index + 2}`).join(", ")} WHERE id = $1 RETURNING *`,
