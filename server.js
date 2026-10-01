@@ -37,6 +37,7 @@ import { ensureDirectSupply, registerDirectSupplyRoutes } from "./directSupply.j
 import { ensureSupplyBilling, registerSupplyBillingRoutes } from "./supplyBilling.js";
 import { ensureSupplyOrderLink, registerSupplyOrderLinkRoutes } from "./supplyOrderLink.js";
 import { initSupplyReports, registerSupplyReportRoutes } from "./supplyReports.js";
+import { initSupplyWhatsApp, handleSupplyWhatsApp } from "./supplyWhatsApp.js";
 import { ensureCapaOverdue, capaOverdueTick, registerCapaOverdueRoutes, handleCapaOverdueWhatsApp } from "./capaOverdue.js";
 import { ensureAttention, attentionReason, isExpectedAnswer, alertAdmins, registerAttentionRoutes, locationProblem, LOCATION_AGAIN } from "./attention.js";
 import { CHARGED_MORE_THAN_ONCE, PRODUCT_QUESTION, COUNT_QUESTION, paymentPrompt, parseChargeCount, extractTransactionIds, paymentId, refundFor, receivedMessage, doneMessage, mergePayments } from "./multiPayment.js";
@@ -4071,6 +4072,13 @@ app.post("/webhook", async (req, res) => {
       console.log("CAPA OVERDUE MESSAGE ERROR:", err.message);
     }
 
+    // Company admins send Direct Supply orders to this number (see supplyWhatsApp.js).
+    try {
+      if (await handleSupplyWhatsApp(msg)) return res.sendStatus(200);
+    } catch (err) {
+      console.log("SUPPLY WHATSAPP ERROR:", err.message);
+    }
+
     // Refillers answer their CAPA tasks here; they never get the customer menu or a ticket.
     try {
       if (await handleRefillerWhatsApp(db, msg)) return res.sendStatus(200);
@@ -4770,6 +4778,7 @@ try {
   await ensureSupplyBilling(db).catch((err) => console.error("SUPPLY BILLING SETUP ERROR:", err.message));
   await ensureSupplyOrderLink(db, { onChanged: () => io.emit("supply-changed") }).catch((err) => console.error("SUPPLY ORDER LINK SETUP ERROR:", err.message));
   initSupplyReports(db);
+  initSupplyWhatsApp(db, { onChanged: () => io.emit("supply-changed") });
   // CAPA tasks open for 24 hours: WhatsApp alert to Monish (Admin Settings), then a 10 am daily reminder.
   await ensureCapaOverdue(db).catch((err) => console.error("CAPA OVERDUE SETUP ERROR:", err.message));
   setInterval(capaOverdueTick, 5 * 60 * 1000);

@@ -153,7 +153,7 @@ async function createProduct(name, unit) {
 }
 
 // Reads one order: lines from pasted text or an Excel/CSV file ({ name, data: base64 }).
-function readOrder({ text, file }) {
+export function readOrder({ text, file }) {
   if (file?.data) {
     const buffer = Buffer.from(String(file.data).replace(/^data:[^,]+,/, ""), "base64");
     const workbook = XLSX.read(buffer, { type: "buffer" });
@@ -377,6 +377,18 @@ export function registerDirectSupplyRoutes(app, { auth }) {
       units: UNITS,
       buyer_id: buyer[0]?.value || null,
     });
+  }));
+
+  // Who buys the stock: gets the master sheet, and orders that arrive on WhatsApp are forwarded to them.
+  app.put("/supply/buyer", auth, handle("SUPPLY BUYER", async (req, res) => {
+    const buyer = (global.internalUsers || []).find((user) => String(user.id) === String(req.body?.buyer_id));
+    if (!buyer) return res.status(400).json({ error: "Choose who buys the stock" });
+    await db.query(
+      `INSERT INTO app_settings (key, value, updated_at) VALUES ('supply_buyer_id', $1, NOW())
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+      [String(buyer.id)]
+    );
+    res.json({ success: true });
   }));
 
   /* ---------- Companies ---------- */
