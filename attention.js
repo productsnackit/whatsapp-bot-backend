@@ -1,11 +1,13 @@
 /* =========================================================
     TICKETS THAT NEED A PERSON
-    There is no "talk to admin" option in the bot's menus. Instead the bot reads what the
-    customer writes and hands the chat to the team when:
-      • they ask for a person ("talk to someone", "customer care", "call me", "manager"…)
-        or are clearly upset ("fraud", "cheated", "complaint", "worst"…);
-      • they write a sentence where the bot expects a menu number, or pick a wrong option twice;
-      • they write a sentence after their ticket was submitted or closed.
+    There is no "talk to admin" option in the bot's menus. The bot hands the chat to the team
+    only when the customer:
+      • asks for a person ("talk to someone", "customer care", "call me", "manager"…);
+      • says their issue isn't in the options ("this is not my issue", "none of these",
+        "my issue is different", "other");
+      • uses serious words ("fraud", "scam", "cheated", "police", "consumer court");
+      • is stuck: three wrong menu answers in a row, or no real location after three tries.
+    Everything else gets the normal bot reply.
     The ticket goes to Admin Mode (the bot stops replying), gets high priority and a
     "Needs attention" badge, and the admins set in Admin Settings → "Admin WhatsApp alerts"
     get a WhatsApp message with what the customer said.
@@ -24,24 +26,25 @@ const phoneDigits = (phone) => {
   return digits.length === 10 ? `91${digits}` : digits;
 };
 
-const PEOPLE = "admin|administrator|human|person|agent|executive|someone|somebody|anyone|support|staff|team|manager|owner|representative|customer ?care|care|operator|officer";
+/* Kept deliberately narrow: only clear requests hand the chat over, everything else gets the
+   normal bot reply. (An earlier, broader version handed over almost every chat.) */
+const PEOPLE = "admin|administrator|human|person|agent|executive|someone|somebody|support team|staff|manager|owner|representative|customer care|operator";
 const ASKS_FOR_PERSON = [
-  new RegExp(`\\b(talk|speak|chat|connect|contact|call|reach|transfer)\\w*\\b.{0,30}\\b(${PEOPLE})\\b`, "i"),
-  /\b(customer (care|service|support)|real person|human being|live (agent|chat|person)|call me|call back|callback|give me a call|phone number|contact number|your number|helpline)\b/i,
-  /^(agent|human|admin|support|helpline|customer care|manager)[.!? ]*$/i,
-  /\b(baat|bat)\s*(karna|karni|karo|krna|krni)\b/i,
+  // "I want to talk to someone", "connect me to an agent", "speak with the manager"
+  new RegExp(`\\b(talk|speak|chat|connect|transfer)\\w*\\b(\\s+\\w+){0,4}\\s+(${PEOPLE})\\b`, "i"),
+  /\b(customer (care|service) (number|executive)?|real person|human being|live (agent|person)|call me|call back|callback|give me a call|helpline)\b/i,
+  /^(agent|human|admin|helpline|customer care|manager|talk to (admin|agent|human|someone))[.!? ]*$/i,
+  /\b(kisi se|insaan se|aadmi se|person se)?\s*(baat|bat)\s*(karna|karni|karo|krna|krni)\s*(hai|h)?\b/i,
 ];
-const UPSET = /\b(fraud|scam|cheat(ed|ing)?|police|consumer (court|forum)|legal action|complaint|complain|worst|pathetic|useless|disgusting|no response|not responding|nobody (is )?respond|still (not|no|didn'?t)|waiting since|how many days|when will i get|refund (not|nahi) (received|came|credited))\b/i;
+// "This is not my issue", "none of these", "my problem is different", "something else".
+const NOT_LISTED = /\b(not my (issue|problem|query|concern)|none of (these|this|them|the above|the options)|no option (fits|matches|for (me|my (issue|problem)))|my (issue|problem|query|concern) is (different|something else|not (listed|there|here|in (the )?(list|menu|options)))|(different|other|another) (issue|problem|query|concern)|something else|not (listed|in the (list|menu|options)))\b/i;
+const NOT_LISTED_WORD = /^(other|others|none|none of these|something else)[.!? ]*$/i;
+// Only serious words: "complaint", "still not received" and the like are normal refund chats.
+const UPSET = /\b(fraud|scam|cheat(ed|ing|er)?|police|consumer (court|forum)|legal action|lawyer|cyber ?crime)\b/i;
 
 export const asksForPerson = (text) => ASKS_FOR_PERSON.some((pattern) => pattern.test(String(text || "").trim()));
+export const notListed = (text) => NOT_LISTED.test(String(text || "")) || NOT_LISTED_WORD.test(String(text || "").trim());
 export const soundsUpset = (text) => UPSET.test(String(text || ""));
-
-// A real sentence (not "ok", "hi", "2", a transaction ID or a UPI ID).
-export function isSentence(text) {
-  const value = String(text || "").trim();
-  const words = value.split(/\s+/).filter((word) => /[a-zऀ-ൿ]/i.test(word));
-  return words.length >= 3 && value.length >= 12;
-}
 
 // Steps where the bot waits for a photo or screenshot.
 const PHOTO_STEPS = ["STEP1", "STEP3", "EXP_IMG", "EXP_UPI_IMG", "PRICE_IMG", "PRICE_UPI_IMG", "DAM_IMG", "DAM_UPI_IMG"];
@@ -68,20 +71,17 @@ export function isExpectedAnswer(category, state, text) {
 /* Why this message should go to a person, or null.
    misses: how many wrong answers in a row at this step (kept by the caller). */
 export function attentionReason({ category, state, text, isImage, hasTransactionIds, misses = 0 }) {
-  if (isImage) return null;
+  if (isImage || hasTransactionIds) return null;
   // Asking for a person counts at every step.
   if (asksForPerson(text)) return "Asked to talk to a person";
   const answers = expectedAnswers(category, state);
-  // Complaints only where the bot isn't waiting for free text (a location, an ID, a comment):
+  // The rest only where the bot isn't waiting for free text (a location, an ID, a comment):
   // at a menu, before the menu, at a photo step, or after the ticket was submitted or closed.
   const listening = Boolean(answers) || !category || PHOTO_STEPS.includes(state) || state === "DONE" || state === "CLOSED";
-  if (listening && soundsUpset(text)) return "Upset or complaining";
-  const sentence = isSentence(text) && !hasTransactionIds;
-  if (state === "DONE" && sentence) return "Wrote again after the ticket was submitted";
-  if (state === "CLOSED" && sentence) return "Wrote again after the ticket was closed";
-  if (!answers || isExpectedAnswer(category, state, text)) return null;
-  if (sentence) return "Wrote something the menu doesn't cover";
-  if (misses >= 1) return "Couldn't pick a menu option";
+  if (listening && notListed(text)) return "Said their issue isn't in the options";
+  if (listening && soundsUpset(text)) return "Upset (fraud / police / legal)";
+  // Stuck at a menu: three wrong answers in a row.
+  if (answers && !isExpectedAnswer(category, state, text) && misses >= 2) return "Couldn't pick a menu option (3 tries)";
   return null;
 }
 
@@ -101,6 +101,41 @@ export async function ensureAttention(database) {
       ADD COLUMN IF NOT EXISTS attention_reason TEXT,
       ADD COLUMN IF NOT EXISTS attention_text TEXT
   `);
+  await releaseOldHandOffs().catch((err) => console.log("ATTENTION CLEAN-UP ERROR:", err.message));
+}
+
+/* Once: the first version handed over almost every chat (any sentence after submitting, any
+   sentence at a menu, words like "complaint"). Those chats sat in Admin Mode with the bot
+   silent. Each one that the narrower rules wouldn't hand over, and that nobody on the team has
+   replied to since, goes back to the bot (the customer isn't messaged). */
+const OLD_REASONS = [
+  "Wrote again after the ticket was submitted",
+  "Wrote again after the ticket was closed",
+  "Wrote something the menu doesn't cover",
+  "Couldn't pick a menu option",
+  "Upset or complaining",
+];
+async function releaseOldHandOffs() {
+  const { rows: done } = await db.query("SELECT 1 FROM app_settings WHERE key = 'attention_v2_released'");
+  if (done.length) return;
+  const { rows } = await db.query(
+    `SELECT t.id, t.attention_text FROM tickets t
+     WHERE t.attention_reason = ANY($1) AND COALESCE(t.takeover, FALSE) = TRUE
+       AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.ticket_id = t.id AND m.sender = 'admin' AND m.created_at >= t.attention_at)`,
+    [OLD_REASONS]
+  );
+  const release = rows.filter((row) => !asksForPerson(row.attention_text) && !notListed(row.attention_text) && !soundsUpset(row.attention_text)).map((row) => row.id);
+  if (release.length) {
+    await db.query(
+      "UPDATE tickets SET takeover = FALSE, priority = 'normal', attention_at = NULL, updated_at = NOW() WHERE id = ANY($1)",
+      [release]
+    );
+  }
+  await db.query(
+    "INSERT INTO app_settings (key, value, updated_at) VALUES ('attention_v2_released', $1, NOW()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+    [String(release.length)]
+  );
+  console.log(`🔔 Attention clean-up: ${release.length} chat(s) handed over by the old rules went back to the bot`);
 }
 
 const oneLine = (text, max = 700) => String(text || "").replace(/\s*\n+\s*/g, " · ").replace(/\s{4,}/g, "   ").trim().slice(0, max) || "-";
