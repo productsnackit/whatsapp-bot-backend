@@ -76,7 +76,8 @@ export function sendWhatsAppButtons(to, body, buttons) {
 }
 
 // Meta-approved template: works any time. bodyParams fill {{1}}, {{2}}…; buttonPayloads go to its quick-reply buttons in order.
-export function sendWhatsAppTemplate(to, name, language, bodyParams = [], buttonPayloads = []) {
+// headerDocument ({ link, filename }) fills a template whose header is a document (e.g. an Excel file).
+export function sendWhatsAppTemplate(to, name, language, bodyParams = [], buttonPayloads = [], headerDocument = null) {
   return postToWhatsApp({
     messaging_product: "whatsapp",
     to,
@@ -85,6 +86,7 @@ export function sendWhatsAppTemplate(to, name, language, bodyParams = [], button
       name,
       language: { code: language },
       components: [
+        ...(headerDocument ? [{ type: "header", parameters: [{ type: "document", document: { link: headerDocument.link, filename: headerDocument.filename } }] }] : []),
         { type: "body", parameters: bodyParams.map((text) => ({ type: "text", text: String(text) })) },
         ...buttonPayloads.map((payload, index) => ({ type: "button", sub_type: "quick_reply", index: String(index), parameters: [{ type: "payload", payload }] })),
       ],

@@ -12,7 +12,9 @@
         (price + margin %);
       • WhatsApp buttons take him through the steps:
         Received → Processing → Ordered → Goods received → Sent.
-    Outside WhatsApp's 24-hour window the approved template "supply_buyer_list" is used:
+    The Excel master sheet is attached every time (and the updated one with each update).
+    Outside WhatsApp's 24-hour window the approved template "supply_buyer_list" is used, with the
+    Excel file as its document header:
     "Hi, {{1}} is ready: {{2}} items to buy. Open it to update …: {{3}} Thank you." ({{1}} = "the stock list for Tue, 6 Oct"); button "Received".
 ========================================================= */
 import crypto from "crypto";
@@ -151,27 +153,31 @@ export async function sendListToBuyer(roundOrId, kind = "new") {
     ].filter((line, index, all) => line !== "" || all[index - 1] !== "").join("\n");
   }
 
+  // The Excel master sheet goes every time: with the list, and again (up to date) with each update.
+  const fileName = `Snackit-${round.ref}-master-${round.delivery_date}${isUpdate ? "-updated" : ""}.xlsx`;
+  const file = await storeDashboardFile({
+    name: fileName,
+    type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    data: masterWorkbook(round, sheet, buying).toString("base64"),
+  }).catch((err) => { console.log("SUPPLY BUYER EXCEL ERROR:", err.message); return null; });
+
   let fileSent = false;
   let viaTemplate = false;
   if (await refillerWindowOpen(to)) {
     const text = await sendWhatsAppPayload({ messaging_product: "whatsapp", to, type: "text", text: { body: body.slice(0, 4000) } });
     if (!text.ok) return { ok: false, error: text.error || "WhatsApp didn't accept the message" };
-    if (!isUpdate) {
-      const file = await storeDashboardFile({
-        name: `Snackit-${round.ref}-master-${round.delivery_date}.xlsx`,
-        type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        data: masterWorkbook(round, sheet, buying).toString("base64"),
-      }).catch(() => null);
-      if (file) fileSent = Boolean((await sendStoredFile(to, file, `${round.ref} master sheet`)).ok);
-    }
+    if (file) fileSent = Boolean((await sendStoredFile(to, file, `${round.ref} master sheet${isUpdate ? " (updated)" : ""}`)).ok);
     const next = nextStep(round.buyer_status);
     if (next) await sendWhatsAppButtons(to, isUpdate ? "Tap to say you've seen the change." : "Tap when you've seen the list.", [{ id: `SB:${round.id}:${next}`, title: next }]);
   } else {
-    const result = await sendWhatsAppTemplate(to, TEMPLATE, "en", [`${isUpdate ? "the updated stock list" : "the stock list"} for ${label}`, String(rows.length), url], [`SB:${round.id}:Received`]);
+    // Outside WhatsApp's 24 hours: the approved template, with the Excel file at the top.
+    const params = [`${isUpdate ? "the updated stock list" : "the stock list"} for ${label}`, String(rows.length), url];
+    const result = await sendWhatsAppTemplate(to, TEMPLATE, "en", params, [`SB:${round.id}:Received`], file ? { link: file.url, filename: fileName } : null);
     if (!result.ok) {
-      return { ok: false, error: `${contact.name || "The buyer"} hasn't messaged the Snackit number in the last 24 hours, and the "${TEMPLATE}" template didn't go (${result.error}). Ask them to send "hi" to the Snackit number, or create the template in Meta.` };
+      return { ok: false, error: `${contact.name || "The buyer"} hasn't messaged the Snackit number in the last 24 hours, and the "${TEMPLATE}" template didn't go (${result.error}). Ask them to send "hi" to the Snackit number, or check the template in Meta.` };
     }
     viaTemplate = true;
+    fileSent = Boolean(file);
   }
 
   await db.query(
