@@ -16,16 +16,9 @@
 ========================================================= */
 import XLSX from "xlsx";
 import { parseText, parseRows, parseOrderMessage, cleanName, displayName, matchName, normaliseUnit, UNITS } from "./supplyParse.js";
-import { storeDashboardFile, sendStoredFile } from "./ticketChat.js";
-import { sendWhatsAppPayload } from "./whatsapp.js";
-import { refillerWindowOpen } from "./whatsappOutbox.js";
 
 let db = null;
 const userName = (user) => (user?.role === "admin" ? "Admin" : user?.name || user?.username || "Employee");
-const phoneDigits = (phone) => {
-  const digits = String(phone || "").replace(/\D/g, "");
-  return digits.length === 10 ? `91${digits}` : digits;
-};
 const pad = (n) => String(n).padStart(2, "0");
 const plainDate = (value) => (value instanceof Date ? `${value.getFullYear()}-${pad(value.getMonth() + 1)}-${pad(value.getDate())}` : value);
 const dayLabel = (date) => new Date(`${plainDate(date)}T00:00:00`).toLocaleDateString("en-IN", { weekday: "short", day: "numeric", month: "short" });
@@ -185,7 +178,7 @@ async function withMatches(lines) {
 
 /* The master sheet: every line of the round, combined by item and unit.
    Lines still waiting for "same item?" are combined under their own name and marked. */
-async function masterOf(roundId) {
+export async function masterOf(roundId) {
   const { rows: lines } = await db.query(
     `SELECT l.*, p.name AS product_name, p.category, p.unit AS product_unit, p.pack_size, s.name AS suggestion_name, c.name AS company_name
      FROM supply_lines l
@@ -241,7 +234,7 @@ async function masterOf(roundId) {
 /* Buying for a round, per master-sheet item: the latest rate from each vendor (cheapest first),
    what was bought, what is still short, the selling value (company price, else the item's
    default price) and the margin. Cost is what was spent, plus the best rate for anything short. */
-async function buyingOf(roundId, sheet) {
+export async function buyingOf(roundId, sheet) {
   const ids = sheet.master.filter((row) => row.product_id).map((row) => row.product_id);
   const [quotes, purchases, companyPrices, items] = await Promise.all([
     db.query(
@@ -304,7 +297,7 @@ async function buyingOf(roundId, sheet) {
   return { rows, totals };
 }
 
-function masterWorkbook(round, sheet, buying = null) {
+export function masterWorkbook(round, sheet, buying = null) {
   const bestOf = (row) => buying?.rows.find((item) => item.key === row.key)?.best || null;
   const header = ["Item", "Unit", "Total", ...sheet.companies.map((company) => company.name), "Best rate (₹)", "Vendor"];
   const rows = sheet.master.map((row) => [
@@ -343,7 +336,7 @@ export async function saveOrderLines(orderId, roundId, companyId, lines) {
   return created;
 }
 
-async function roundById(id) {
+export async function roundById(id) {
   const { rows } = await db.query("SELECT * FROM supply_rounds WHERE id = $1", [id]);
   return rows[0] ? { ...rows[0], delivery_date: plainDate(rows[0].delivery_date) } : null;
 }
@@ -711,54 +704,5 @@ export function registerDirectSupplyRoutes(app, { auth }) {
     res.send(buffer);
   }));
 
-  // To the stock buyer's WhatsApp: a summary and the Excel file. WhatsApp only allows this within
-  // 24 hours of their last message to the Snackit number, so outside that it says so.
-  app.post("/supply/rounds/:id/send", auth, handle("SUPPLY SEND", async (req, res) => {
-    const round = await roundById(req.params.id);
-    if (!round) return res.status(404).json({ error: "Not found" });
-    const buyer = (global.internalUsers || []).find((user) => String(user.id) === String(req.body?.buyer_id));
-    if (!buyer) return res.status(400).json({ error: "Choose who buys the stock" });
-    if (!buyer.phone) return res.status(400).json({ error: `${buyer.name} has no WhatsApp number. Add it in Employees & Access.` });
-    await db.query(
-      `INSERT INTO app_settings (key, value, updated_at) VALUES ('supply_buyer_id', $1, NOW())
-       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
-      [String(buyer.id)]
-    );
-    const to = phoneDigits(buyer.phone);
-    if (!(await refillerWindowOpen(to))) {
-      return res.status(409).json({ error: `${buyer.name} hasn't messaged the Snackit WhatsApp number in the last 24 hours, so WhatsApp won't deliver it. Ask them to send "hi", then try again, or download the Excel and share it.` });
-    }
-    const sheet = await masterOf(round.id);
-    if (!sheet.master.length) return res.status(400).json({ error: "There are no orders in this round yet" });
-    const buying = await buyingOf(round.id, sheet);
-    const toBuy = sheet.master.filter((row) => row.total > 0);
-    const lines = toBuy.slice(0, 60).map((row) => {
-      const best = buying.rows.find((item) => item.key === row.key)?.best;
-      return `• ${row.name}: *${row.total} ${row.unit}*${best ? ` · best ₹${best.price}/${row.unit} at ${best.vendor_name}` : ""}${row.to_check ? " (check name)" : ""}`;
-    });
-    const body = [
-      `🛒 *Stock to buy · ${round.ref}*`,
-      `Delivery: ${dayLabel(round.delivery_date)}${round.title ? ` · ${round.title}` : ""}`,
-      `${sheet.companies.length} compan${sheet.companies.length === 1 ? "y" : "ies"}: ${sheet.companies.map((company) => company.name).join(", ")}`,
-      "",
-      ...lines,
-      toBuy.length > 60 ? `…and ${toBuy.length - 60} more in the Excel file.` : "",
-      "",
-      "Full sheet with each company's quantity is attached.",
-    ].filter((line, index, all) => line !== "" || all[index - 1] !== "").join("\n").slice(0, 4000);
-    const text = await sendWhatsAppPayload({ messaging_product: "whatsapp", to, type: "text", text: { body } });
-    if (!text.ok) return res.status(502).json({ error: text.error || "WhatsApp didn't accept the message" });
-    const file = await storeDashboardFile({
-      name: `Snackit-${round.ref}-master-${round.delivery_date}.xlsx`,
-      type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-      data: masterWorkbook(round, sheet, buying).toString("base64"),
-    });
-    const document = await sendStoredFile(to, file, `${round.ref} master sheet`);
-    await db.query(
-      "UPDATE supply_rounds SET sent_at = NOW(), sent_to = $2, status = CASE WHEN status = 'Collecting' THEN 'Sent to buyer' ELSE status END, updated_at = NOW() WHERE id = $1",
-      [round.id, buyer.name]
-    );
-    res.locals.activity = { section: "Direct Supply", action: `Sent ${round.ref} master sheet to ${buyer.name}` };
-    res.json({ success: true, file_sent: Boolean(document.ok), round: await roundById(round.id) });
-  }));
+  // Sending the master sheet to the buyer: see supplyBuyer.js.
 }

@@ -8,9 +8,8 @@
         within 12 hours goes to the same date as their last one; otherwise the next date still
         collecting orders, else tomorrow (a new date is started if needed);
       • sending the list again for the same date replaces their earlier WhatsApp order;
-      • the admin gets a reply with what was understood, the stock buyer gets it forwarded
-        (when WhatsApp allows: they messaged the Snackit number in the last 24 hours), and
-        the dashboard is told.
+      • the admin gets a reply with what was understood and the dashboard is told; the stock
+        buyer gets the combined list, and later changes, from supplyBuyer.js.
     Employees can forward a message with several companies ("AERO / - Apple 6 kg / CRED One /
     …"): each company heading becomes that company's order. Other employee messages are left
     alone, so they still reach the rest of the bot.
@@ -19,7 +18,7 @@ import axios from "axios";
 import { readOrder, saveOrderLines } from "./directSupply.js";
 import { parseOrderMessage, displayName } from "./supplyParse.js";
 import { sendWhatsApp } from "./whatsapp.js";
-import { noteInbound, refillerWindowOpen } from "./whatsappOutbox.js";
+import { noteInbound } from "./whatsappOutbox.js";
 import { storeIncomingMedia } from "./ticketChat.js";
 import { sendPushToUsers } from "./pushNotifications.js";
 
@@ -49,7 +48,7 @@ const employeeFor = (phone) => (global.internalUsers || []).find((user) => user.
 
 /* The delivery date for an order: the one in the message (unless already delivered); else, for a
    correction sent soon after (within 12 hours of this company's last WhatsApp order), that same
-   date unless it's delivered (the buyer gets the change forwarded);
+   date unless it's delivered (the buyer gets the updated list);
    else the next date still collecting; else tomorrow. */
 async function roundFor(date, title, by, companyId = null) {
   if (!date && companyId) {
@@ -97,17 +96,6 @@ async function saveOrder({ round, company, lines, rawText, from, sender }) {
 
 const listOf = (lines) => lines.map((line) => `• ${line.name}: ${qty(line.qty)} ${line.unit}`).join("\n");
 
-// Forward to the stock buyer (set when the master sheet is sent), if WhatsApp allows it now.
-async function forwardToBuyer(text) {
-  const { rows } = await db.query("SELECT value FROM app_settings WHERE key = 'supply_buyer_id'").catch(() => ({ rows: [] }));
-  const buyer = (global.internalUsers || []).find((user) => String(user.id) === String(rows[0]?.value));
-  if (!buyer?.phone) return "no buyer";
-  const to = String(buyer.phone).replace(/\D/g, "");
-  if (!(await refillerWindowOpen(to))) return "window closed";
-  await sendWhatsApp(to.length === 10 ? `91${to}` : to, text);
-  return "sent";
-}
-
 // Returns true when the message was a supply order (or from a company admin), so the customer bot skips it.
 export async function handleSupplyWhatsApp(msg) {
   if (!db || !msg?.from) return false;
@@ -135,8 +123,7 @@ export async function handleSupplyWhatsApp(msg) {
     }
     const date = plainDate(round.delivery_date);
     await sendWhatsApp(msg.from, `✅ Added to ${round.ref} · delivery ${dayLabel(date)}:\n\n${summary.join("\n\n")}`.slice(0, 4000));
-    const forwarded = await forwardToBuyer(`🛒 *Orders for ${dayLabel(date)}* (${round.ref}), from ${employee.name}:\n\n${summary.join("\n\n")}`.slice(0, 4000));
-    finish(`${groups.length} companies' orders`, round, date, employee.name, forwarded);
+    finish(`${groups.length} companies' orders`, round, date, employee.name);
     return true;
   }
 
@@ -180,13 +167,13 @@ export async function handleSupplyWhatsApp(msg) {
     "",
     "To change it, just send the full list again. Thank you!",
   ].join("\n").replace(/\n{3,}/g, "\n\n").slice(0, 4000));
-  const forwarded = await forwardToBuyer(`🛒 *${result.updated ? "Updated order" : "New order"} · ${company.name}*\nDelivery ${dayLabel(date)} (${round.ref})\n\n${listOf(lines)}`.slice(0, 4000));
-  finish(`${company.name}'s order`, round, date, sender, forwarded, result.updated);
+  finish(`${company.name}'s order`, round, date, sender, result.updated);
   return true;
 }
 
-function finish(what, round, date, sender, forwarded, updated = false) {
+// The buyer gets the combined list (and later changes) from supplyBuyer.js, not each order.
+function finish(what, round, date, sender, updated = false) {
   onChange();
-  sendPushToUsers(db, ["admin"], { title: `${updated ? "Order updated" : "New order"} on WhatsApp`, body: `${what} for ${round.ref} (${date}) from ${sender}${forwarded === "sent" ? " · forwarded to the buyer" : ""}`.slice(0, 180), view: "supply" }).catch(() => {});
-  console.log(`🛒 WhatsApp supply order: ${what} → ${round.ref} (${date}), buyer: ${forwarded}`);
+  sendPushToUsers(db, ["admin"], { title: `${updated ? "Order updated" : "New order"} on WhatsApp`, body: `${what} for ${round.ref} (${date}) from ${sender}`.slice(0, 180), view: "supply" }).catch(() => {});
+  console.log(`🛒 WhatsApp supply order: ${what} → ${round.ref} (${date})`);
 }
