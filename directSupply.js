@@ -11,7 +11,7 @@
     remembered for next time.
 ========================================================= */
 import XLSX from "xlsx";
-import { parseText, parseRows, cleanName, displayName, matchName, normaliseUnit, UNITS } from "./supplyParse.js";
+import { parseText, parseRows, parseOrderMessage, cleanName, displayName, matchName, normaliseUnit, UNITS } from "./supplyParse.js";
 import { storeDashboardFile, sendStoredFile } from "./ticketChat.js";
 import { sendWhatsAppPayload } from "./whatsapp.js";
 import { refillerWindowOpen } from "./whatsappOutbox.js";
@@ -304,11 +304,27 @@ export function registerDirectSupplyRoutes(app, { auth }) {
   }));
 
   /* ---------- Orders ---------- */
-  // Preview: what was read from the text or file, and what each line matches. Nothing is saved.
+  /* Preview: what was read from the text or file, and what each line matches. Nothing is saved.
+     A pasted message can hold several companies ("AERO / - Apple 6 kg / CRED One / …"): each
+     becomes a group, matched to a saved company by name. The date and title are read too. */
   app.post("/supply/parse", auth, handle("SUPPLY PARSE", async (req, res) => {
-    const lines = readOrder({ text: req.body?.text, file: req.body?.file });
-    if (!lines.length) return res.status(400).json({ error: "No items found. Paste one item per line (e.g. \"Lays Classic 52g - 20\") or upload the Excel sheet." });
-    res.json({ lines: await withMatches(lines) });
+    const empty = "No items found. Paste one item per line (e.g. \"Lays Classic 52g - 20\") or upload the Excel sheet.";
+    if (req.body?.file?.data) {
+      const lines = readOrder({ file: req.body.file });
+      if (!lines.length) return res.status(400).json({ error: empty });
+      const matched = await withMatches(lines);
+      return res.json({ lines: matched, groups: [{ heading: null, company_id: null, lines: matched }], date: null, title: null });
+    }
+    const message = parseOrderMessage(req.body?.text);
+    if (!message.groups.length) return res.status(400).json({ error: empty });
+    const { rows: companies } = await db.query("SELECT id, name FROM supply_companies");
+    const key = (name) => String(name || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+    const groups = [];
+    for (const group of message.groups) {
+      const company = group.heading ? companies.find((item) => key(item.name) === key(group.heading)) : null;
+      groups.push({ heading: group.heading ? group.heading.trim() : null, company_id: company?.id || null, company_name: company?.name || null, lines: await withMatches(group.lines) });
+    }
+    res.json({ lines: groups.flatMap((group) => group.lines), groups, date: message.date, title: message.title });
   }));
 
   // Saves one company's order (the previewed lines, possibly edited).

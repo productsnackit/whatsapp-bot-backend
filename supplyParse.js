@@ -173,3 +173,60 @@ export function matchName(name, products) {
   }
   return best ? { suggestion_id: best.id, key } : { key };
 }
+
+/* ---------- A message with several companies ----------
+   "Fruits requirements for / 1/10/26 / AERO / - Apple - 6 kg / CRED One / - Apple - 12 kg …":
+   a company's name on its own line, its items under it. The date and a title
+   ("Fruits") are read from the lines before the first company. */
+
+const BULLET = /^\s*(\d{1,3}[.)]|[-*•–])\s+/;
+const TITLE_FILLER = /\b(requirements?|reqs?|orders?|list|for|of|the|on|dated?|delivery|supply|needed|required)\b/gi;
+
+// "1/10/26", "01-10-2026", "1.10.26" (day first, as written in India).
+export function findDate(text) {
+  const match = String(text || "").match(/\b(\d{1,2})[/.-](\d{1,2})[/.-](\d{2,4})\b/);
+  if (!match) return null;
+  const day = Number(match[1]);
+  const month = Number(match[2]);
+  let year = Number(match[3]);
+  if (year < 100) year += 2000;
+  if (day < 1 || day > 31 || month < 1 || month > 12) return null;
+  return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+
+function isHeading(line, next) {
+  const text = line.trim().replace(/[:\-–]+$/, "").trim();
+  if (!text || BULLET.test(line) || /\d/.test(text) || !/[a-z]/i.test(text) || text.split(/\s+/).length > 5) return false;
+  if (HEADER_WORDS.test(text)) return false;
+  const nextItem = next ? parseLine(next) : null;
+  // Followed by an item with a quantity, and either written as a heading (CAPITALS, a colon) or
+  // unbulleted above bulleted items.
+  return Boolean(nextItem && nextItem.qty > 0) && (text === text.toUpperCase() || /:\s*$/.test(line) || BULLET.test(next));
+}
+
+export function parseOrderMessage(text) {
+  const rows = String(text || "").split(/\r?\n/).map((line) => line.replace(/ /g, " ")).filter((line) => line.trim());
+  const groups = [];
+  const intro = [];
+  let current = null;
+  rows.forEach((line, index) => {
+    if (isHeading(line, rows[index + 1])) {
+      current = { heading: line.trim().replace(/[:\-–]+$/, "").trim(), lines: [] };
+      groups.push(current);
+      return;
+    }
+    const item = parseLine(line);
+    if (!current) {
+      // Lines before the first company: an order without companies, or the title and date.
+      if (item && item.qty > 0) {
+        current = { heading: null, lines: [item] };
+        groups.push(current);
+      } else intro.push(line.trim());
+      return;
+    }
+    if (item) current.lines.push(item);
+  });
+  const introText = intro.join(" ");
+  const title = displayName(introText.replace(/\b\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}\b/g, "").replace(TITLE_FILLER, " ").replace(/\s+/g, " ").trim()) || null;
+  return { date: findDate(text), title: title && title.length <= 40 ? title : null, groups: groups.filter((group) => group.lines.length) };
+}
