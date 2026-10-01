@@ -2667,7 +2667,9 @@ app.get("/tickets", auth, async (req, res) => {
         created_at,
         updated_at
       FROM tickets
-      WHERE category = 'REFUND'
+      -- Refund tickets, plus any chat the bot handed to the team (it may have happened at the
+      -- main menu, before a category was chosen) or an admin took over.
+      WHERE category = 'REFUND' OR attention_at IS NOT NULL OR COALESCE(takeover, FALSE) = TRUE
       ORDER BY id DESC
     `);
 
