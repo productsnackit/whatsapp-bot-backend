@@ -24,6 +24,8 @@ export const PAGES = {
 const ALL_PAGES = Object.keys(PAGES);
 
 export const ROLE_PRESETS = {
+  // A director has everything an admin has (all pages, settings, employees); only the label differs.
+  director: { label: "Director", pages: ALL_PAGES, readOnly: false },
   admin: { label: "Admin", pages: ALL_PAGES, readOnly: false },
   support: { label: "Support agent", pages: ["tickets", "feedback", "products", "findings", "expiry"], readOnly: false },
   quality: { label: "Quality auditor", pages: ["audit", "refills", "findings", "expiry"], readOnly: false },
@@ -42,10 +44,11 @@ function legacyRole(user) {
 export function accessFor(user) {
   const accessRole = ROLE_PRESETS[user?.accessRole] ? user.accessRole : legacyRole(user);
   const preset = ROLE_PRESETS[accessRole];
-  const pages = accessRole === "admin"
+  const fullAccess = accessRole === "admin" || accessRole === "director";
+  const pages = fullAccess
     ? ALL_PAGES
     : (Array.isArray(user?.pages) ? user.pages : preset.pages).filter((page) => PAGES[page]);
-  return { accessRole, roleLabel: preset.label, pages, readOnly: accessRole === "viewer", isAdmin: accessRole === "admin" };
+  return { accessRole, roleLabel: preset.label, pages, readOnly: accessRole === "viewer", isAdmin: fullAccess };
 }
 
 export function hasPage(user, page) {
