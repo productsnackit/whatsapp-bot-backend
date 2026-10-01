@@ -18,7 +18,7 @@
 import { sendWhatsApp, sendWhatsAppButtons, sendWhatsAppList } from "./whatsapp.js";
 import { sendWithFallback, onDeliveryUpdate, noteInbound, refillerWindowOpen } from "./whatsappOutbox.js";
 import { sendPushToUsers } from "./pushNotifications.js";
-import { storeIncomingMedia } from "./ticketChat.js";
+import { storeIncomingMedia, storeDashboardFile, sendStoredFile } from "./ticketChat.js";
 
 export const CALL_SOURCES = ["Phone call", "WhatsApp", "In person", "Email", "Internal"];
 export const CALL_PRIORITIES = ["Low", "Normal", "High", "Urgent"];
@@ -89,6 +89,13 @@ export async function ensureCallLog(database, { onChange } = {}) {
       updated_at TIMESTAMPTZ DEFAULT NOW()
     )
   `);
+  // Files attached on the dashboard to point out the issue ([{ url, kind, name, mime, size, by, at }]),
+  // and which number they were last sent to on WhatsApp.
+  await db.query(`
+    ALTER TABLE call_logs
+      ADD COLUMN IF NOT EXISTS attachments JSONB NOT NULL DEFAULT '[]'::jsonb,
+      ADD COLUMN IF NOT EXISTS attachments_sent_to TEXT
+  `);
   onDeliveryUpdate("calllog", async ({ refIds, ok, status, error }) => {
     if (!ok) {
       await db.query("UPDATE call_logs SET whatsapp_status = 'FAILED', whatsapp_error = $2, whatsapp_delivery = NULL WHERE id = ANY($1)", [refIds, error]);
@@ -130,6 +137,7 @@ function taskText(task, { forwardedBy, note } = {}) {
     task.due_at ? `⏰ Due: ${when(task.due_at)}` : "",
     `👤 Raised by ${task.raised_by || "the team"}`,
     note ? `\n💬 ${forwardedBy}: ${note}` : "",
+    (task.attachments || []).length ? `📎 ${task.attachments.length} file${task.attachments.length === 1 ? "" : "s"} attached (sent below)` : "",
     "",
     "Tap *Processing* when you begin and *Resolved* when it's finished. Can't do it? Tap *Forward* to pass it to a colleague.",
   ];
@@ -148,7 +156,9 @@ const oneLine = (text, max = 700) => String(text || "").replace(/\s*\n+\s*/g, " 
 function templateFor(task) {
   const name = process.env.CALL_TEMPLATE_NAME || "call_log_task";
   if (name === "off") return null;
-  const summary = [task.title, task.details, task.location && `Location: ${task.location}`, (task.caller_name || task.caller_phone) && `Caller: ${[task.caller_name, task.caller_phone].filter(Boolean).join(", ")}`].filter(Boolean).join(" · ");
+  const files = (task.attachments || []).length;
+  const summary = [task.title, task.details, task.location && `Location: ${task.location}`, (task.caller_name || task.caller_phone) && `Caller: ${[task.caller_name, task.caller_phone].filter(Boolean).join(", ")}`,
+    files && `📎 ${files} file${files === 1 ? "" : "s"} attached: tap a button below to receive ${files === 1 ? "it" : "them"}`].filter(Boolean).join(" · ");
   return {
     name,
     lang: process.env.CALL_TEMPLATE_LANG || "en",
@@ -177,12 +187,29 @@ export async function sendTask(id, options = {}) {
   });
   // A forward note goes as its own message when the task itself went as a template.
   if (result.ok && result.viaTemplate && options.note) await sendWhatsApp(to, `💬 ${options.forwardedBy}: ${options.note}`).catch(() => {});
+  // Files go right after the task; after a template (window closed) they wait for the first button tap.
+  if (result.ok && !result.viaTemplate) await sendAttachments(task, to);
+  else if (result.ok) await db.query("UPDATE call_logs SET attachments_sent_to = NULL WHERE id = $1", [id]);
   await db.query(
     `UPDATE call_logs SET whatsapp_status = $2, whatsapp_error = $3, whatsapp_delivery = NULL, whatsapp_sent_at = CASE WHEN $2 = 'SENT' THEN NOW() ELSE whatsapp_sent_at END WHERE id = $1`,
     [id, result.ok ? "SENT" : "FAILED", result.ok ? null : result.error || "Could not send"]
   );
   changed();
   return result;
+}
+
+// Sends the task's files (or only the new ones) to the employee on WhatsApp.
+async function sendAttachments(task, to, files = task.attachments || []) {
+  if (!files.length) return 0;
+  let sent = 0;
+  for (const [index, file] of files.entries()) {
+    const caption = index === 0 ? `📎 ${task.ref}: ${task.title}`.slice(0, 1000) : "";
+    const result = await sendStoredFile(to, file, caption).catch((err) => ({ ok: false, error: err.message }));
+    if (result.ok) sent += 1;
+    else console.log(`CALL LOG FILE ${file.name} to ${to} failed:`, result.error);
+  }
+  if (sent) await db.query("UPDATE call_logs SET attachments_sent_to = $2 WHERE id = $1", [task.id, to]);
+  return sent;
 }
 
 /* ---------- Actions (from WhatsApp or the dashboard) ---------- */
@@ -260,6 +287,8 @@ export async function handleCallLogWhatsApp(msg) {
       await sendWhatsApp(phone, `${task.ref} was cancelled. Nothing more to do.`);
       return true;
     }
+    // Their tap opened WhatsApp's 24-hour window: files that came with a template go now.
+    if ((task.attachments || []).length && task.attachments_sent_to !== phone) await sendAttachments(task, phone);
     if (task.status === "Done" && action !== "FWD" && action !== "TO") {
       await sendWhatsApp(phone, `${task.ref} is already resolved ✅`);
       return true;
@@ -367,6 +396,20 @@ function readTask(body, { partial }) {
   return { values };
 }
 
+// Files from the dashboard ({ name, type, data }): up to `room` of them, each up to 15 MB.
+async function storeFiles(files, by, room = 10) {
+  const stored = [];
+  const errors = [];
+  for (const file of (Array.isArray(files) ? files : []).slice(0, Math.max(0, room))) {
+    try {
+      stored.push({ ...(await storeDashboardFile(file)), by, at: new Date().toISOString() });
+    } catch (err) {
+      errors.push(err.message);
+    }
+  }
+  return { stored, errors };
+}
+
 // Per employee: tasks now with them, finished, forwarded on, and how long they take.
 function stats(tasks) {
   const people = new Map();
@@ -443,12 +486,14 @@ export function registerCallLogRoutes(app, { auth }) {
     );
     const id = inserted.rows[0].id;
     await db.query("UPDATE call_logs SET ref = 'CL-' || LPAD(id::text, 4, '0') WHERE id = $1", [id]);
+    const attached = await storeFiles(req.body?.files, by);
+    if (attached.stored.length) await db.query("UPDATE call_logs SET attachments = $2 WHERE id = $1", [id, JSON.stringify(attached.stored)]);
     await sendTask(id);
     if (assignee.username) {
       await sendPushToUsers(db, [assignee.username], { title: `New task for you · ${values.title}`.slice(0, 80), body: `From ${by}`, view: "call-log" }).catch(() => {});
     }
-    res.locals.activity = { section: "Call Log", action: `Raised task "${values.title}" for ${assignee.name}` };
-    res.status(201).json(await getTask(id));
+    res.locals.activity = { section: "Call Log", action: `Raised task "${values.title}" for ${assignee.name}${attached.stored.length ? ` with ${attached.stored.length} file(s)` : ""}` };
+    res.status(201).json({ ...(await getTask(id)), file_errors: attached.errors });
   }));
 
   // { status } | { assignee_id, note } (forward) | { note } | fields to edit.
@@ -491,6 +536,23 @@ export function registerCallLogRoutes(app, { auth }) {
     if (note) await addHistory(task.id, { by, action: "note", note });
     changed();
     res.json(await getTask(task.id));
+  }));
+
+  // More files for a task: saved, and sent to the employee now if WhatsApp allows it.
+  app.post("/internal/call-log/:id/attachments", auth, handle("CALL LOG ATTACH", async (req, res) => {
+    const task = await getTask(Number(req.params.id));
+    if (!task) return res.status(404).json({ error: "Task not found" });
+    if (!canChange(req, task)) return res.status(403).json({ error: "Only the person who raised it, the person it's with, or an admin can add files." });
+    const by = userName(req.user);
+    const attached = await storeFiles(req.body?.files, by, 10 - (task.attachments || []).length);
+    if (!attached.stored.length) return res.status(400).json({ error: attached.errors[0] || "Choose a file to attach" });
+    await db.query("UPDATE call_logs SET attachments = attachments || $2::jsonb WHERE id = $1", [task.id, JSON.stringify(attached.stored)]);
+    await addHistory(task.id, { by, action: "note", note: `📎 Attached ${attached.stored.map((file) => file.name).join(", ")}` });
+    const to = phoneDigits(task.assignee_phone);
+    let sent = 0;
+    if (to && ["Open", "In Progress"].includes(task.status) && (await refillerWindowOpen(to))) sent = await sendAttachments({ ...task }, to, attached.stored);
+    res.locals.activity = { section: "Call Log", action: `Attached ${attached.stored.length} file(s) to ${task.ref}` };
+    res.json({ task: await getTask(task.id), sent, file_errors: attached.errors });
   }));
 
   app.post("/internal/call-log/:id/resend", auth, handle("CALL LOG RESEND", async (req, res) => {

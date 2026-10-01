@@ -178,6 +178,21 @@ async function sendMedia(phone, kind, link, { caption, fileName }) {
   return sendWhatsAppPayload({ messaging_product: "whatsapp", to: phone, type: kind, [kind]: media });
 }
 
+/* For other pages (Call Log): store one file sent from the dashboard ({ name, type, data: base64 })
+   on Cloudinary, and send a stored file on WhatsApp. */
+export async function storeDashboardFile(file) {
+  const name = String(file?.name || "file").slice(0, 150);
+  let mime = String(file?.type || "application/octet-stream");
+  let buffer = Buffer.from(String(file?.data || "").replace(/^data:[^,]+,/, ""), "base64");
+  if (!buffer.length) throw new Error(`${name} is empty`);
+  if (buffer.length > MAX_UPLOAD_BYTES) throw new Error(`${name} is larger than 15 MB`);
+  const kind = kindForMime(mime);
+  if (kind === "image") ({ buffer, mime } = await prepareOutgoingImage(buffer, mime));
+  const url = await uploadBuffer(buffer, { resourceType: resourceTypeFor(kind), fileName: name });
+  return { url, kind, name, mime, size: buffer.length };
+}
+export const sendStoredFile = (phone, file, caption = "") => sendMedia(phone, file.kind, file.url, { caption, fileName: file.name });
+
 // Same rule as server.js: refunded, resolved or closed tickets can't be messaged until reopened.
 function isClosed(ticket) {
   return String(ticket?.state || "").toUpperCase() === "CLOSED"
