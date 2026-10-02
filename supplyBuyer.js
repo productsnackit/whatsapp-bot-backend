@@ -374,6 +374,47 @@ export function registerSupplyBuyerRoutes(app, { auth }) {
     res.json({ name: contact.name, has_phone: Boolean(contact.phone), auto: contact.auto, cutoff: contact.cutoff, steps: BUYER_STEPS });
   }));
 
+  /* The orders list (one row per delivery date, like Tickets): who ordered, how much, what the
+     buyer has done, money spent, selling value, margin, deliveries and payments. */
+  app.get("/supply/orders-list", auth, handle("SUPPLY ORDERS LIST", async (req, res) => {
+    const { rows: rounds } = await db.query(
+      "SELECT * FROM supply_rounds WHERE delivery_date >= CURRENT_DATE - INTERVAL '120 days' ORDER BY delivery_date DESC, id DESC LIMIT 150"
+    );
+    const ids = rounds.map((round) => round.id);
+    const [active, deliveries, invoices, sources] = await Promise.all([
+      db.query("SELECT COUNT(*)::int AS count FROM supply_companies WHERE active = TRUE"),
+      db.query("SELECT round_id, COUNT(*) FILTER (WHERE status = 'Delivered')::int AS delivered FROM supply_deliveries WHERE round_id = ANY($1) GROUP BY round_id", [ids]),
+      db.query("SELECT round_id, COALESCE(SUM(total), 0) AS billed, COALESCE(SUM(paid), 0) AS paid FROM supply_invoices WHERE cancelled_at IS NULL AND round_id = ANY($1) GROUP BY round_id", [ids]).catch(() => ({ rows: [] })),
+      db.query("SELECT round_id, source, COUNT(*)::int AS count FROM supply_orders WHERE round_id = ANY($1) GROUP BY round_id, source", [ids]),
+    ]);
+    const list = [];
+    for (const raw of rounds) {
+      const sheet = await masterOf(raw.id);
+      const { totals } = await buyingOf(raw.id, sheet);
+      const amounts = {};
+      for (const row of sheet.master) if (row.total > 0) amounts[row.unit] = (amounts[row.unit] || 0) + row.total;
+      const invoice = invoices.rows.find((row) => row.round_id === raw.id);
+      list.push({
+        id: raw.id, ref: raw.ref, delivery_date: plainDate(raw.delivery_date), title: raw.title, status: raw.status,
+        buyer_status: raw.buyer_status, buyer_steps: raw.buyer_steps || {}, sent_at: raw.sent_at,
+        companies: sheet.companies.map((company) => company.name), companies_total: active.rows[0].count,
+        items: sheet.master.filter((row) => row.total > 0).length,
+        amounts: Object.entries(amounts).map(([unit, total]) => `${qtyText(total)} ${unit}`),
+        sources: Object.fromEntries(sources.rows.filter((row) => row.round_id === raw.id).map((row) => [row.source, row.count])),
+        to_check: sheet.checks.length,
+        spent: Math.round(totals.spent * 100) / 100,
+        selling: totals.priced_items ? Math.round(totals.selling * 100) / 100 : null,
+        margin: totals.margin_selling ? Math.round(totals.margin * 100) / 100 : null,
+        margin_percent: totals.margin_percent,
+        short_items: totals.short_items,
+        delivered: deliveries.rows.find((row) => row.round_id === raw.id)?.delivered || 0,
+        billed: invoice ? Number(invoice.billed) : 0,
+        paid: invoice ? Number(invoice.paid) : 0,
+      });
+    }
+    res.json({ rounds: list, steps: BUYER_STEPS });
+  }));
+
   // Send now from the dashboard (the full list again).
   app.post("/supply/rounds/:id/send", auth, handle("SUPPLY SEND", async (req, res) => {
     const round = await roundById(req.params.id);
