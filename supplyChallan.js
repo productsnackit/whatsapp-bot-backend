@@ -59,6 +59,38 @@ export async function ensureSupplyChallan(database, { getBuyer, onChanged } = {}
       UNIQUE (round_id, company_id)
     );
   `);
+  await saveKnownLocations().catch((err) => console.log("SUPPLY LOCATIONS ERROR:", err.message));
+}
+
+/* Locations from Snackit's earlier DCs (Oct 2026), saved once: a new location is added; an
+   existing one (same name) only gets the details that are still empty. */
+const KNOWN_LOCATIONS = [
+  { name: "Nutanix", billing_name: "Nutanix Technologies India Pvt Ltd", address: "Prestige Tech Park 9th Floor, Mercury 2B Block Marathahalli - Sarjapur Outer Ring Road Kadabeesanahalli Kadabeesanahalli", contact_no: "6364831771", gstin: "29AAECN3355L1Z2", state: "29-Karnataka", ship_to: "Prestige TechPark" },
+  { name: "Newtap", billing_name: "Newtap Finance Private Limited", address: "3rd Floor 777/A KP Towers 13th Main Road, 100 Feet Road Bengaluru", gstin: "29AACCP3655M1ZX", state: "29-Karnataka" },
+  { name: "Solera", billing_name: "Dealer Socket (India) Private Limited", address: "Khatha No.381 Prestige Technostar Krishnarajapuram Hobli Doddanekundi Industrial Area, Doddanekundi Village", contact_no: "9060301538", gstin: "29AAHCD3977F1ZA" },
+  { name: "Sanas", billing_name: "Sanas", address: "Prestige Pegasus, Sarjapur - Marathahalli Rd, Ambalipura, Haralur, Bengaluru, Karntaka - 560103.", gstin: "29ABICS7655M1ZE", state: "29-Karnataka" },
+];
+
+async function saveKnownLocations() {
+  const { rows: done } = await db.query("SELECT 1 FROM app_settings WHERE key = 'supply_locations_v1'");
+  if (done.length) return;
+  const key = (text) => String(text || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  const { rows: companies } = await db.query("SELECT * FROM supply_companies");
+  for (const location of KNOWN_LOCATIONS) {
+    const found = companies.find((company) => key(company.name) === key(location.name));
+    const fields = Object.keys(location).filter((field) => field !== "name");
+    if (!found) {
+      await db.query(
+        `INSERT INTO supply_companies (name, ${fields.join(", ")}) VALUES ($1, ${fields.map((_, index) => `$${index + 2}`).join(", ")}) ON CONFLICT (name) DO NOTHING`,
+        [location.name, ...fields.map((field) => location[field])]
+      );
+    } else {
+      const empty = fields.filter((field) => !String(found[field] ?? "").trim());
+      if (empty.length) await db.query(`UPDATE supply_companies SET ${empty.map((field, index) => `${field} = $${index + 2}`).join(", ")} WHERE id = $1`, [found.id, ...empty.map((field) => location[field])]);
+    }
+  }
+  await db.query("INSERT INTO app_settings (key, value, updated_at) VALUES ('supply_locations_v1', 'done', NOW()) ON CONFLICT (key) DO NOTHING");
+  console.log("📍 Direct Supply: saved the locations from the earlier DCs");
 }
 
 async function seller() {
@@ -154,36 +186,41 @@ async function challanPdf({ ref, madeAt, round, company, lines, seller: me }) {
   doc.moveTo(split, y + rowH).lineTo(R, y + rowH).stroke();
   doc.moveTo(split, y + rowH * 2).lineTo(R, y + rowH * 2).stroke();
   doc.moveTo(mid, y).lineTo(mid, y + rowH * 2).stroke();
-  text("DC No.", split + 6, y + 4);
+  text("Invoice No.", split + 6, y + 4);
   text(ref, split + 6, y + 14, { bold: true });
   text("Date", mid + 6, y + 4);
   text(dateText, mid + 6, y + 14, { bold: true });
   text("Place of supply", split + 6, y + rowH + 4);
   text(placeOfSupply, split + 6, y + rowH + 14, { bold: true });
-  if (round.ref) text(`Delivery: ${dayLabel(round.delivery_date)} (${round.ref})`, split + 6, y + rowH * 2 + 6, { size: 8, color: "#444444", width: R - split - 12 });
   y += sellerHeight;
 
   // Bill To | Ship To
   const billLines = [
     company.address || company.location || "",
-    company.contact_no || company.contact_phone ? `Contact No. : ${company.contact_no || String(company.contact_phone).split(/[,;/\n]+/)[0].trim()}` : "",
+    company.contact_no ? `Contact No. : ${company.contact_no}` : "",
     company.gstin ? `GSTIN : ${company.gstin}` : "",
     `State: ${company.state || placeOfSupply}`,
   ].filter(Boolean).join("\n");
   const billName = company.billing_name || company.name;
-  const shipText = company.ship_to || company.location || company.address || "";
-  const partyHeight = Math.max(70, 18 + heightOf(billName, split - L - 12, 9, true) + heightOf(billLines, split - L - 12) + 8, 18 + heightOf(shipText, R - split - 12) + 8);
+  // Like Snackit's DCs: a Ship To box only when there is a ship-to; otherwise Bill To is full width.
+  const shipText = String(company.ship_to || "").trim();
+  const billRight = shipText ? split : R;
+  const partyHeight = Math.max(56, 18 + heightOf(billName, billRight - L - 12, 9, true) + heightOf(billLines, billRight - L - 12) + 8, shipText ? 18 + heightOf(shipText, R - split - 12) + 8 : 0);
   box(L, y, W, partyHeight);
-  doc.moveTo(split, y).lineTo(split, y + partyHeight).stroke();
+  if (shipText) doc.moveTo(split, y).lineTo(split, y + partyHeight).stroke();
   text("Bill To", L + 6, y + 4);
-  text(billName, L + 6, y + 18, { bold: true, size: 9, width: split - L - 12 });
-  text(billLines, L + 6, doc.y + 4, { width: split - L - 12 });
-  text("Ship To", split + 6, y + 4);
-  text(shipText, split + 6, y + 18, { width: R - split - 12 });
+  text(billName, L + 6, y + 18, { bold: true, size: 9, width: billRight - L - 12 });
+  text(billLines, L + 6, doc.y + 4, { width: billRight - L - 12 });
+  if (shipText) {
+    text("Ship To", split + 6, y + 4);
+    text(shipText, split + 6, y + 18, { width: R - split - 12 });
+  }
   y += partyHeight;
 
   // Items
-  const cols = [
+  // Exp. / Mfg. columns only when some item has a date (as on Snackit's DCs).
+  const withDates = lines.some((item) => item.exp || item.mfg);
+  const cols = withDates ? [
     { key: "n", title: "#", w: 22 },
     { key: "name", title: "Item name", w: 170, bold: true },
     { key: "hsn", title: "HSN/ SAC", w: 66 },
@@ -191,6 +228,12 @@ async function challanPdf({ ref, madeAt, round, company, lines, seller: me }) {
     { key: "mfg", title: "Mfg. Date", w: 66, align: "right" },
     { key: "qty", title: "Quantity", w: 70, align: "right" },
     { key: "unit", title: "Unit", w: W - 22 - 170 - 66 * 3 - 70, align: "right" },
+  ] : [
+    { key: "n", title: "#", w: 26 },
+    { key: "name", title: "Item name", w: 245, bold: true },
+    { key: "hsn", title: "HSN/ SAC", w: 98 },
+    { key: "qty", title: "Quantity", w: 88, align: "right" },
+    { key: "unit", title: "Unit", w: W - 26 - 245 - 98 - 88, align: "right" },
   ];
   const drawRow = (cells, top, options = {}) => {
     const h = Math.max(18, ...cols.map((col) => heightOf(cells[col.key], col.w - 8, 8.5, options.bold || col.bold) + 8));
