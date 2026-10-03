@@ -239,8 +239,14 @@ export async function matchSite(text) {
    unless someone set it by hand. Returns the machine or null. */
 export async function applyPaidMachine(ticketId, text) {
   if (!db) return null;
-  const machine = await findMachine(text);
+  const machine = await findMachine(text, { allowUnknown: true });
   if (!machine) return null;
+  // An ID that isn't in the machine list is still shown on the ticket, but sets no location.
+  if (machine.unknown) {
+    await db.query("UPDATE tickets SET paid_machine = $2 WHERE id = $1", [ticketId, machine.code]);
+    onTicketsChanged?.();
+    return machine;
+  }
   const site = fromMachine(machine, "screenshot");
   const { rowCount } = await db.query(
     `UPDATE tickets SET paid_machine = $2, site_id = $3, site_name = $4, site_match = $5
@@ -301,6 +307,17 @@ export async function ensureSiteMatching(database, { onChanged } = {}) {
   }
   if (linked) console.log(`🔢 Machines: ${linked} linked to Refill Audit locations`);
   await rematchTickets();
+  // Screenshots read before machine IDs were looked for: read their saved text again.
+  const { rows: scanned } = await db.query(
+    `SELECT id, upi_scan->'upi_ids' AS upi_ids, upi_scan->>'text' AS text FROM tickets
+     WHERE paid_machine IS NULL AND upi_scan ? 'text'`
+  ).catch(() => ({ rows: [] }));
+  let found = 0;
+  for (const ticket of scanned) {
+    const ids = Array.isArray(ticket.upi_ids) ? ticket.upi_ids : [];
+    if (await applyPaidMachine(ticket.id, [...ids, ticket.text].join("\n")).catch(() => null)) found += 1;
+  }
+  if (found) console.log(`🔢 Machines: machine ID read from ${found} earlier screenshot(s)`);
 }
 
 export function registerSiteRoutes(app, { auth }) {

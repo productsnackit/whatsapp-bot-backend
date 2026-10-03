@@ -2651,6 +2651,7 @@ app.get("/tickets", auth, async (req, res) => {
         site_name,
         site_match,
         paid_machine,
+        (SELECT vm.location FROM vending_machines vm WHERE vm.code = tickets.paid_machine) AS paid_machine_location,
         upi_utr,
         payments,
         product_received,

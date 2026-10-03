@@ -54,19 +54,35 @@ export async function linkMachine(code, siteId) {
   cache.at = 0;
 }
 
-/* The machine named in some text (screenshot text, a UPI ID, or what a customer typed).
-   Only IDs that are in the list count, so a random "vv12" never matches. */
-export async function findMachine(text) {
-  const machines = await allMachines();
-  if (!machines.length) return null;
-  const byCode = new Map(machines.map((machine) => [machine.code, machine]));
-  // "snackit" right before the ID (as in the UPI name / ID), or an ID with 4+ digits ("VV0046").
-  const patterns = [/snack\s*it\s*(av|vv)\s?-?\s?(\d{1,6})(?!\d)/gi, /\b(av|vv)\s?-?\s?(\d{4,6})(?!\d)/gi];
-  for (const pattern of patterns) {
-    for (const found of String(text || "").matchAll(pattern)) {
-      const machine = byCode.get(machineKey(found[1], found[2]));
-      if (machine) return machine;
-    }
+/* Machine IDs in some text (screenshot text, a UPI ID, or what a customer typed), allowing
+   the usual reading mistakes in screenshots: "VV" read as "W", "O" for 0, "I"/"l" for 1,
+   "S" for 5, "B" for 8, spaces or dashes inside. After "snackit" the ID is taken as written;
+   without it, only a clean ID with 4+ digits counts ("VV0046"), so random text never matches.
+   Returns codes like "vv00002" in the order found. */
+const DIGIT_FIX = { o: "0", d: "0", q: "0", i: "1", l: "1", "|": "1", "!": "1", s: "5", b: "8", z: "2", g: "6" };
+export function machineCodesIn(text) {
+  const raw = String(text || "");
+  const codes = [];
+  const after = /sn[a@4]\s?[ck]{1,2}\s?[i1l|!]\s?t\s*[-_.:]?\s*(a\s?v|v\s?v|w|v\s?w|w\s?v|\\\/\s?v|v\s?\\\/|u\s?v|v\s?u)\s*[-_.]?\s*([0-9oOdDqQiIlL|!sSbBzZgG]{1,6})(?![0-9a-z])/gi;
+  for (const found of raw.matchAll(after)) {
+    const letters = found[1].replace(/\s/g, "").toLowerCase().startsWith("a") ? "av" : "vv";
+    const digits = found[2].toLowerCase().replace(/[^0-9]/g, (char) => DIGIT_FIX[char] ?? "");
+    if (digits && /^\d+$/.test(digits) && /\d/.test(found[2])) codes.push(machineKey(letters, digits));
   }
+  for (const found of raw.matchAll(/\b(av|vv|w)\s?-?\s?(\d{4,6})(?!\d)/gi)) {
+    codes.push(machineKey(found[1].toLowerCase() === "av" ? "av" : "vv", found[2]));
+  }
+  return [...new Set(codes)];
+}
+
+/* The machine in some text: the first ID that is in the list, else the first ID written after
+   "snackit" (shown as "not in the list"). */
+export async function findMachine(text, { allowUnknown = false } = {}) {
+  const machines = await allMachines();
+  const byCode = new Map(machines.map((machine) => [machine.code, machine]));
+  const codes = machineCodesIn(text);
+  const known = codes.map((code) => byCode.get(code)).find(Boolean);
+  if (known) return known;
+  if (allowUnknown && codes.length && /sn[a@4]\s?[ck]{1,2}\s?[i1l|!]\s?t/i.test(String(text))) return { code: codes[0], location: null, site_id: null, unknown: true };
   return null;
 }
