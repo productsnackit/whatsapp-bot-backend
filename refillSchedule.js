@@ -182,6 +182,13 @@ export async function ensureRefillTables(database, { sendPush } = {}) {
     )
   `);
   await db.query("CREATE TABLE IF NOT EXISTS refill_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+  // Messages sent to several refillers at once (Message refillers tab).
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS refill_broadcasts (
+      id SERIAL PRIMARY KEY, message TEXT NOT NULL, results JSONB NOT NULL DEFAULT '[]',
+      created_by TEXT, created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
   // Temporary cover: another refiller does a site's visits on certain days.
   await db.query(`
     CREATE TABLE IF NOT EXISTS refill_shifts (
@@ -1138,6 +1145,39 @@ export function registerRefillRoutes(app, { auth }) {
     // Upcoming anytime / part-of-day visits take the new deadlines.
     if (["day_close_time", "morning_ends", "afternoon_ends"].some((key) => key in next)) await refreshSlotDeadlines(saved);
     res.json(saved);
+  }));
+
+  /* One message to many refillers. Within WhatsApp's 24 hours it goes as typed; otherwise as the
+     approved template REFILL_MESSAGE_TEMPLATE (default "refiller_message", body "Hi {{1}}, a message
+     from Snackit: {{2}}"; template text can't hold line breaks, so they become " · "). */
+  app.get("/refills/broadcasts", auth, guard, handle("REFILL BROADCASTS", async (req, res) => {
+    const { rows } = await db.query("SELECT * FROM refill_broadcasts ORDER BY created_at DESC LIMIT 20");
+    res.json({ broadcasts: rows, template: process.env.REFILL_MESSAGE_TEMPLATE || "refiller_message" });
+  }));
+
+  app.post("/refills/broadcast", auth, guard, handle("REFILL BROADCAST", async (req, res) => {
+    const message = String(req.body?.message || "").trim().slice(0, 1000);
+    if (!message) return res.status(400).json({ error: "Type the message" });
+    const ids = Array.isArray(req.body?.refiller_ids) ? req.body.refiller_ids.map(Number).filter(Boolean) : [];
+    if (!ids.length) return res.status(400).json({ error: "Choose at least one refiller" });
+    const { rows: refillers } = await db.query("SELECT id, name, phone FROM audit_refillers WHERE id = ANY($1) ORDER BY name", [ids]);
+    const template = process.env.REFILL_MESSAGE_TEMPLATE || "refiller_message";
+    const results = [];
+    for (const refiller of refillers) {
+      const phone = phoneDigits(refiller.phone);
+      if (!phone) { results.push({ id: refiller.id, name: refiller.name, ok: false, error: "No WhatsApp number" }); continue; }
+      const result = await sendWithFallback({
+        kind: "refill-message",
+        to: phone,
+        send: () => sendWhatsAppPayload({ messaging_product: "whatsapp", to: phone, type: "text", text: { body: message } }),
+        template: { name: template, lang: process.env.REFILL_TEMPLATE_LANG || "en", params: [refiller.name.split(" ")[0], message.replace(/\s*\n+\s*/g, " · ").replace(/ {4,}/g, " ").slice(0, 900)] },
+        noWindowError: `Not delivered: ${refiller.name} hasn't messaged the Snackit number in 24 hours and the "${template}" template didn't go.`,
+      });
+      results.push({ id: refiller.id, name: refiller.name, ok: Boolean(result.ok), via_template: Boolean(result.viaTemplate), error: result.ok ? null : result.error || "Not sent" });
+    }
+    const { rows } = await db.query("INSERT INTO refill_broadcasts (message, results, created_by) VALUES ($1, $2, $3) RETURNING *", [message, JSON.stringify(results), actorName(req.user)]);
+    res.locals.activity = { section: "Refill Schedule", action: `Sent a message to ${results.filter((item) => item.ok).length} of ${results.length} refillers` };
+    res.json(rows[0]);
   }));
 
   // Sends tomorrow's list to one refiller now (to check their phone and the template work).
