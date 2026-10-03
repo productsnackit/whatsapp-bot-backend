@@ -87,7 +87,7 @@ const invoiceOut = (row) => row && {
 };
 
 // A company's lines in a round, with the quantity delivered and its price (company, else default).
-async function companyLines(roundId, companyId) {
+export async function companyLines(roundId, companyId) {
   const { rows } = await db.query(
     `SELECT l.id, l.raw_name, l.qty, l.unit, l.delivered_qty, l.product_id,
             p.name AS product_name, p.unit AS product_unit, p.pack_size, p.sell_price, cp.price AS company_price
@@ -359,8 +359,9 @@ export function registerSupplyBillingRoutes(app, { auth }) {
   /* ---------- Settings: Snackit's details on invoices, and companies' billing details ---------- */
   app.get("/supply/seller", auth, handle("SUPPLY SELLER", async (req, res) => res.json(await seller())));
   app.put("/supply/seller", auth, handle("SUPPLY SELLER SAVE", async (req, res) => {
-    const keys = ["name", "address", "gstin", "phone", "email", "upi", "bank", "terms", "public_url"];
-    const value = Object.fromEntries(keys.map((key) => [key, String(req.body?.[key] || "").slice(0, 600)]));
+    const keys = ["name", "address", "gstin", "phone", "email", "upi", "bank", "terms", "public_url", "state", "dc_prefix", "dc_next"];
+    // The logo and stamp (uploaded separately, see supplyChallan.js) are kept.
+    const value = { ...(await seller()), ...Object.fromEntries(keys.map((key) => [key, String(req.body?.[key] || "").slice(0, 600)])) };
     await db.query(
       `INSERT INTO app_settings (key, value, updated_at) VALUES ('supply_seller', $1, NOW())
        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,

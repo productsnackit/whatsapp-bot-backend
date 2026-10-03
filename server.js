@@ -38,7 +38,8 @@ import { ensureSupplyBilling, registerSupplyBillingRoutes } from "./supplyBillin
 import { ensureSupplyOrderLink, registerSupplyOrderLinkRoutes } from "./supplyOrderLink.js";
 import { initSupplyReports, registerSupplyReportRoutes } from "./supplyReports.js";
 import { initSupplyWhatsApp, handleSupplyWhatsApp } from "./supplyWhatsApp.js";
-import { ensureSupplyBuyer, registerSupplyBuyerRoutes, supplyBuyerTick, handleSupplyBuyerWhatsApp } from "./supplyBuyer.js";
+import { ensureSupplyBuyer, registerSupplyBuyerRoutes, supplyBuyerTick, handleSupplyBuyerWhatsApp, buyerContact } from "./supplyBuyer.js";
+import { ensureSupplyChallan, registerSupplyChallanRoutes } from "./supplyChallan.js";
 import { ensureCapaOverdue, capaOverdueTick, registerCapaOverdueRoutes, handleCapaOverdueWhatsApp } from "./capaOverdue.js";
 import { ensureAttention, attentionReason, isExpectedAnswer, alertAdmins, registerAttentionRoutes, locationProblem, LOCATION_AGAIN } from "./attention.js";
 import { CHARGED_MORE_THAN_ONCE, PRODUCT_QUESTION, COUNT_QUESTION, paymentPrompt, parseChargeCount, extractTransactionIds, paymentId, refundFor, receivedMessage, doneMessage, mergePayments } from "./multiPayment.js";
@@ -3319,6 +3320,7 @@ registerSupplyBillingRoutes(app, { auth });
 registerSupplyOrderLinkRoutes(app, { auth });
 registerSupplyReportRoutes(app, { auth });
 registerSupplyBuyerRoutes(app, { auth });
+registerSupplyChallanRoutes(app, { auth });
 registerCapaOverdueRoutes(app, { auth });
 registerAttentionRoutes(app, { auth });
 registerExpiryRoutes(app, { db, auth });
@@ -4790,6 +4792,8 @@ try {
   initSupplyWhatsApp(db, { onChanged: () => io.emit("supply-changed") });
   // The master sheet goes to the buyer (Admin Settings) when all companies have ordered or at the cutoff.
   await ensureSupplyBuyer(db, { onChanged: () => io.emit("supply-changed") }).catch((err) => console.error("SUPPLY BUYER SETUP ERROR:", err.message));
+  // Delivery challans (one per company) when the buyer taps Goods received.
+  await ensureSupplyChallan(db, { getBuyer: buyerContact, onChanged: () => io.emit("supply-changed") }).catch((err) => console.error("SUPPLY CHALLAN SETUP ERROR:", err.message));
   setInterval(supplyBuyerTick, 2 * 60 * 1000);
   setTimeout(supplyBuyerTick, 60 * 1000);
   // CAPA tasks open for 24 hours: WhatsApp alert to Monish (Admin Settings), then a 10 am daily reminder.

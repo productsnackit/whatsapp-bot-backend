@@ -130,7 +130,7 @@ export async function ensureDirectSupply(database) {
 }
 
 async function products() {
-  const { rows } = await db.query("SELECT id, name, key, unit, category, aliases, pack_size, sell_price FROM supply_products ORDER BY name");
+  const { rows } = await db.query("SELECT id, name, key, unit, category, aliases, pack_size, sell_price, hsn FROM supply_products ORDER BY name");
   return rows;
 }
 
@@ -399,7 +399,7 @@ export function registerDirectSupplyRoutes(app, { auth }) {
   }));
 
   app.patch("/supply/companies/:id", auth, handle("SUPPLY COMPANY UPDATE", async (req, res) => {
-    const fields = ["name", "contact_name", "contact_phone", "location", "active", "billing_name", "address", "gstin", "payment_days"].filter((key) => req.body?.[key] !== undefined);
+    const fields = ["name", "contact_name", "contact_phone", "location", "active", "billing_name", "address", "gstin", "payment_days", "contact_no", "state", "ship_to"].filter((key) => req.body?.[key] !== undefined);
     if (fields.includes("payment_days")) req.body.payment_days = req.body.payment_days === "" || req.body.payment_days == null ? null : Math.max(0, Math.round(Number(req.body.payment_days)) || 0);
     if (!fields.length) return res.status(400).json({ error: "Nothing to change" });
     const { rows } = await db.query(
@@ -547,7 +547,7 @@ export function registerDirectSupplyRoutes(app, { auth }) {
 
   /* ---------- Items ---------- */
   app.patch("/supply/products/:id", auth, handle("SUPPLY PRODUCT", async (req, res) => {
-    const fields = ["name", "unit", "category", "pack_size", "sell_price"].filter((key) => req.body?.[key] !== undefined);
+    const fields = ["name", "unit", "category", "pack_size", "sell_price", "hsn"].filter((key) => req.body?.[key] !== undefined);
     if (!fields.length) return res.status(400).json({ error: "Nothing to change" });
     for (const key of ["pack_size", "sell_price"]) {
       if (fields.includes(key) && req.body[key] !== "" && req.body[key] !== null && !(Number(req.body[key]) >= 0)) return res.status(400).json({ error: "Enter a number" });

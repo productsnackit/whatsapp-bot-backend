@@ -24,6 +24,7 @@ import { storeDashboardFile, sendStoredFile } from "./ticketChat.js";
 import { sendWhatsApp, sendWhatsAppPayload, sendWhatsAppButtons, sendWhatsAppTemplate } from "./whatsapp.js";
 import { refillerWindowOpen } from "./whatsappOutbox.js";
 import { sendPushToUsers } from "./pushNotifications.js";
+import { makeAndSendChallans } from "./supplyChallan.js";
 
 export const BUYER_STEPS = ["Received", "Processing", "Ordered", "Goods received", "Sent"];
 const STEP_TEXT = { Received: "✅ List received", Processing: "⏳ Processing", Ordered: "🛒 Ordered", "Goods received": "📦 Goods received", Sent: "🚚 Sent" };
@@ -205,6 +206,13 @@ async function setStep(round, step, by) {
     [round.id, step, bought]
   );
   onChange();
+  // Goods are in: the delivery challans (one per company) go to the buyer's WhatsApp.
+  if (step === "Goods received") {
+    setTimeout(() => makeAndSendChallans(round.id).then((result) => {
+      console.log(`📄 DCs for ${round.ref}: made ${result.made}, sent ${result.sent}${result.error ? ` (${result.error})` : ""}`);
+      if (result.error) sendPushToUsers(db, ["admin"], { title: "Delivery challans", body: `${round.ref}: ${result.error}`.slice(0, 180), view: "supply" }).catch(() => {});
+    }).catch((err) => console.log("DC MAKE ERROR:", err.message)), 2000);
+  }
   sendPushToUsers(db, ["admin"], { title: `Buyer: ${step}`, body: `${by || "The buyer"} marked ${round.ref} (${dayLabel(round.delivery_date)}) as ${step}`, view: "supply" }).catch(() => {});
   return rows[0];
 }
@@ -438,7 +446,7 @@ export function registerSupplyBuyerRoutes(app, { auth }) {
     const sheet = await masterOf(round.id);
     const buying = await buyingOf(round.id, sheet);
     const { rows: mine } = await db.query(
-      `SELECT pu.product_id, pu.unit, pu.qty, pu.price, pu.sell_price, pu.margin_percent, v.name AS place
+      `SELECT pu.product_id, pu.unit, pu.qty, pu.price, pu.sell_price, pu.margin_percent, pu.mfg_date, pu.exp_date, v.name AS place
        FROM supply_purchases pu LEFT JOIN supply_vendors v ON v.id = pu.vendor_id
        WHERE pu.round_id = $1 AND pu.source = 'buyer'`,
       [round.id]
@@ -456,7 +464,7 @@ export function registerSupplyBuyerRoutes(app, { auth }) {
           key: row.key, product_id: row.product_id, name: row.name, unit: row.unit, need: row.need,
           for: Object.entries(sheet.master.find((item) => item.key === row.key)?.by_company || {}).map(([id, qty]) => ({ name: companyName.get(id) || "", qty: Number(qtyText(qty)) })),
           last: row.best ? { price: row.best.price, place: row.best.vendor_name } : null,
-          bought: own ? { qty: Number(own.qty), price: Number(own.price), sell: own.sell_price == null ? null : Number(own.sell_price), place: own.place || "", margin: own.margin_percent == null ? null : Number(own.margin_percent) } : null,
+          bought: own ? { qty: Number(own.qty), price: Number(own.price), sell: own.sell_price == null ? null : Number(own.sell_price), place: own.place || "", mfg: own.mfg_date || "", exp: own.exp_date || "", margin: own.margin_percent == null ? null : Number(own.margin_percent) } : null,
           sell_price: row.selling != null && row.need ? Math.round((row.selling / row.need) * 100) / 100 : null,
         };
       }),
@@ -503,8 +511,8 @@ export function registerSupplyBuyerRoutes(app, { auth }) {
       if (!(qty > 0) || !(price >= 0)) continue;
       const vendorId = await vendorFor(item.place);
       await db.query(
-        "INSERT INTO supply_purchases (round_id, product_id, vendor_id, unit, qty, price, bought_by, source, margin_percent, sell_price) VALUES ($1, $2, $3, $4, $5, $6, $7, 'buyer', $8, $9)",
-        [round.id, productId, vendorId, item.unit, qty, price, by, margin, okSell ? sell : null]
+        "INSERT INTO supply_purchases (round_id, product_id, vendor_id, unit, qty, price, bought_by, source, margin_percent, sell_price, mfg_date, exp_date) VALUES ($1, $2, $3, $4, $5, $6, $7, 'buyer', $8, $9, $10, $11)",
+        [round.id, productId, vendorId, item.unit, qty, price, by, margin, okSell ? sell : null, String(item.mfg || "").trim().slice(0, 20) || null, String(item.exp || "").trim().slice(0, 20) || null]
       );
       if (vendorId) await db.query("INSERT INTO supply_prices (product_id, vendor_id, unit, price, round_id, recorded_by) VALUES ($1, $2, $3, $4, $5, $6)", [productId, vendorId, item.unit, price, round.id, by]);
       if (okSell) await db.query("UPDATE supply_products SET sell_price = $3 WHERE id = $1 AND unit = $2", [productId, item.unit, Math.round(sell * 100) / 100]);
