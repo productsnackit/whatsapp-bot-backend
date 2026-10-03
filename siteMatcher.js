@@ -137,6 +137,71 @@ export function matchText(text, sites) {
   return { site_id: null, site_name: words.slice(0, Math.max(1, Math.min(shared, words.length))).join(" "), site_match: "group" };
 }
 
+/* ---------- Matching on the machines' addresses ----------
+   Customers often type the building or area, not the company ("Bagmane Laurel 5th floor",
+   "prestige technostar", "kudlu gate"). Each machine's address is compared word by word
+   (small spelling mistakes allowed); words that say nothing ("road", "bengaluru", "floor",
+   pin codes) are ignored, and words found in many addresses count less. A floor the customer
+   wrote ("5th floor", "ground floor") picks between machines in the same building. */
+const ADDRESS_NOISE = new Set(`no sy survey plot unit level municipal ward khata katha opp opposite near behind next above adjacent junction
+  bengaluru bangalore banglore karnataka hyderabad telangana mumbai maharashtra chennai tamil nadu kolkata west bengal pune goa kochi keralam kerala
+  delhi haryana gurugram india hobli taluk rd road main cross street layout nagar extension stage phase block sector area industrial indst
+  ground floor floors campus building bldg tower towers wing park tech business centre center office hub internal service ring outer intermediate
+  pvt ltd east north south new old the and of off`.split(/\s+/).filter(Boolean));
+const addressWords = (text) => [...new Set(tokensOf(text).filter((word) => word.length >= 3 && !/\d/.test(word) && !GENERIC_WORDS.has(word) && !ADDRESS_NOISE.has(word)))];
+const floorOf = (text) => {
+  const raw = String(text || "").toLowerCase();
+  if (/\b(ground|gf|g\s*floor)\b/.test(raw)) return "ground";
+  const found = raw.match(/\b(\d{1,2})\s*(?:st|nd|rd|th)?\s*(?:floor|flr|fl)\b/) || raw.match(/\bfloor\s*(\d{1,2})\b/);
+  return found ? String(Number(found[1])) : null;
+};
+
+function matchAddress(text, machines) {
+  const typed = addressWords(text);
+  if (!typed.length) return null;
+  // How many different addresses each word appears in (rarer words say more).
+  const addresses = [...new Set(machines.map((machine) => machine.address).filter(Boolean))];
+  const seen = new Map();
+  for (const address of addresses) for (const word of addressWords(address)) seen.set(word, (seen.get(word) || 0) + 1);
+  const scored = [];
+  for (const machine of machines) {
+    if (!machine.address) continue;
+    const words = addressWords(machine.address);
+    let score = 0;
+    let hits = 0;
+    let rareHit = false;
+    for (const word of words) {
+      if (!typed.some((token) => sameWord(token, word))) continue;
+      hits += 1;
+      const spread = seen.get(word) || 1;
+      score += 1 / spread;
+      if (spread === 1 && word.length >= 3) rareHit = true;
+    }
+    // Sure enough: two address words, or one word found in only one address.
+    if (hits >= 2 || rareHit) scored.push({ machine, score });
+  }
+  if (!scored.length) return null;
+  const best = Math.max(...scored.map((item) => item.score));
+  let top = scored.filter((item) => item.score >= best - 1e-9).map((item) => item.machine);
+  // Several machines in that building: the floor they wrote picks one.
+  const floor = floorOf(text);
+  if (top.length > 1 && floor) {
+    const onFloor = top.filter((machine) => floorOf(machine.location) === floor);
+    if (onFloor.length) top = onFloor;
+  }
+  if (top.length === 1) return { machine: top[0] };
+  // Still several: one company ("PWC") is still useful; different companies are not.
+  const company = (machine) => tokensOf(machine.location)[0];
+  if (top.every((machine) => company(machine) === company(top[0]))) return { group: machine0Name(top) };
+  return null;
+}
+const machine0Name = (machines) => {
+  const words = machines.map((machine) => String(machine.location).split(/\s+/));
+  let shared = 0;
+  while (words.every((list) => list[shared] && list[shared].toLowerCase() === words[0][shared].toLowerCase())) shared += 1;
+  return words[0].slice(0, Math.max(1, shared)).join(" ").replace(/[-–]+$/, "");
+};
+
 // A machine's location: its Refill Audit site when linked, else the machine list's name.
 const fromMachine = (machine, how) => ({ site_id: machine.site_id || null, site_name: machine.site_name || machine.location, site_match: how === "screenshot" ? "machine" : machine.site_id ? "site" : "named" });
 
@@ -146,12 +211,27 @@ export async function matchSite(text) {
   const typedMachine = await findMachine(text).catch(() => null);
   if (typedMachine) return fromMachine(typedMachine, "typed");
   const result = matchText(text, await loadSites());
-  if (result.site_match !== "none") return result;
-  // Not a Refill Audit site: try the machine list's location names ("Sony 3rd floor", "Refyne").
+  if (result.site_match === "site") return result;
   const machines = await allMachines();
+  // The machine list's location names ("Sony 3rd floor", "Refyne").
   const named = matchText(text, machines.map((machine) => describe({ id: machine.code, name: machine.location, aliases: [] })).filter((site) => site.core.length));
   if (named.site_match === "site") return fromMachine(machines.find((machine) => machine.code === named.site_id), "typed");
-  if (named.site_match === "group" && named.site_name) return { site_id: null, site_name: named.site_name, site_match: "group" };
+  // Only the company was clear ("Alorica"): its machines' addresses and floors may say which one.
+  const groupName = result.site_match === "group" ? result.site_name : named.site_match === "group" ? named.site_name : null;
+  if (groupName) {
+    const key = normaliseText(groupName);
+    const ofCompany = machines.filter((machine) => normaliseText(machine.location).startsWith(key));
+    const picked = ofCompany.length ? matchAddress(text, ofCompany) : null;
+    if (picked?.machine) return fromMachine(picked.machine, "typed");
+    const floor = floorOf(text);
+    const onFloor = floor ? ofCompany.filter((machine) => floorOf(machine.location) === floor) : [];
+    if (onFloor.length === 1) return fromMachine(onFloor[0], "typed");
+    return result.site_match === "group" ? result : { site_id: null, site_name: groupName, site_match: "group" };
+  }
+  // The building or area they typed, from the machines' addresses.
+  const byAddress = matchAddress(text, machines);
+  if (byAddress?.machine) return fromMachine(byAddress.machine, "typed");
+  if (byAddress?.group) return { site_id: null, site_name: byAddress.group, site_match: "group" };
   return result;
 }
 
@@ -211,7 +291,13 @@ export async function ensureSiteMatching(database, { onChanged } = {}) {
   for (const machine of await allMachines()) {
     if (machine.site_id) continue;
     const result = matchText(machine.location, sites);
-    if (result.site_match === "site") { await linkMachine(machine.code, result.site_id); linked += 1; }
+    if (result.site_match !== "site") continue;
+    // "Sony 2nd Floor" is not the site "Sony (3rd floor)".
+    const machineFloor = floorOf(machine.location);
+    const siteFloor = floorOf(result.site_name);
+    if (machineFloor && siteFloor && machineFloor !== siteFloor) continue;
+    await linkMachine(machine.code, result.site_id);
+    linked += 1;
   }
   if (linked) console.log(`🔢 Machines: ${linked} linked to Refill Audit locations`);
   await rematchTickets();
