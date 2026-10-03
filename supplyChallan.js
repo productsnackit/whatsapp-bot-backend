@@ -18,7 +18,7 @@ import sharp from "sharp";
 import PDFDocument from "pdfkit";
 import { companyLines } from "./supplyBilling.js";
 import { cleanName, likeness } from "./supplyParse.js";
-import { savePastOrders } from "./supplyHistory.js";
+import { savePastOrders, saveSept2026Workbook } from "./supplyHistory.js";
 import { storeDashboardFile } from "./ticketChat.js";
 import { sendWhatsApp, sendWhatsAppPayload, sendWhatsAppTemplate } from "./whatsapp.js";
 import { refillerWindowOpen } from "./whatsappOutbox.js";
@@ -70,6 +70,7 @@ export async function ensureSupplyChallan(database, { getBuyer, onChanged } = {}
   await saveKnownLocations().catch((err) => console.log("SUPPLY LOCATIONS ERROR:", err.message));
   await fillKnownHsn().catch((err) => console.log("SUPPLY HSN ERROR:", err.message));
   await savePastOrders(db).catch((err) => console.log("SUPPLY PAST ORDERS ERROR:", err.message));
+  await saveSept2026Workbook(db).catch((err) => console.log("SUPPLY SEPT WORKBOOK ERROR:", err.message));
 }
 
 /* Locations from Snackit's earlier DCs (Oct 2026), saved once: a new location is added; an
