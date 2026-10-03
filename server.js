@@ -25,6 +25,7 @@ import { registerTaskRoutes, taskReminderTick } from "./internalTasks.js";
 import { ensureImageRetention, cleanOldImages, registerImageRetentionRoutes } from "./imageRetention.js";
 import { registerAnalyticsOverview } from "./analyticsOverview.js";
 import { registerMachineRoutes } from "./machines.js";
+import { initSupplyAnalytics, registerSupplyAnalyticsRoutes } from "./supplyAnalytics.js";
 import { registerFindingsRoutes } from "./findingsRoutes.js";
 import { registerExpiryRoutes } from "./expiryRoutes.js";
 import { ensureUpiScanColumns, scanUpiScreenshot, registerUpiScanRoutes, readUpiImage, readMissedScreenshots } from "./upiScanner.js";
@@ -3326,6 +3327,7 @@ registerSupplyOrderLinkRoutes(app, { auth });
 registerSupplyReportRoutes(app, { auth });
 registerSupplyBuyerRoutes(app, { auth });
 registerMachineRoutes(app, { auth });
+registerSupplyAnalyticsRoutes(app, { auth });
 registerSupplyChallanRoutes(app, { auth });
 registerCapaOverdueRoutes(app, { auth });
 registerAttentionRoutes(app, { auth });
@@ -4797,6 +4799,7 @@ try {
   await ensureSupplyBilling(db).catch((err) => console.error("SUPPLY BILLING SETUP ERROR:", err.message));
   await ensureSupplyOrderLink(db, { onChanged: () => io.emit("supply-changed") }).catch((err) => console.error("SUPPLY ORDER LINK SETUP ERROR:", err.message));
   initSupplyReports(db);
+  initSupplyAnalytics(db);
   initSupplyWhatsApp(db, { onChanged: () => io.emit("supply-changed") });
   // The master sheet goes to the buyer (Admin Settings) when all companies have ordered or at the cutoff.
   await ensureSupplyBuyer(db, { onChanged: () => io.emit("supply-changed") }).catch((err) => console.error("SUPPLY BUYER SETUP ERROR:", err.message));
