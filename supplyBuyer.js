@@ -7,9 +7,9 @@
       • if orders change after that, the buyer gets an "updated list" with just the changes
         (once the change has settled for a couple of minutes), until he marks Goods received;
       • the message has a private link to a phone page (no login) where he fills, per item,
-        how much he bought, the price, where he bought it, and the margin %; that becomes the
-        purchase on the dashboard, the place's rate, and the item's selling price
-        (price + margin %);
+        how much he bought, the purchase price, the selling price and where he bought it; the
+        margin (selling − purchase, and % of selling) is worked out and stored, the selling price
+        becomes the item's price on invoices, and the place's rate is saved;
       • WhatsApp buttons take him through the steps:
         Received → Processing → Ordered → Goods received → Sent.
     The Excel master sheet is attached every time (and the updated one with each update).
@@ -54,7 +54,8 @@ export async function ensureSupplyBuyer(database, { onChanged } = {}) {
       ADD COLUMN IF NOT EXISTS buyer_snapshot JSONB;
     ALTER TABLE supply_purchases
       ADD COLUMN IF NOT EXISTS source TEXT,
-      ADD COLUMN IF NOT EXISTS margin_percent NUMERIC;
+      ADD COLUMN IF NOT EXISTS margin_percent NUMERIC,
+      ADD COLUMN IF NOT EXISTS sell_price NUMERIC;
   `);
 }
 
@@ -149,7 +150,7 @@ export async function sendListToBuyer(roundOrId, kind = "new") {
       ...lines,
       rows.length > 60 ? `…and ${rows.length - 60} more in the Excel file.` : "",
       "",
-      `👉 After buying, fill how much you bought, the price, where you bought it and the margin here:\n${url}`,
+      `👉 After buying, fill how much you bought, the purchase price and the selling price here:\n${url}`,
     ].filter((line, index, all) => line !== "" || all[index - 1] !== "").join("\n");
   }
 
@@ -301,7 +302,7 @@ export async function handleSupplyBuyerWhatsApp(msg) {
   const { url } = await linkFor(updated);
   const text = `${STEP_TEXT[updated.buyer_status]} · ${round.ref} (${dayLabel(round.delivery_date)})`;
   if (next) {
-    await sendWhatsAppButtons(msg.from, `${text}\n\nFill what you bought, price, place and margin: ${url}\n\nTap the next step when it's done.`, [{ id: `SB:${round.id}:${next}`, title: next }]);
+    await sendWhatsAppButtons(msg.from, `${text}\n\nFill what you bought, purchase price and selling price: ${url}\n\nTap the next step when it's done.`, [{ id: `SB:${round.id}:${next}`, title: next }]);
   } else {
     await sendWhatsApp(msg.from, `${text}. Thank you! 🙏`);
   }
@@ -437,7 +438,7 @@ export function registerSupplyBuyerRoutes(app, { auth }) {
     const sheet = await masterOf(round.id);
     const buying = await buyingOf(round.id, sheet);
     const { rows: mine } = await db.query(
-      `SELECT pu.product_id, pu.unit, pu.qty, pu.price, pu.margin_percent, v.name AS place
+      `SELECT pu.product_id, pu.unit, pu.qty, pu.price, pu.sell_price, pu.margin_percent, v.name AS place
        FROM supply_purchases pu LEFT JOIN supply_vendors v ON v.id = pu.vendor_id
        WHERE pu.round_id = $1 AND pu.source = 'buyer'`,
       [round.id]
@@ -455,7 +456,8 @@ export function registerSupplyBuyerRoutes(app, { auth }) {
           key: row.key, product_id: row.product_id, name: row.name, unit: row.unit, need: row.need,
           for: Object.entries(sheet.master.find((item) => item.key === row.key)?.by_company || {}).map(([id, qty]) => ({ name: companyName.get(id) || "", qty: Number(qtyText(qty)) })),
           last: row.best ? { price: row.best.price, place: row.best.vendor_name } : null,
-          bought: own ? { qty: Number(own.qty), price: Number(own.price), place: own.place || "", margin: own.margin_percent == null ? null : Number(own.margin_percent) } : null,
+          bought: own ? { qty: Number(own.qty), price: Number(own.price), sell: own.sell_price == null ? null : Number(own.sell_price), place: own.place || "", margin: own.margin_percent == null ? null : Number(own.margin_percent) } : null,
+          sell_price: row.selling != null && row.need ? Math.round((row.selling / row.need) * 100) / 100 : null,
         };
       }),
       places: places.map((place) => place.name),
@@ -493,18 +495,19 @@ export function registerSupplyBuyerRoutes(app, { auth }) {
       if (!known.has(`${productId}|${item.unit}`)) continue;
       const qty = Number(item.qty);
       const price = item.price === "" || item.price == null ? NaN : Number(item.price);
-      const margin = item.margin === "" || item.margin == null ? null : Number(item.margin);
+      const sell = item.sell === "" || item.sell == null ? null : Number(item.sell);
+      const okSell = sell != null && sell > 0 && sell < 10000000;
+      // Margin = selling − purchase, as % of the selling price (the same way the dashboard shows it).
+      const margin = okSell && price >= 0 ? Math.round(((sell - price) / sell) * 10000) / 100 : null;
       await db.query("DELETE FROM supply_purchases WHERE round_id = $1 AND product_id = $2 AND unit = $3 AND source = 'buyer'", [round.id, productId, item.unit]);
       if (!(qty > 0) || !(price >= 0)) continue;
       const vendorId = await vendorFor(item.place);
       await db.query(
-        "INSERT INTO supply_purchases (round_id, product_id, vendor_id, unit, qty, price, bought_by, source, margin_percent) VALUES ($1, $2, $3, $4, $5, $6, $7, 'buyer', $8)",
-        [round.id, productId, vendorId, item.unit, qty, price, by, margin != null && margin >= 0 && margin < 1000 ? margin : null]
+        "INSERT INTO supply_purchases (round_id, product_id, vendor_id, unit, qty, price, bought_by, source, margin_percent, sell_price) VALUES ($1, $2, $3, $4, $5, $6, $7, 'buyer', $8, $9)",
+        [round.id, productId, vendorId, item.unit, qty, price, by, margin, okSell ? sell : null]
       );
       if (vendorId) await db.query("INSERT INTO supply_prices (product_id, vendor_id, unit, price, round_id, recorded_by) VALUES ($1, $2, $3, $4, $5, $6)", [productId, vendorId, item.unit, price, round.id, by]);
-      if (margin != null && margin >= 0 && margin < 1000 && price > 0) {
-        await db.query("UPDATE supply_products SET sell_price = $3 WHERE id = $1 AND unit = $2", [productId, item.unit, Math.round(price * (1 + margin / 100) * 100) / 100]);
-      }
+      if (okSell) await db.query("UPDATE supply_products SET sell_price = $3 WHERE id = $1 AND unit = $2", [productId, item.unit, Math.round(sell * 100) / 100]);
       saved += 1;
     }
     await db.query("UPDATE supply_rounds SET updated_at = NOW() WHERE id = $1", [round.id]);
