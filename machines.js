@@ -86,3 +86,35 @@ export async function findMachine(text, { allowUnknown = false } = {}) {
   if (allowUnknown && codes.length && /sn[a@4]\s?[ck]{1,2}\s?[i1l|!]\s?t/i.test(String(text))) return { code: codes[0], location: null, site_id: null, unknown: true };
   return null;
 }
+
+/* Analytics: complaints per machine (machine ID read from the payment screenshot) today, this
+   month and all time (India dates), with the last complaint and the most common issue.
+   IDs read from screenshots that aren't in the machine list are included too. */
+export function registerMachineRoutes(app, { auth }) {
+  app.get("/analytics/machines", auth, async (req, res) => {
+    try {
+      const { rows } = await db.query(`
+        WITH t AS (
+          SELECT paid_machine AS code, created_at, (created_at AT TIME ZONE 'Asia/Kolkata') AS ist, main_issue,
+                 LOWER(COALESCE(status, '')) AS status
+          FROM tickets WHERE paid_machine IS NOT NULL
+        ), today AS (SELECT (NOW() AT TIME ZONE 'Asia/Kolkata')::date AS d)
+        SELECT t.code,
+               m.location, m.address,
+               COUNT(*) FILTER (WHERE t.ist::date = (SELECT d FROM today))::int AS today,
+               COUNT(*) FILTER (WHERE date_trunc('month', t.ist) = date_trunc('month', (SELECT d FROM today)::timestamp))::int AS month,
+               COUNT(*)::int AS all_time,
+               COUNT(*) FILTER (WHERE t.status IN ('refunded', 'auto_refunded'))::int AS refunded,
+               MAX(t.created_at) AS last_at,
+               MODE() WITHIN GROUP (ORDER BY t.main_issue) AS top_issue
+        FROM t LEFT JOIN vending_machines m ON m.code = t.code
+        GROUP BY t.code, m.location, m.address
+        ORDER BY month DESC, all_time DESC, t.code`);
+      const { rows: count } = await db.query("SELECT COUNT(*)::int AS machines FROM vending_machines");
+      res.json({ machines: rows, machine_count: count[0].machines });
+    } catch (err) {
+      console.log("MACHINE ANALYTICS ERROR:", err.message);
+      res.status(500).json({ error: "Could not load machine analytics" });
+    }
+  });
+}

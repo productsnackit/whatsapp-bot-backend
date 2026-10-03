@@ -24,6 +24,7 @@ import { ensureRefillTables, registerRefillRoutes, refillTick } from "./refillSc
 import { registerTaskRoutes, taskReminderTick } from "./internalTasks.js";
 import { ensureImageRetention, cleanOldImages, registerImageRetentionRoutes } from "./imageRetention.js";
 import { registerAnalyticsOverview } from "./analyticsOverview.js";
+import { registerMachineRoutes } from "./machines.js";
 import { registerFindingsRoutes } from "./findingsRoutes.js";
 import { registerExpiryRoutes } from "./expiryRoutes.js";
 import { ensureUpiScanColumns, scanUpiScreenshot, registerUpiScanRoutes, readUpiImage, readMissedScreenshots } from "./upiScanner.js";
@@ -3323,6 +3324,7 @@ registerSupplyBillingRoutes(app, { auth });
 registerSupplyOrderLinkRoutes(app, { auth });
 registerSupplyReportRoutes(app, { auth });
 registerSupplyBuyerRoutes(app, { auth });
+registerMachineRoutes(app, { auth });
 registerSupplyChallanRoutes(app, { auth });
 registerCapaOverdueRoutes(app, { auth });
 registerAttentionRoutes(app, { auth });
