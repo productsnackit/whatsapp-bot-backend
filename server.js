@@ -604,7 +604,7 @@ async function saveMessage(ticketId, sender, message) {
 }
 
 async function updateTicket(id, fields) {
-  const currentResult = await db.query("SELECT phone, state, refund_stage FROM tickets WHERE id=$1", [id]);
+  const currentResult = await db.query("SELECT phone, state, refund_stage, site_match FROM tickets WHERE id=$1", [id]);
   const current = currentResult.rows[0];
   const nextFields = { ...fields };
 
@@ -618,8 +618,9 @@ async function updateTicket(id, fields) {
     );
     nextFields.machine_id = machine.rows[0]?.id || null;
     nextFields.location = location;
-    // Which of our sites the customer's words point to (see siteMatcher.js).
-    Object.assign(nextFields, await matchSite(location).catch(() => ({})));
+    // Which of our sites the customer's words point to (see siteMatcher.js), unless the site was
+    // already read from the payment screenshot's machine ID or set by hand.
+    if (!["machine", "manual"].includes(current?.site_match)) Object.assign(nextFields, await matchSite(location).catch(() => ({})));
   }
 
   const nextStage = getRefundStage(nextFields.refund_stage || nextFields.status, nextFields.state || current?.state, current?.refund_stage);
@@ -2649,6 +2650,7 @@ app.get("/tickets", auth, async (req, res) => {
         site_id,
         site_name,
         site_match,
+        paid_machine,
         upi_utr,
         payments,
         product_received,

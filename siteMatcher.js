@@ -7,11 +7,15 @@
     what they typed, so analytics count real sites.
       - site:   one site clearly matched;
       - group:  a company with several sites (e.g. "Alorica") but not which one;
+      - machine: read from the payment screenshot's machine ID (see machines.js);
+      - named:  one of our machines' locations (machine list) that isn't a Refill Audit site;
       - manual: set by someone on the dashboard;
       - none:   nothing matched.
     When someone sets the site by hand they can keep the customer's wording
     as an extra name for that site, so it matches by itself next time.
 ========================================================= */
+
+import { ensureMachines, allMachines, linkMachine, findMachine } from "./machines.js";
 
 let db = null;
 let cache = { at: 0, sites: [] };
@@ -133,22 +137,51 @@ export function matchText(text, sites) {
   return { site_id: null, site_name: words.slice(0, Math.max(1, Math.min(shared, words.length))).join(" "), site_match: "group" };
 }
 
+// A machine's location: its Refill Audit site when linked, else the machine list's name.
+const fromMachine = (machine, how) => ({ site_id: machine.site_id || null, site_name: machine.site_name || machine.location, site_match: how === "screenshot" ? "machine" : machine.site_id ? "site" : "named" });
+
 export async function matchSite(text) {
   if (!db) return { site_id: null, site_name: null, site_match: "none" };
-  return matchText(text, await loadSites());
+  // A machine ID typed by the customer ("vv00017") says exactly where.
+  const typedMachine = await findMachine(text).catch(() => null);
+  if (typedMachine) return fromMachine(typedMachine, "typed");
+  const result = matchText(text, await loadSites());
+  if (result.site_match !== "none") return result;
+  // Not a Refill Audit site: try the machine list's location names ("Sony 3rd floor", "Refyne").
+  const machines = await allMachines();
+  const named = matchText(text, machines.map((machine) => describe({ id: machine.code, name: machine.location, aliases: [] })).filter((site) => site.core.length));
+  if (named.site_match === "site") return fromMachine(machines.find((machine) => machine.code === named.site_id), "typed");
+  if (named.site_match === "group" && named.site_name) return { site_id: null, site_name: named.site_name, site_match: "group" };
+  return result;
+}
+
+/* The payment screenshot names the machine paid (snackitvv00002): that sets the ticket's site,
+   unless someone set it by hand. Returns the machine or null. */
+export async function applyPaidMachine(ticketId, text) {
+  if (!db) return null;
+  const machine = await findMachine(text);
+  if (!machine) return null;
+  const site = fromMachine(machine, "screenshot");
+  const { rowCount } = await db.query(
+    `UPDATE tickets SET paid_machine = $2, site_id = $3, site_name = $4, site_match = $5
+     WHERE id = $1 AND COALESCE(site_match, '') <> 'manual'`,
+    [ticketId, machine.code, site.site_id, site.site_name, site.site_match]
+  );
+  if (!rowCount) await db.query("UPDATE tickets SET paid_machine = $2 WHERE id = $1", [ticketId, machine.code]);
+  onTicketsChanged?.();
+  return machine;
 }
 
 // Matches again every ticket not set by hand (after sites or their extra names change).
 export async function rematchTickets() {
   if (!db) return 0;
-  const sites = await loadSites();
   const { rows } = await db.query(
     `SELECT id, location, site_id, site_name, site_match FROM tickets
-     WHERE NULLIF(TRIM(COALESCE(location, '')), '') IS NOT NULL AND COALESCE(site_match, '') <> 'manual'`
+     WHERE NULLIF(TRIM(COALESCE(location, '')), '') IS NOT NULL AND COALESCE(site_match, '') NOT IN ('manual', 'machine')`
   );
   let changed = 0;
   for (const ticket of rows) {
-    const result = matchText(ticket.location, sites);
+    const result = await matchSite(ticket.location);
     if (result.site_id === ticket.site_id && result.site_name === ticket.site_name && result.site_match === ticket.site_match) continue;
     await db.query("UPDATE tickets SET site_id = $2, site_name = $3, site_match = $4 WHERE id = $1", [ticket.id, result.site_id, result.site_name, result.site_match]);
     changed += 1;
@@ -171,6 +204,16 @@ export async function ensureSiteMatching(database, { onChanged } = {}) {
       ADD COLUMN IF NOT EXISTS site_match TEXT
   `);
   cache.at = 0;
+  // The machine list, each machine linked to the Refill Audit site with its name (when clear).
+  await ensureMachines(db).catch((err) => console.log("MACHINES SETUP ERROR:", err.message));
+  const sites = await loadSites();
+  let linked = 0;
+  for (const machine of await allMachines()) {
+    if (machine.site_id) continue;
+    const result = matchText(machine.location, sites);
+    if (result.site_match === "site") { await linkMachine(machine.code, result.site_id); linked += 1; }
+  }
+  if (linked) console.log(`🔢 Machines: ${linked} linked to Refill Audit locations`);
   await rematchTickets();
 }
 

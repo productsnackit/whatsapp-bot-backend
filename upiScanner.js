@@ -11,6 +11,7 @@ import { createWorker, PSM } from "tesseract.js";
 import os from "os";
 import path from "path";
 import { createRequire } from "module";
+import { applyPaidMachine } from "./siteMatcher.js";
 import { imageFingerprint } from "./ticketWatch.js";
 
 // The English language file ships with the app (no download at start-up, so it works even
@@ -545,7 +546,13 @@ async function scanNow(ticketId) {
       [JSON.stringify(scan), result.utr, result.payer_upi, ticketId]
     );
   }
-  console.log(`🔎 UPI scan ticket #${ticketId}: UTR ${result.utr || "-"}, ₹${result.amount ?? "-"}, ${result.payer_upi || "no UPI ID"} (${scan.ms}ms)`);
+  // The machine paid ("paid to snackitvv00002") sets the ticket's location (see machines.js).
+  const machine = await applyPaidMachine(ticketId, [...(result.upi_ids || []), data.text].join("\n")).catch((err) => { console.log(`MACHINE READ ticket #${ticketId}:`, err.message); return null; });
+  if (machine) {
+    scan.machine = machine.code;
+    await db.query("UPDATE tickets SET upi_scan = jsonb_set(upi_scan, '{machine}', to_jsonb($2::text)) WHERE id = $1", [ticketId, machine.code]).catch(() => {});
+  }
+  console.log(`🔎 UPI scan ticket #${ticketId}: UTR ${result.utr || "-"}, ₹${result.amount ?? "-"}, ${result.payer_upi || "no UPI ID"}${machine ? `, machine ${machine.code} (${machine.location})` : ""} (${scan.ms}ms)`);
   return scan;
 }
 
