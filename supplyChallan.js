@@ -12,14 +12,15 @@
       • the number is the prefix + next number from Invoice details (e.g. DIR26 + 00488), kept
         when the DC is made again for the same company and date.
 ========================================================= */
+import crypto from "crypto";
 import axios from "axios";
 import sharp from "sharp";
 import PDFDocument from "pdfkit";
 import { companyLines } from "./supplyBilling.js";
 import { cleanName, likeness } from "./supplyParse.js";
 import { savePastOrders } from "./supplyHistory.js";
-import { storeDashboardFile, sendStoredFile } from "./ticketChat.js";
-import { sendWhatsApp } from "./whatsapp.js";
+import { storeDashboardFile } from "./ticketChat.js";
+import { sendWhatsApp, sendWhatsAppPayload, sendWhatsAppTemplate } from "./whatsapp.js";
 import { refillerWindowOpen } from "./whatsappOutbox.js";
 
 let db = null;
@@ -60,6 +61,11 @@ export async function ensureSupplyChallan(database, { getBuyer, onChanged } = {}
       sent_at TIMESTAMPTZ,
       UNIQUE (round_id, company_id)
     );
+    ALTER TABLE supply_challans
+      ADD COLUMN IF NOT EXISTS pdf BYTEA,
+      ADD COLUMN IF NOT EXISTS file_token TEXT UNIQUE,
+      ADD COLUMN IF NOT EXISTS file_name TEXT,
+      ADD COLUMN IF NOT EXISTS send_error TEXT;
   `);
   await saveKnownLocations().catch((err) => console.log("SUPPLY LOCATIONS ERROR:", err.message));
   await fillKnownHsn().catch((err) => console.log("SUPPLY HSN ERROR:", err.message));
@@ -339,6 +345,11 @@ async function challanPdf({ ref, madeAt, round, company, lines, seller: me }) {
 
 /* Makes (or makes again) the DCs for a round, one per company with something to deliver.
    Returns [{ company, ref, file }]. */
+/* The PDF is kept here and served from this server's own address (Cloudinary blocks PDFs on
+   many accounts, which stopped them opening and WhatsApp fetching them). */
+const SERVER_URL = String(process.env.PUBLIC_SERVER_URL || process.env.RENDER_EXTERNAL_URL || "https://whatsapp-bot-backend-b3nb.onrender.com").replace(/\/$/, "");
+const fileUrl = (token, name) => `${SERVER_URL}/public/supply/dc/${token}/${encodeURIComponent(name)}`;
+
 export async function makeChallans(roundId) {
   const { rows: rounds } = await db.query("SELECT * FROM supply_rounds WHERE id = $1", [roundId]);
   if (!rounds[0]) throw new Error("Delivery date not found");
@@ -349,19 +360,21 @@ export async function makeChallans(roundId) {
   for (const { company_id: companyId } of companies) {
     const data = await challanData(round, companyId);
     if (!data.lines.length) continue;
-    const { rows: existing } = await db.query("SELECT ref, made_at FROM supply_challans WHERE round_id = $1 AND company_id = $2", [round.id, companyId]);
+    const { rows: existing } = await db.query("SELECT ref, made_at, file_token FROM supply_challans WHERE round_id = $1 AND company_id = $2", [round.id, companyId]);
     const ref = existing[0]?.ref || await nextRef();
     const madeAt = existing[0]?.made_at || new Date();
     const pdf = await challanPdf({ ref, madeAt, round, company: data.company, lines: data.lines, seller: me });
     const fileName = `DC-${ref}-${data.company.name.replace(/[^A-Za-z0-9]+/g, "-")}.pdf`;
-    const file = await storeDashboardFile({ name: fileName, type: "application/pdf", data: pdf.toString("base64") });
+    const token = existing[0]?.file_token || crypto.randomBytes(18).toString("base64url");
+    const url = fileUrl(token, fileName);
     const total = data.lines.reduce((sum, item) => sum + item.qty, 0);
     await db.query(
-      `INSERT INTO supply_challans (round_id, company_id, ref, lines, total_qty, pdf_url, made_at) VALUES ($1, $2, $3, $4, $5, $6, $7)
-       ON CONFLICT (round_id, company_id) DO UPDATE SET lines = EXCLUDED.lines, total_qty = EXCLUDED.total_qty, pdf_url = EXCLUDED.pdf_url`,
-      [round.id, companyId, ref, JSON.stringify(data.lines), total, file.url, madeAt]
+      `INSERT INTO supply_challans (round_id, company_id, ref, lines, total_qty, pdf_url, made_at, pdf, file_token, file_name) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+       ON CONFLICT (round_id, company_id) DO UPDATE SET lines = EXCLUDED.lines, total_qty = EXCLUDED.total_qty, pdf_url = EXCLUDED.pdf_url,
+         pdf = EXCLUDED.pdf, file_token = EXCLUDED.file_token, file_name = EXCLUDED.file_name, sent_at = NULL, send_error = NULL`,
+      [round.id, companyId, ref, JSON.stringify(data.lines), total, url, madeAt, pdf, token, fileName]
     );
-    made.push({ company: data.company, ref, file, total });
+    made.push({ company: data.company, ref, file: { url, name: fileName }, total });
   }
   onChange();
   return { round, made };
@@ -374,21 +387,32 @@ export async function makeAndSendChallans(roundId) {
   const contact = await buyerContact();
   if (!contact.phone) return { made: made.length, sent: 0, error: "Add the buyer's WhatsApp number in Admin Settings → Direct Supply buyer." };
   const to = phoneDigits(contact.phone);
-  if (!(await refillerWindowOpen(to))) {
-    return { made: made.length, sent: 0, error: `${contact.name || "The buyer"} hasn't messaged the Snackit number in the last 24 hours, so WhatsApp won't deliver the DCs. Ask them to send "hi", then press Send DCs again.` };
+  const open = await refillerWindowOpen(to);
+  if (open) {
+    await sendWhatsApp(to, `📄 *Delivery challans · ${dayLabel(round.delivery_date)}* (${round.ref})\n${made.length} DC${made.length === 1 ? "" : "s"}, one per company:\n${made.map((item) => `• ${item.company.name}: ${item.ref} (${qtyText(item.total)} items)`).join("\n")}\n\nPrint each one and send it with that company's delivery.`);
   }
-  await sendWhatsApp(to, `📄 *Delivery challans · ${dayLabel(round.delivery_date)}* (${round.ref})\n${made.length} DC${made.length === 1 ? "" : "s"}, one per company:\n${made.map((item) => `• ${item.company.name}: ${item.ref} (${qtyText(item.total)} items)`).join("\n")}\n\nPrint each one and send it with that company's delivery.`);
   let sent = 0;
+  const problems = [];
   for (const item of made) {
-    const result = await sendStoredFile(to, item.file, `${item.ref} · ${item.company.name}`);
+    // Inside WhatsApp's 24 hours: the PDF itself. Outside: the approved supply_buyer_list template
+    // with the PDF as its document (one per company).
+    const result = open
+      ? await sendWhatsAppPayload({ messaging_product: "whatsapp", to, type: "document", document: { link: item.file.url, filename: item.file.name, caption: `${item.ref} · ${item.company.name}` } })
+      : await sendWhatsAppTemplate(to, "supply_buyer_list", "en", [`the delivery challan ${item.ref} for ${item.company.name}, ${dayLabel(round.delivery_date)},`, String(item.total), item.file.url], [`SBDC:${round.id}`], { link: item.file.url, filename: item.file.name });
     if (result.ok) {
       sent += 1;
-      await db.query("UPDATE supply_challans SET sent_at = NOW() WHERE round_id = $1 AND company_id = $2", [round.id, item.company.id]);
+      await db.query("UPDATE supply_challans SET sent_at = NOW(), send_error = NULL WHERE round_id = $1 AND company_id = $2", [round.id, item.company.id]);
+    } else {
+      problems.push(`${item.company.name}: ${result.error || "not accepted"}`);
+      await db.query("UPDATE supply_challans SET send_error = $3 WHERE round_id = $1 AND company_id = $2", [round.id, item.company.id, String(result.error || "Not sent").slice(0, 300)]);
     }
   }
+  if (problems.length) console.log("DC SEND:", problems.join(" | "));
   onChange();
-  return { made: made.length, sent, error: sent < made.length ? "Some DCs didn't go on WhatsApp. Download them from the dashboard." : null };
+  const reason = open ? "WhatsApp didn't take some DCs" : `${contact.name || "The buyer"} hasn't messaged the Snackit number in the last 24 hours, and the supply_buyer_list template didn't go (create it in Meta with a Document header, or ask him to send "hi")`;
+  return { made: made.length, sent, error: sent < made.length ? `${reason}. You can open and print them from the dashboard.` : null };
 }
+
 
 export function registerSupplyChallanRoutes(app, { auth }) {
   const handle = (label, fn) => async (req, res) => {
@@ -402,7 +426,7 @@ export function registerSupplyChallanRoutes(app, { auth }) {
 
   app.get("/supply/rounds/:id/challans", auth, handle("SUPPLY CHALLANS", async (req, res) => {
     const { rows } = await db.query(
-      `SELECT ch.id, ch.company_id, ch.ref, ch.total_qty, ch.pdf_url, ch.made_at, ch.sent_at, c.name AS company_name
+      `SELECT ch.id, ch.company_id, ch.ref, ch.total_qty, ch.pdf_url, ch.made_at, ch.sent_at, ch.send_error, (ch.pdf IS NOT NULL) AS has_file, c.name AS company_name
        FROM supply_challans ch JOIN supply_companies c ON c.id = ch.company_id WHERE ch.round_id = $1 ORDER BY c.name`,
       [req.params.id]
     );
@@ -414,6 +438,17 @@ export function registerSupplyChallanRoutes(app, { auth }) {
     const result = req.body?.send === false ? { made: (await makeChallans(req.params.id)).made.length, sent: 0 } : await makeAndSendChallans(req.params.id);
     res.locals.activity = { section: "Direct Supply", action: `Made ${result.made} delivery challan(s)${result.sent ? `, sent ${result.sent} to the buyer` : ""}` };
     res.json(result);
+  }));
+
+  // The DC PDF (no login: the long random part of the link is the key, like the buyer's page).
+  app.get("/public/supply/dc/:token/:name", handle("DC FILE", async (req, res) => {
+    if (!/^[A-Za-z0-9_-]{16,64}$/.test(req.params.token)) return res.status(404).send("Not found");
+    const { rows } = await db.query("SELECT pdf, file_name FROM supply_challans WHERE file_token = $1", [req.params.token]);
+    if (!rows[0]?.pdf) return res.status(404).send("This delivery challan isn't available. Make it again from the dashboard.");
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `inline; filename="${String(rows[0].file_name || "DC.pdf").replace(/"/g, "")}"`);
+    res.setHeader("Cache-Control", "no-store");
+    res.send(rows[0].pdf);
   }));
 
   // Snackit's logo or the signatory's stamp for the DC.
