@@ -282,7 +282,8 @@ export async function handleSupplyBuyerWhatsApp(msg) {
     const text = String(msg.text?.body || "");
     if (parseOrderMessage(text).groups.some((group) => group.heading && group.lines.length)) return false;
     const { rows } = await db.query(
-      "SELECT * FROM supply_rounds WHERE sent_at IS NOT NULL AND delivery_date >= $1::date ORDER BY delivery_date, id LIMIT 3",
+      `SELECT * FROM supply_rounds WHERE sent_at IS NOT NULL AND delivery_date >= $1::date
+       AND status <> 'Delivered' AND COALESCE(buyer_status, '') <> 'Sent' ORDER BY delivery_date, id LIMIT 3`,
       [istNow().slice(0, 10)]
     );
     if (!rows.length) {
@@ -307,10 +308,10 @@ export async function handleSupplyBuyerWhatsApp(msg) {
   const updated = await setStep(round, tapped[2], contact.name);
   if (!updated) return false;
   const next = nextStep(updated.buyer_status);
-  const { url } = await linkFor(updated);
   const text = `${STEP_TEXT[updated.buyer_status]} · ${round.ref} (${dayLabel(round.delivery_date)})`;
+  // The link to his page is only in the list message itself, not in every step reply.
   if (next) {
-    await sendWhatsAppButtons(msg.from, `${text}\n\nFill what you bought, purchase price and selling price: ${url}\n\nTap the next step when it's done.`, [{ id: `SB:${round.id}:${next}`, title: next }]);
+    await sendWhatsAppButtons(msg.from, `${text}\n\nTap the next step when it's done.`, [{ id: `SB:${round.id}:${next}`, title: next }]);
   } else {
     await sendWhatsApp(msg.from, `${text}. Thank you! 🙏`);
   }
@@ -496,12 +497,15 @@ export function registerSupplyBuyerRoutes(app, { auth }) {
     const by = contact.name || "Buyer";
     const sheet = await masterOf(round.id);
     const known = new Set(sheet.master.filter((row) => row.product_id).map((row) => `${row.product_id}|${row.unit}`));
+    const needOf = new Map(sheet.master.map((row) => [`${row.product_id}|${row.unit}`, row.total]));
     const items = Array.isArray(req.body?.items) ? req.body.items.slice(0, 300) : [];
     let saved = 0;
     for (const item of items) {
       const productId = Number(item.product_id);
       if (!known.has(`${productId}|${item.unit}`)) continue;
-      const qty = Number(item.qty);
+      // He fills the prices but often leaves "Bought" showing the needed amount: that means all of it.
+      const hasPrice = item.price !== "" && item.price != null;
+      const qty = item.qty === "" || item.qty == null ? (hasPrice ? Number(needOf.get(`${productId}|${item.unit}`) || 0) : 0) : Number(item.qty);
       const price = item.price === "" || item.price == null ? NaN : Number(item.price);
       const sell = item.sell === "" || item.sell == null ? null : Number(item.sell);
       const okSell = sell != null && sell > 0 && sell < 10000000;
