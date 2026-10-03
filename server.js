@@ -41,6 +41,7 @@ import { initSupplyReports, registerSupplyReportRoutes } from "./supplyReports.j
 import { initSupplyWhatsApp, handleSupplyWhatsApp } from "./supplyWhatsApp.js";
 import { ensureSupplyBuyer, registerSupplyBuyerRoutes, supplyBuyerTick, handleSupplyBuyerWhatsApp, buyerContact } from "./supplyBuyer.js";
 import { ensureSupplyChallan, registerSupplyChallanRoutes } from "./supplyChallan.js";
+import { ensureSupplySegments } from "./supplySegments.js";
 import { ensureCapaOverdue, capaOverdueTick, registerCapaOverdueRoutes, handleCapaOverdueWhatsApp } from "./capaOverdue.js";
 import { ensureAttention, attentionReason, isExpectedAnswer, alertAdmins, registerAttentionRoutes, locationProblem, LOCATION_AGAIN } from "./attention.js";
 import { CHARGED_MORE_THAN_ONCE, PRODUCT_QUESTION, COUNT_QUESTION, paymentPrompt, parseChargeCount, extractTransactionIds, paymentId, refundFor, receivedMessage, doneMessage, mergePayments } from "./multiPayment.js";
@@ -4791,6 +4792,8 @@ try {
   await ensureImageRetention(db).catch((err) => console.error("IMAGE CLEAN-UP SETUP ERROR:", err.message));
   await ensureCallLog(db, { onChange: () => io.emit("call-log-changed") }).catch((err) => console.error("CALL LOG SETUP ERROR:", err.message));
   await ensureDirectSupply(db).catch((err) => console.error("DIRECT SUPPLY SETUP ERROR:", err.message));
+  // Fruits and packaged products are two supplies (Direct Supply / Packaged Supply pages).
+  await ensureSupplySegments(db).catch((err) => console.error("SUPPLY SEGMENTS SETUP ERROR:", err.message));
   await ensureSupplyBilling(db).catch((err) => console.error("SUPPLY BILLING SETUP ERROR:", err.message));
   await ensureSupplyOrderLink(db, { onChanged: () => io.emit("supply-changed") }).catch((err) => console.error("SUPPLY ORDER LINK SETUP ERROR:", err.message));
   initSupplyReports(db);

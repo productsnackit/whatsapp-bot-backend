@@ -25,6 +25,7 @@ import { sendWhatsApp, sendWhatsAppPayload, sendWhatsAppButtons, sendWhatsAppTem
 import { refillerWindowOpen } from "./whatsappOutbox.js";
 import { sendPushToUsers } from "./pushNotifications.js";
 import { makeAndSendChallans } from "./supplyChallan.js";
+import { validSegment } from "./supplySegments.js";
 
 export const BUYER_STEPS = ["Received", "Processing", "Ordered", "Goods received", "Sent"];
 const STEP_TEXT = { Received: "✅ List received", Processing: "⏳ Processing", Ordered: "🛒 Ordered", "Goods received": "📦 Goods received", Sent: "🚚 Sent" };
@@ -131,7 +132,7 @@ export async function sendListToBuyer(roundOrId, kind = "new") {
   if (isUpdate) {
     const changes = changesBetween(round.buyer_snapshot || [], rows);
     body = [
-      `📝 *Updated stock list · ${label}*`,
+      `📝 *Updated ${kindOf(round)} stock list · ${label}*`,
       `${round.ref}${round.title ? ` · ${round.title}` : ""}`,
       "",
       ...changes.slice(0, 40),
@@ -145,7 +146,7 @@ export async function sendListToBuyer(roundOrId, kind = "new") {
       return `• ${row.name}: *${qtyText(row.total)} ${row.unit}*${best ? ` · last ₹${best.price} at ${best.vendor_name}` : ""}`;
     });
     body = [
-      `🛒 *Stock to buy · ${label}*`,
+      `🛒 *${kindOf(round, true)} stock to buy · ${label}*`,
       `${round.ref}${round.title ? ` · ${round.title}` : ""} · ${sheet.companies.length} location${sheet.companies.length === 1 ? "" : "s"}: ${sheet.companies.map((company) => company.name).join(", ")}`,
       "",
       ...lines,
@@ -173,7 +174,7 @@ export async function sendListToBuyer(roundOrId, kind = "new") {
     if (next) await sendWhatsAppButtons(to, isUpdate ? "Tap to say you've seen the change." : "Tap when you've seen the list.", [{ id: `SB:${round.id}:${next}`, title: next }]);
   } else {
     // Outside WhatsApp's 24 hours: the approved template, with the Excel file at the top.
-    const params = [`${isUpdate ? "the updated stock list" : "the stock list"} for ${label}`, String(rows.length), url];
+    const params = [`${isUpdate ? "the updated" : "the"} ${kindOf(round)} stock list for ${label}`, String(rows.length), url];
     const result = await sendWhatsAppTemplate(to, TEMPLATE, "en", params, [`SB:${round.id}:Received`], file ? { link: file.url, filename: fileName } : null);
     if (!result.ok) {
       return { ok: false, error: `${contact.name || "The buyer"} hasn't messaged the Snackit number in the last 24 hours, and the "${TEMPLATE}" template didn't go (${result.error}). Ask them to send "hi" to the Snackit number, or check the template in Meta.` };
@@ -190,6 +191,9 @@ export async function sendListToBuyer(roundOrId, kind = "new") {
   onChange();
   return { ok: true, file_sent: fileSent, via_template: viaTemplate };
 }
+
+// "fruits" / "packaged" for the WhatsApp texts (with its emoji when capitalised).
+const kindOf = (round, capital = false) => (round.segment === "packaged" ? (capital ? "🥫 Packaged" : "packaged") : (capital ? "🍎 Fruits" : "fruits"));
 
 const nextStep = (status) => {
   const index = BUYER_STEPS.indexOf(status);
@@ -232,7 +236,7 @@ export async function supplyBuyerTick() {
       [now.slice(0, 10)]
     );
     if (!rounds.length) return;
-    const { rows: active } = await db.query("SELECT id FROM supply_companies WHERE active = TRUE");
+    const { rows: active } = await db.query("SELECT id, segments FROM supply_companies WHERE active = TRUE");
     for (const raw of rounds) {
       const round = { ...raw, delivery_date: plainDate(raw.delivery_date) };
       if (failedAt.has(round.id) && Date.now() - failedAt.get(round.id) < 30 * 60000) continue;
@@ -241,7 +245,9 @@ export async function supplyBuyerTick() {
       let kind = null;
       if (!round.sent_at) {
         const have = new Set(ordered.map((row) => row.company_id));
-        const everyone = active.length > 0 && active.every((company) => have.has(company.id));
+        // Only the companies that order from this supply (fruits / packaged) count.
+        const ofSupply = active.filter((company) => (company.segments || []).includes(round.segment || "fruits"));
+        const everyone = ofSupply.length > 0 && ofSupply.every((company) => have.has(company.id));
         if (everyone || now >= `${dayBefore(round.delivery_date)}T${contact.cutoff}`) kind = "new";
       } else if (!["Goods received", "Sent"].includes(round.buyer_status)) {
         const current = JSON.stringify(snapshotOf(await masterOf(round.id)));
@@ -294,7 +300,7 @@ export async function handleSupplyBuyerWhatsApp(msg) {
       const round = { ...raw, delivery_date: plainDate(raw.delivery_date) };
       const { url } = await linkFor(round);
       const next = nextStep(round.buyer_status);
-      const body = `🛒 Stock list for ${dayLabel(round.delivery_date)} (${round.ref})${round.buyer_status ? ` · now: ${round.buyer_status}` : ""}\n${url}`;
+      const body = `🛒 ${kindOf(round, true)} stock list for ${dayLabel(round.delivery_date)} (${round.ref})${round.buyer_status ? ` · now: ${round.buyer_status}` : ""}\n${url}`;
       if (next) await sendWhatsAppButtons(msg.from, body, [{ id: `SB:${round.id}:${next}`, title: next }]);
       else await sendWhatsApp(msg.from, body);
     }
@@ -388,11 +394,11 @@ export function registerSupplyBuyerRoutes(app, { auth }) {
      buyer has done, money spent, selling value, margin, deliveries and payments. */
   app.get("/supply/orders-list", auth, handle("SUPPLY ORDERS LIST", async (req, res) => {
     const { rows: rounds } = await db.query(
-      "SELECT * FROM supply_rounds WHERE delivery_date >= CURRENT_DATE - INTERVAL '120 days' ORDER BY delivery_date DESC, id DESC LIMIT 150"
+      "SELECT * FROM supply_rounds WHERE delivery_date >= CURRENT_DATE - INTERVAL '120 days' AND segment = $1 ORDER BY delivery_date DESC, id DESC LIMIT 150", [validSegment(req.query.segment)]
     );
     const ids = rounds.map((round) => round.id);
     const [active, deliveries, invoices, sources] = await Promise.all([
-      db.query("SELECT COUNT(*)::int AS count FROM supply_companies WHERE active = TRUE"),
+      db.query("SELECT COUNT(*)::int AS count FROM supply_companies WHERE active = TRUE AND $1 = ANY(segments)", [validSegment(req.query.segment)]),
       db.query("SELECT round_id, COUNT(*) FILTER (WHERE status = 'Delivered')::int AS delivered FROM supply_deliveries WHERE round_id = ANY($1) GROUP BY round_id", [ids]),
       db.query("SELECT round_id, COALESCE(SUM(total), 0) AS billed, COALESCE(SUM(paid), 0) AS paid FROM supply_invoices WHERE cancelled_at IS NULL AND round_id = ANY($1) GROUP BY round_id", [ids]).catch(() => ({ rows: [] })),
       db.query("SELECT round_id, source, COUNT(*)::int AS count FROM supply_orders WHERE round_id = ANY($1) GROUP BY round_id, source", [ids]),

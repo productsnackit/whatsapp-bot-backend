@@ -15,6 +15,7 @@
     remembered for next time.
 ========================================================= */
 import XLSX from "xlsx";
+import { segmentOfName, validSegment, addCompanySegment } from "./supplySegments.js";
 import { parseText, parseRows, parseOrderMessage, cleanName, displayName, matchName, normaliseUnit, UNITS } from "./supplyParse.js";
 
 let db = null;
@@ -130,7 +131,7 @@ export async function ensureDirectSupply(database) {
 }
 
 async function products() {
-  const { rows } = await db.query("SELECT id, name, key, unit, category, aliases, pack_size, sell_price, hsn FROM supply_products ORDER BY name");
+  const { rows } = await db.query("SELECT id, name, key, unit, category, aliases, pack_size, sell_price, hsn, segment FROM supply_products ORDER BY name");
   return rows;
 }
 
@@ -138,9 +139,9 @@ async function products() {
 async function createProduct(name, unit) {
   const key = cleanName(name);
   const { rows } = await db.query(
-    `INSERT INTO supply_products (name, key, unit) VALUES ($1, $2, $3)
+    `INSERT INTO supply_products (name, key, unit, segment) VALUES ($1, $2, $3, $4)
      ON CONFLICT (key) DO UPDATE SET key = EXCLUDED.key RETURNING id`,
-    [displayName(name), key, unit || "pcs"]
+    [displayName(name), key, unit || "pcs", segmentOfName(name)]
   );
   return rows[0].id;
 }
@@ -333,6 +334,9 @@ export async function saveOrderLines(orderId, roundId, companyId, lines) {
     );
   }
   await db.query("UPDATE supply_rounds SET updated_at = NOW() WHERE id = $1", [roundId]);
+  // The company orders from this supply (fruits / packaged) from now on.
+  const { rows: round } = await db.query("SELECT segment FROM supply_rounds WHERE id = $1", [roundId]);
+  if (round[0]) await addCompanySegment(companyId, round[0].segment);
   return created;
 }
 
@@ -358,7 +362,7 @@ export function registerDirectSupplyRoutes(app, { auth }) {
       products(),
       db.query(`SELECT r.*, COUNT(DISTINCT o.company_id)::int AS company_count, COUNT(l.id)::int AS line_count
                 FROM supply_rounds r LEFT JOIN supply_orders o ON o.round_id = r.id LEFT JOIN supply_lines l ON l.order_id = o.id
-                GROUP BY r.id ORDER BY r.delivery_date DESC, r.id DESC LIMIT 200`),
+                WHERE r.segment = $1 GROUP BY r.id ORDER BY r.delivery_date DESC, r.id DESC LIMIT 200`, [validSegment(req.query.segment)]),
       db.query("SELECT * FROM supply_vendors ORDER BY active DESC, name"),
     ]);
     const { rows: buyer } = await db.query("SELECT value FROM app_settings WHERE key = 'supply_buyer_id'").catch(() => ({ rows: [] }));
@@ -399,7 +403,8 @@ export function registerDirectSupplyRoutes(app, { auth }) {
   }));
 
   app.patch("/supply/companies/:id", auth, handle("SUPPLY COMPANY UPDATE", async (req, res) => {
-    const fields = ["name", "contact_name", "contact_phone", "location", "active", "billing_name", "address", "gstin", "payment_days", "contact_no", "state", "ship_to"].filter((key) => req.body?.[key] !== undefined);
+    const fields = ["name", "contact_name", "contact_phone", "location", "active", "billing_name", "address", "gstin", "payment_days", "contact_no", "state", "ship_to", "segments"].filter((key) => req.body?.[key] !== undefined);
+    if (fields.includes("segments")) req.body.segments = (Array.isArray(req.body.segments) ? req.body.segments : []).filter((value) => ["fruits", "packaged"].includes(value));
     if (fields.includes("payment_days")) req.body.payment_days = req.body.payment_days === "" || req.body.payment_days == null ? null : Math.max(0, Math.round(Number(req.body.payment_days)) || 0);
     if (!fields.length) return res.status(400).json({ error: "Nothing to change" });
     const { rows } = await db.query(
@@ -414,11 +419,12 @@ export function registerDirectSupplyRoutes(app, { auth }) {
   app.post("/supply/rounds", auth, handle("SUPPLY ROUND", async (req, res) => {
     const date = String(req.body?.delivery_date || "").slice(0, 10);
     if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return res.status(400).json({ error: "Choose the delivery date" });
+    const segment = validSegment(req.body?.segment);
     const { rows } = await db.query(
-      "INSERT INTO supply_rounds (delivery_date, title, created_by) VALUES ($1, $2, $3) RETURNING id",
-      [date, String(req.body?.title || "").trim().slice(0, 120) || null, userName(req.user)]
+      "INSERT INTO supply_rounds (delivery_date, title, created_by, segment) VALUES ($1, $2, $3, $4) RETURNING id",
+      [date, String(req.body?.title || "").trim().slice(0, 120) || null, userName(req.user), segment]
     );
-    await db.query("UPDATE supply_rounds SET ref = 'DS-' || LPAD(id::text, 4, '0') WHERE id = $1", [rows[0].id]);
+    await db.query(`UPDATE supply_rounds SET ref = '${segment === "packaged" ? "PS" : "DS"}-' || LPAD(id::text, 4, '0') WHERE id = $1`, [rows[0].id]);
     res.locals.activity = { section: "Direct Supply", action: `Started supply round for ${dayLabel(date)}` };
     res.status(201).json(await roundById(rows[0].id));
   }));
@@ -547,8 +553,9 @@ export function registerDirectSupplyRoutes(app, { auth }) {
 
   /* ---------- Items ---------- */
   app.patch("/supply/products/:id", auth, handle("SUPPLY PRODUCT", async (req, res) => {
-    const fields = ["name", "unit", "category", "pack_size", "sell_price", "hsn"].filter((key) => req.body?.[key] !== undefined);
+    const fields = ["name", "unit", "category", "pack_size", "sell_price", "hsn", "segment"].filter((key) => req.body?.[key] !== undefined);
     if (!fields.length) return res.status(400).json({ error: "Nothing to change" });
+    if (fields.includes("segment") && !["fruits", "packaged"].includes(req.body.segment)) return res.status(400).json({ error: "Choose Fruits or Packaged" });
     for (const key of ["pack_size", "sell_price"]) {
       if (fields.includes(key) && req.body[key] !== "" && req.body[key] !== null && !(Number(req.body[key]) >= 0)) return res.status(400).json({ error: "Enter a number" });
     }

@@ -17,6 +17,7 @@
 import axios from "axios";
 import { readOrder, saveOrderLines } from "./directSupply.js";
 import { parseOrderMessage, displayName } from "./supplyParse.js";
+import { splitBySegment, SEGMENT_LABEL } from "./supplySegments.js";
 import { sendWhatsApp } from "./whatsapp.js";
 import { noteInbound } from "./whatsappOutbox.js";
 import { storeIncomingMedia } from "./ticketChat.js";
@@ -46,33 +47,52 @@ async function companyFor(phone) {
 
 const employeeFor = (phone) => (global.internalUsers || []).find((user) => user.phone && last10(user.phone) === last10(phone)) || null;
 
-/* The delivery date for an order: the one in the message (unless already delivered); else, for a
-   correction sent soon after (within 12 hours of this company's last WhatsApp order), that same
-   date unless it's delivered (the buyer gets the updated list);
-   else the next date still collecting; else tomorrow. */
-async function roundFor(date, title, by, companyId = null) {
-  if (!date && companyId) {
+/* The delivery date for an order: the one in the message; else, for a correction sent soon
+   after (within 12 hours of this company's last WhatsApp order), that same date unless it's
+   delivered (the buyer gets the updated list); else the next date still collecting; else tomorrow.
+   Fruits and packaged items of one message go to the same date, each to its own supply. */
+async function dayFor(date, companyId = null) {
+  if (date) return date;
+  if (companyId) {
     const { rows } = await db.query(
-      `SELECT r.* FROM supply_orders o JOIN supply_rounds r ON r.id = o.round_id
+      `SELECT r.delivery_date FROM supply_orders o JOIN supply_rounds r ON r.id = o.round_id
        WHERE o.company_id = $1 AND o.source = 'whatsapp' AND o.created_at > NOW() - INTERVAL '12 hours'
          AND r.status <> 'Delivered' AND r.delivery_date >= $2 ORDER BY o.created_at DESC LIMIT 1`,
       [companyId, istDay()]
     );
-    if (rows[0]) return rows[0];
+    if (rows[0]) return plainDate(rows[0].delivery_date);
   }
-  if (date) {
-    // A date already delivered isn't reopened: a new delivery is started for it instead.
-    const { rows } = await db.query("SELECT * FROM supply_rounds WHERE delivery_date = $1 AND status <> 'Delivered' ORDER BY (status = 'Collecting') DESC, id DESC LIMIT 1", [date]);
-    if (rows[0]) return rows[0];
-  } else {
-    const { rows } = await db.query("SELECT * FROM supply_rounds WHERE status = 'Collecting' AND delivery_date >= $1 ORDER BY delivery_date, id LIMIT 1", [istDay()]);
-    if (rows[0]) return rows[0];
-  }
-  const day = date || istDay(1);
-  const { rows } = await db.query("INSERT INTO supply_rounds (delivery_date, title, created_by) VALUES ($1, $2, $3) RETURNING *", [day, title || null, `${by} (WhatsApp)`]);
-  const { rows: named } = await db.query("UPDATE supply_rounds SET ref = 'DS-' || LPAD(id::text, 4, '0') WHERE id = $1 RETURNING *", [rows[0].id]);
+  const { rows } = await db.query("SELECT delivery_date FROM supply_rounds WHERE status = 'Collecting' AND delivery_date >= $1 ORDER BY delivery_date, id LIMIT 1", [istDay()]);
+  return rows[0] ? plainDate(rows[0].delivery_date) : istDay(1);
+}
+
+// That supply's delivery for the date (a delivered one isn't reopened: a new one is started).
+async function roundOf(day, segment, title, by) {
+  const { rows } = await db.query(
+    "SELECT * FROM supply_rounds WHERE delivery_date = $1 AND segment = $2 AND status <> 'Delivered' ORDER BY (status = 'Collecting') DESC, id DESC LIMIT 1",
+    [day, segment]
+  );
+  if (rows[0]) return rows[0];
+  const { rows: created } = await db.query("INSERT INTO supply_rounds (delivery_date, title, created_by, segment) VALUES ($1, $2, $3, $4) RETURNING *", [day, title || null, `${by} (WhatsApp)`, segment]);
+  const { rows: named } = await db.query(`UPDATE supply_rounds SET ref = '${segment === "packaged" ? "PS" : "DS"}-' || LPAD(id::text, 4, '0') WHERE id = $1 RETURNING *`, [created[0].id]);
   return named[0];
 }
+
+// Saves a company's lines for a day: each supply's part to that supply's delivery.
+async function savePerSupply({ day, title, company, lines, rawText, from, sender, by }) {
+  const parts = await splitBySegment(lines);
+  const saved = [];
+  for (const [segment, part] of Object.entries(parts)) {
+    const round = await roundOf(day, segment, title, by);
+    const result = await saveOrder({ round, company, lines: part, rawText, from, sender });
+    saved.push({ segment, round, lines: part, updated: result.updated });
+  }
+  return saved;
+}
+// "• Apple: 6 kg" lines, under 🍎 Fruits / 📦 Packaged headings when there are both.
+const sectioned = (saved) => (!saved.length ? "" : saved.length > 1
+  ? saved.map((part) => `*${SEGMENT_LABEL[part.segment]}*\n${listOf(part.lines)}`).join("\n\n")
+  : listOf(saved[0].lines));
 
 async function companyByName(name) {
   const key = (text) => String(text || "").toLowerCase().replace(/[^a-z0-9]/g, "");
@@ -114,16 +134,18 @@ export async function handleSupplyWhatsApp(msg) {
     const groups = message.groups.filter((group) => group.heading && group.lines.length);
     if (!groups.length) return false;
     await noteInbound(msg.from);
-    const round = await roundFor(message.date, message.title, employee.name);
+    const date = await dayFor(message.date);
     const summary = [];
+    const refs = new Set();
+    let lastRound = null;
     for (const group of groups) {
       const target = await companyByName(group.heading);
-      const result = await saveOrder({ round, company: target, lines: group.lines, rawText: text, from: msg.from, sender: employee.name });
-      summary.push(`*${target.name}*${result.updated ? " (updated)" : ""}\n${listOf(group.lines)}`);
+      const saved = await savePerSupply({ day: date, title: message.title, company: target, lines: group.lines, rawText: text, from: msg.from, sender: employee.name, by: employee.name });
+      for (const part of saved) { refs.add(part.round.ref); lastRound = part.round; }
+      summary.push(`*${target.name}*${saved.some((part) => part.updated) ? " (updated)" : ""}\n${sectioned(saved)}`);
     }
-    const date = plainDate(round.delivery_date);
-    await sendWhatsApp(msg.from, `✅ Added to ${round.ref} · delivery ${dayLabel(date)}:\n\n${summary.join("\n\n")}`.slice(0, 4000));
-    finish(`${groups.length} companies' orders`, round, date, employee.name);
+    await sendWhatsApp(msg.from, `✅ Added to ${[...refs].join(" & ")} · delivery ${dayLabel(date)}:\n\n${summary.join("\n\n")}`.slice(0, 4000));
+    finish(`${groups.length} companies' orders`, lastRound, date, employee.name);
     return true;
   }
 
@@ -155,14 +177,15 @@ export async function handleSupplyWhatsApp(msg) {
     await sendWhatsApp(msg.from, reply);
     return true;
   }
-  const round = await roundFor(message.date, message.title, company.name, company.id);
-  const result = await saveOrder({ round, company, lines, rawText: fileName ? `📄 ${fileName}` : text, from: msg.from, sender });
-  const date = plainDate(round.delivery_date);
+  const date = await dayFor(message.date, company.id);
+  const saved = await savePerSupply({ day: date, title: message.title, company, lines, rawText: fileName ? `📄 ${fileName}` : text, from: msg.from, sender, by: company.name });
+  const result = { updated: saved.some((part) => part.updated) };
+  const round = saved[0].round;
   const problems = lines.filter((line) => !(line.qty > 0)).map((line) => line.name);
   await sendWhatsApp(msg.from, [
     `✅ ${result.updated ? "Order updated" : "Order received"} for *${company.name}* · delivery *${dayLabel(date)}*:`,
     "",
-    listOf(lines.filter((line) => line.qty > 0)),
+    sectioned(saved.map((part) => ({ ...part, lines: part.lines.filter((line) => line.qty > 0) })).filter((part) => part.lines.length)) || "",
     problems.length ? `\n⚠️ No quantity for: ${problems.join(", ")}. Please send the full list again with quantities.` : "",
     "",
     "To change it, just send the full list again. Thank you!",
@@ -174,6 +197,6 @@ export async function handleSupplyWhatsApp(msg) {
 // The buyer gets the combined list (and later changes) from supplyBuyer.js, not each order.
 function finish(what, round, date, sender, updated = false) {
   onChange();
-  sendPushToUsers(db, ["admin"], { title: `${updated ? "Order updated" : "New order"} on WhatsApp`, body: `${what} for ${round.ref} (${date}) from ${sender}`.slice(0, 180), view: "supply" }).catch(() => {});
+  sendPushToUsers(db, ["admin"], { title: `${updated ? "Order updated" : "New order"} on WhatsApp`, body: `${what} for ${round?.ref || ""} (${date}) from ${sender}`.slice(0, 180), view: round?.segment === "packaged" ? "packaged-supply" : "supply" }).catch(() => {});
   console.log(`🛒 WhatsApp supply order: ${what} → ${round.ref} (${date})`);
 }

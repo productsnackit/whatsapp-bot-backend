@@ -11,6 +11,7 @@
 import crypto from "crypto";
 import { saveOrderLines } from "./directSupply.js";
 import { displayName } from "./supplyParse.js";
+import { splitBySegment } from "./supplySegments.js";
 import { sendPushToUsers } from "./pushNotifications.js";
 
 let db = null;
@@ -38,12 +39,21 @@ async function companyByToken(token) {
 }
 
 // Delivery dates still taking orders: collecting, and today or later (India time).
+// One entry per date, even when fruits and packaged each have a delivery that day (round_ids).
 async function openRounds() {
   const { rows } = await db.query(
-    "SELECT id, ref, delivery_date, title FROM supply_rounds WHERE status = 'Collecting' AND delivery_date >= $1::date ORDER BY delivery_date, id",
+    "SELECT id, ref, delivery_date, title, segment FROM supply_rounds WHERE status = 'Collecting' AND delivery_date >= $1::date ORDER BY delivery_date, id",
     [todayIst()]
   );
-  return rows.map((round) => ({ ...round, delivery_date: plainDate(round.delivery_date) }));
+  const byDate = new Map();
+  for (const round of rows) {
+    const date = plainDate(round.delivery_date);
+    const entry = byDate.get(date) || { id: round.id, ref: round.ref, delivery_date: date, title: round.title, round_ids: [] };
+    entry.round_ids.push(round.id);
+    entry.segments = { ...(entry.segments || {}), [round.segment]: round.id };
+    byDate.set(date, entry);
+  }
+  return [...byDate.values()];
 }
 
 // A few submissions per link per hour is plenty; this stops a leaked link being hammered.
@@ -105,8 +115,18 @@ export function registerSupplyOrderLinkRoutes(app, { auth }) {
       `SELECT o.round_id, o.note, o.submitted_by, o.created_at, json_agg(json_build_object('product_id', l.product_id, 'name', l.raw_name, 'qty', l.qty, 'unit', l.unit) ORDER BY l.id) AS lines
        FROM supply_orders o JOIN supply_lines l ON l.order_id = o.id
        WHERE o.company_id = $1 AND o.source = 'link' AND o.round_id = ANY($2) GROUP BY o.id`,
-      [company.id, rounds.map((round) => round.id)]
+      [company.id, rounds.flatMap((round) => round.round_ids)]
     );
+    // Fruits and packaged orders for one date are shown together under that date.
+    const dateOf = new Map(rounds.flatMap((round) => round.round_ids.map((id) => [id, round.id])));
+    for (const order of mine) order.round_id = dateOf.get(order.round_id) || order.round_id;
+    const merged = new Map();
+    for (const order of mine) {
+      const entry = merged.get(order.round_id);
+      if (entry) entry.lines = [...entry.lines, ...order.lines];
+      else merged.set(order.round_id, { ...order });
+    }
+    mine.splice(0, mine.length, ...merged.values());
     const { rows: seller } = await db.query("SELECT value FROM app_settings WHERE key = 'supply_seller'").catch(() => ({ rows: [] }));
     let sellerName = "Snackit";
     try { sellerName = JSON.parse(seller[0]?.value || "{}").name || "Snackit"; } catch { /* default name */ }
@@ -141,13 +161,22 @@ export function registerSupplyOrderLinkRoutes(app, { auth }) {
     if (!lines.length) return res.status(400).json({ error: "Add a quantity for at least one item." });
     const submittedBy = String(req.body?.name || "").trim().slice(0, 80) || null;
     const note = String(req.body?.note || "").trim().slice(0, 500) || null;
-    // A new submission for the same date replaces their earlier link order.
-    const { rows: previous } = await db.query("DELETE FROM supply_orders WHERE company_id = $1 AND round_id = $2 AND source = 'link' RETURNING id", [company.id, round.id]);
-    const { rows: order } = await db.query(
-      "INSERT INTO supply_orders (round_id, company_id, source, raw_text, submitted_by, note, created_by) VALUES ($1, $2, 'link', $3, $4, $5, $6) RETURNING id",
-      [round.id, company.id, note, submittedBy, note, `${submittedBy || company.name} (order link)`]
-    );
-    await saveOrderLines(order[0].id, round.id, company.id, lines);
+    // A new submission for the same date replaces their earlier link order (both supplies).
+    const { rows: previous } = await db.query("DELETE FROM supply_orders WHERE company_id = $1 AND round_id = ANY($2) AND source = 'link' RETURNING id", [company.id, round.round_ids]);
+    // Fruits and packaged items each go to that supply's delivery for the date.
+    for (const [segment, part] of Object.entries(await splitBySegment(lines))) {
+      let roundId = round.segments?.[segment];
+      if (!roundId) {
+        const { rows: created } = await db.query("INSERT INTO supply_rounds (delivery_date, title, created_by, segment) VALUES ($1, $2, $3, $4) RETURNING id", [round.delivery_date, round.title, `${company.name} (order link)`, segment]);
+        roundId = created[0].id;
+        await db.query(`UPDATE supply_rounds SET ref = '${segment === "packaged" ? "PS" : "DS"}-' || LPAD(id::text, 4, '0') WHERE id = $1`, [roundId]);
+      }
+      const { rows: order } = await db.query(
+        "INSERT INTO supply_orders (round_id, company_id, source, raw_text, submitted_by, note, created_by) VALUES ($1, $2, 'link', $3, $4, $5, $6) RETURNING id",
+        [roundId, company.id, note, submittedBy, note, `${submittedBy || company.name} (order link)`]
+      );
+      await saveOrderLines(order[0].id, roundId, company.id, part);
+    }
     onChange();
     sendPushToUsers(db, ["admin"], {
       title: `${previous.length ? "Order updated" : "New order"} · ${company.name}`,
