@@ -16,6 +16,7 @@ import axios from "axios";
 import sharp from "sharp";
 import PDFDocument from "pdfkit";
 import { companyLines } from "./supplyBilling.js";
+import { cleanName, likeness } from "./supplyParse.js";
 import { storeDashboardFile, sendStoredFile } from "./ticketChat.js";
 import { sendWhatsApp } from "./whatsapp.js";
 import { refillerWindowOpen } from "./whatsappOutbox.js";
@@ -60,6 +61,7 @@ export async function ensureSupplyChallan(database, { getBuyer, onChanged } = {}
     );
   `);
   await saveKnownLocations().catch((err) => console.log("SUPPLY LOCATIONS ERROR:", err.message));
+  await fillKnownHsn().catch((err) => console.log("SUPPLY HSN ERROR:", err.message));
 }
 
 /* Locations from Snackit's earlier DCs (Oct 2026), saved once: a new location is added; an
@@ -91,6 +93,56 @@ async function saveKnownLocations() {
   }
   await db.query("INSERT INTO app_settings (key, value, updated_at) VALUES ('supply_locations_v1', 'done', NOW()) ON CONFLICT (key) DO NOTHING");
   console.log("📍 Direct Supply: saved the locations from the earlier DCs");
+}
+
+/* HSN codes from Snackit's earlier DCs. An item gets one when its name clearly matches
+   (same sizes, nearly the same words): filled into Setup → Items once, and used on a DC for
+   any item whose HSN is still empty (so items ordered for the first time later get it too). */
+const KNOWN_HSN = [
+  ["PAPER BOAT MIXED FRUIT (160ML)", "22029920"], ["PAPER BOAT ORANGE (160ML)", "22029920"], ["PAPER BOAT APPLE (160ML)", "22029920"],
+  ["FITSUPPORT Hydration Drink ZERO SUGAR (250ML)", "22021090"], ["DIET COKE CAN (330ML)", "220210"],
+  ["RED BULL ENERGY DRINK (250ML)", "22029990"], ["RED BULL SUGAR FREE (250ML)", "22029990"],
+  ["Nutraj snackrite Crispy nut mix 25gm", "20081920"], ["Nutraj Snackrite Seeds & Berry Mix (25gm)", "20081920"],
+  ["yoga bar muesli dark chocolate cranberry", "19041090"], ["Yoga Bar Multigrain Energy Bar Nuts and Seeds (MRP-50)", "21069099"],
+  ["YOGA BAR PROTEIN MINI'S COFFEE CRUCH (MRP-20)", "21069099"],
+  ["LAYS SPANISH TOMATO (31.2GM)", "21069099"], ["LAYS WEST INDIES HOT N SWEET CHILLI (27.5GM)", "21069099"],
+  ["LAYS INDIA'S MAGIC MASALA (27.5GM)", "21069099"], ["LAYS CLASSIC SALT(27.5GM)", "21069099"], ["LAYS CREAM & ONION (27.5GM)", "21069099"],
+  ["TOWN BUS MADRAS MIXTURE (45G)", "21069099"], ["Bingo Mad Angles 32g", "21069099"],
+  ["RAW COCONUT WATER ALOE LEMON (200ML)", "22029920"],
+  ["LIMCA PET BOTTLE (250ML)", "22021010"], ["SPRITE PET BOTTLE (250ML)", "22021010"], ["THUMSUP PET BOTTLE (250ML)", "22021010"],
+  ["OREO ORIGINIAL(41.75GM)", "19053100"], ["BRITANNIA GOOD DAY PISTA AND BADAM(52.5GM)", "19053100"],
+  ["BRITANNIA GOOD DAY CASHEW COOKIES(60.1GM)", "19053100"], ["BRITANNIA 50-50 MASKA CHASKA(42.7GM)", "19053100"], ["Britannia little hearts", "19053100"],
+  ["PARLE MARIE(MRP-10)", "19059020"], ["PARLE MONACO CLASSIC-(52.2gms)", "19059020"], ["Parle G gold (68.75g)", "19059020"],
+  ["AKSHAYAKALPA SPICED BUTTERMILK (200ml)", "04039090"], ["AKSHAYAKALPA PLAIN BUTTERMILK (200ML)", "04039090"],
+  ["NESCAFE CHOCO MOCHA(180ML)", "22029930"], ["EPIGAMIA TURBO CHOCOLATE PROTEIN MILKSHAKE (250ML)", "22029930"],
+  ["EPIGAMIA TURBO VANILLA CARAMEL PROTEIN MILKSHAKE (250ML)", "22029930"],
+  ["MINUTE MAID PULPY ORANGE(250ML)", "22029020"], ["CAVIN'S BADAM FLAVOURED MILK (170ML)", "04029990"],
+  ["Alo Mixed fruit (300ml)", "20098990"], ["Horlicks 500gm", "19019090"], ["RED LABEL NATURAL CARE(1KG)", "09023030"],
+].map(([name, hsn]) => ({ key: cleanName(name), hsn }));
+
+export function knownHsn(...names) {
+  let best = null;
+  for (const name of names.filter(Boolean)) {
+    const key = cleanName(name);
+    for (const known of KNOWN_HSN) {
+      const score = likeness(key, known.key);
+      if (score >= 0.9 && (!best || score > best.score)) best = { hsn: known.hsn, score };
+    }
+  }
+  return best?.hsn || "";
+}
+
+async function fillKnownHsn() {
+  const { rows: done } = await db.query("SELECT 1 FROM app_settings WHERE key = 'supply_hsn_v1'");
+  if (done.length) return;
+  const { rows } = await db.query("SELECT id, name, key, aliases FROM supply_products WHERE hsn IS NULL OR hsn = ''");
+  let filled = 0;
+  for (const product of rows) {
+    const hsn = knownHsn(product.name, product.key, ...(product.aliases || []));
+    if (hsn) { await db.query("UPDATE supply_products SET hsn = $2 WHERE id = $1", [product.id, hsn]); filled += 1; }
+  }
+  await db.query("INSERT INTO app_settings (key, value, updated_at) VALUES ('supply_hsn_v1', $1, NOW()) ON CONFLICT (key) DO NOTHING", [String(filled)]);
+  console.log(`🏷️ Direct Supply: filled HSN for ${filled} item(s) from the earlier DCs`);
 }
 
 async function seller() {
@@ -139,7 +191,7 @@ async function challanData(round, companyId) {
     company,
     lines: lines.map((line) => ({
       name: line.name,
-      hsn: products.find((product) => product.id === line.product_id)?.hsn || "",
+      hsn: products.find((product) => product.id === line.product_id)?.hsn || knownHsn(line.name),
       exp: dates.find((row) => row.product_id === line.product_id)?.exp_date || "",
       mfg: dates.find((row) => row.product_id === line.product_id)?.mfg_date || "",
       qty: Number(qtyText(line.delivered)),
