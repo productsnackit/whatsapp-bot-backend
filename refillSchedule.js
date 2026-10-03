@@ -1149,7 +1149,8 @@ export function registerRefillRoutes(app, { auth }) {
 
   /* One message to many refillers. Within WhatsApp's 24 hours it goes as typed; otherwise as the
      approved template REFILL_MESSAGE_TEMPLATE (default "refiller_message", body "Hi {{1}}, a message
-     from Snackit: {{2}}"; template text can't hold line breaks, so they become " · "). */
+     from Snackit:\n\n{{2}}\n\nThank you." (Meta allows no variable at the start or end); a variable
+     can't hold line breaks, so they become " · "). */
   app.get("/refills/broadcasts", auth, guard, handle("REFILL BROADCASTS", async (req, res) => {
     const { rows } = await db.query("SELECT * FROM refill_broadcasts ORDER BY created_at DESC LIMIT 20");
     res.json({ broadcasts: rows, template: process.env.REFILL_MESSAGE_TEMPLATE || "refiller_message" });
