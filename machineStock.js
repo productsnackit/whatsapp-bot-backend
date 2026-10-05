@@ -4,12 +4,14 @@
       • sales come from the Wendor transactions report the office uploads each day (only
         completed vends count; failed / started / not started don't). Uploading a report again,
         or one that overlaps another, replaces those days, so nothing is counted twice;
-      • refills come from the Refill Schedule: a refill photo the refiller already sends
-        (not rejected) means the machine was filled back up at that time;
+      • every machine is refilled at a fixed time: the office sets its refill days and time once
+        (e.g. Mon–Sat 9:00 am), and the machine counts as filled back up at each of those times.
+        Refillers are not involved. A refill that didn't happen can be skipped for that day,
+        and an extra one marked by hand;
       • each slot's size (how many fit) is set once by the office; until then it is estimated
         from the most ever sold from that slot between two refills (marked "estimated");
       • the office can also type an actual count for a slot (a spot check) or mark a machine as
-        refilled by hand (e.g. a refill with no photo); the latest of these wins.
+        refilled by hand; the latest of these wins.
     Stock in a slot = (slot size at its last refill, or the last counted number) − completed
     vends from that slot since then. Products in a slot change often, so the product shown for a
     slot is the last one sold from it (an estimate). Each Wendor machine is linked to its Refill
@@ -18,7 +20,6 @@
 ========================================================= */
 import XLSX from "xlsx";
 import { hasPage } from "./accessControl.js";
-import { matchSite } from "./siteMatcher.js";
 
 let db = null;
 const pad = (n) => String(n).padStart(2, "0");
@@ -39,6 +40,9 @@ export async function ensureMachineStock(database) {
       id SERIAL PRIMARY KEY, wendor_id TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
       location_id INTEGER, linked_by TEXT, active BOOLEAN NOT NULL DEFAULT TRUE, created_at TIMESTAMPTZ DEFAULT NOW()
     );
+    ALTER TABLE stock_machines
+      ADD COLUMN IF NOT EXISTS refill_days SMALLINT[],
+      ADD COLUMN IF NOT EXISTS refill_time TEXT;
     CREATE TABLE IF NOT EXISTS stock_slots (
       machine_id INTEGER NOT NULL REFERENCES stock_machines(id) ON DELETE CASCADE,
       position TEXT NOT NULL, capacity INTEGER, capacity_by TEXT,
@@ -125,11 +129,6 @@ export async function importReport({ base64, fileName, by }) {
       [wendorId, name]
     );
     ids.set(wendorId, saved[0].id);
-    // Linked to its Refill Schedule location by name, unless someone set it by hand.
-    if (!saved[0].location_id) {
-      const site = await matchSite(name).catch(() => null);
-      if (site?.site_id) await db.query("UPDATE stock_machines SET location_id = $2, linked_by = 'auto' WHERE id = $1 AND location_id IS NULL", [saved[0].id, site.site_id]);
-    }
   }
   const dayList = [...days].sort();
   // These days in this report replace whatever was uploaded for them before (for these machines).
@@ -161,26 +160,54 @@ async function loadMachines(machineId = null) {
     machineId ? [machineId] : []
   );
   const ids = machines.map((machine) => machine.id);
-  const [slots, sales, marks, refills] = await Promise.all([
+  const [slots, sales, marks] = await Promise.all([
     db.query("SELECT * FROM stock_slots WHERE machine_id = ANY($1)", [ids]),
     db.query("SELECT day::text AS day, bucket, machine_id, position, product, qty, amount FROM stock_sales WHERE machine_id = ANY($1) ORDER BY day, bucket", [ids]),
     db.query("SELECT * FROM stock_marks WHERE machine_id = ANY($1) ORDER BY at", [ids]),
-    db.query(
-      `SELECT location_id, completed_at, refiller_name FROM refill_tasks
-       WHERE location_id = ANY($1) AND completed_at IS NOT NULL AND status NOT IN ('rejected', 'cancelled')
-       ORDER BY completed_at`,
-      [machines.map((machine) => machine.location_id).filter(Boolean)]
-    ).catch(() => ({ rows: [] })),
   ]);
-  return { machines, slots: slots.rows, sales: sales.rows.map((sale) => ({ ...sale, day: plainDate(sale.day) })), marks: marks.rows, refills: refills.rows };
+  return { machines, slots: slots.rows, sales: sales.rows.map((sale) => ({ ...sale, day: plainDate(sale.day) })), marks: marks.rows };
+}
+
+// "09:00" on a given India day → that moment.
+const atIst = (day, time) => new Date(`${day}T${time}:00+05:30`);
+const weekdayOf = (day) => new Date(`${day}T00:00:00Z`).getUTCDay(); // 0 = Sunday
+
+/* Every fixed refill time from the first sales day (at most 120 days back) up to now, except days
+   marked as skipped. */
+function scheduledRefills(machine, skips, firstDay) {
+  const days = machine.refill_days || [];
+  if (!days.length || !/^\d{2}:\d{2}$/.test(machine.refill_time || "")) return [];
+  const skipped = new Set(skips.map((mark) => istDay(mark.at)));
+  const now = new Date();
+  const today = istDay(now);
+  let day = firstDay && firstDay > addDays(today, -120) ? addDays(firstDay, -1) : addDays(today, -120);
+  const out = [];
+  for (; day <= today; day = addDays(day, 1)) {
+    if (!days.includes(weekdayOf(day)) || skipped.has(day)) continue;
+    const at = atIst(day, machine.refill_time);
+    if (at <= now) out.push({ at, source: "schedule" });
+  }
+  return out;
+}
+
+function nextRefill(machine) {
+  const days = machine.refill_days || [];
+  if (!days.length || !/^\d{2}:\d{2}$/.test(machine.refill_time || "")) return null;
+  const now = new Date();
+  for (let offset = 0; offset <= 7; offset += 1) {
+    const day = addDays(istDay(now), offset);
+    const at = atIst(day, machine.refill_time);
+    if (days.includes(weekdayOf(day)) && at > now) return at;
+  }
+  return null;
 }
 
 function stockOf(data, machine, today = istDay()) {
   const sales = data.sales.filter((sale) => sale.machine_id === machine.id);
   const lastData = sales.length ? sales[sales.length - 1] : null;
-  // Refills of the whole machine: refill photos (Refill Schedule) and refills marked by hand.
+  // Refills of the whole machine: its fixed refill times (minus skipped days) and refills marked by hand.
   const refillTimes = [
-    ...data.refills.filter((refill) => refill.location_id && refill.location_id === machine.location_id).map((refill) => ({ at: refill.completed_at, source: "photo", by: refill.refiller_name })),
+    ...scheduledRefills(machine, data.marks.filter((mark) => mark.machine_id === machine.id && mark.kind === "skip"), sales[0]?.day),
     ...data.marks.filter((mark) => mark.machine_id === machine.id && mark.kind === "refill").map((mark) => ({ at: mark.at, source: "manual", by: mark.by })),
   ].sort((a, b) => new Date(a.at) - new Date(b.at));
   const lastRefill = refillTimes[refillTimes.length - 1] || null;
@@ -209,7 +236,7 @@ function stockOf(data, machine, today = istDay()) {
     const counts = data.marks.filter((mark) => mark.machine_id === machine.id && mark.kind === "count" && mark.position === position);
     const lastCount = counts[counts.length - 1] || null;
     let start = null;
-    if (lastRefill && (!lastCount || new Date(lastRefill.at) >= new Date(lastCount.at))) start = { at: lastRefill.at, level: capacity, from: lastRefill.source === "photo" ? "refill photo" : "refill (by hand)" };
+    if (lastRefill && (!lastCount || new Date(lastRefill.at) >= new Date(lastCount.at))) start = { at: lastRefill.at, level: capacity, from: lastRefill.source === "schedule" ? "refill time" : "refill (by hand)" };
     else if (lastCount) start = { at: lastCount.at, level: lastCount.qty, from: "count" };
     const since = start ? slotSales.filter((sale) => after(sale, bucketOf(start.at))) : [];
     const soldSince = since.reduce((sum, sale) => sum + sale.qty, 0);
@@ -242,8 +269,10 @@ function stockOf(data, machine, today = istDay()) {
   const known = slots.filter((slot) => slot.in_machine != null);
   return {
     id: machine.id, wendor_id: machine.wendor_id, name: machine.name, active: machine.active,
-    location_id: machine.location_id, location_name: machine.location_name, linked_by: machine.linked_by,
-    last_refill: lastRefill, refills: refillTimes.slice(-10).reverse(),
+    location_id: machine.location_id, location_name: machine.location_name,
+    refill_days: machine.refill_days || null, refill_time: machine.refill_time || null,
+    next_refill: nextRefill(machine), skips: data.marks.filter((mark) => mark.machine_id === machine.id && mark.kind === "skip").slice(-10).reverse().map((mark) => ({ id: mark.id, day: istDay(mark.at), by: mark.by })),
+    last_refill: lastRefill, refills: refillTimes.slice(-10).reverse(), all_refills: refillTimes,
     data_to: lastData ? lastData.day : null,
     data_until: lastData ? `${lastData.day} ${pad(Math.floor(lastData.bucket / 6))}:${pad((lastData.bucket % 6) * 10)}` : null,
     missing_days: missing,
@@ -272,7 +301,7 @@ function historyOf(data, machine, stock) {
       day,
       sold: ofDay.reduce((sum, sale) => sum + sale.qty, 0),
       value: Math.round(ofDay.reduce((sum, sale) => sum + Number(sale.amount), 0)),
-      refills: stock.refills.filter((refill) => istDay(refill.at) === day).length,
+      refills: stock.all_refills.filter((refill) => istDay(refill.at) === day).length,
       top: Object.entries(ofDay.reduce((map, sale) => ({ ...map, [sale.product]: (map[sale.product] || 0) + sale.qty }), {})).sort((a, b) => b[1] - a[1]).slice(0, 3),
     };
   }).reverse();
@@ -299,7 +328,7 @@ export function registerMachineStockRoutes(app, { auth }) {
     // Everything running out, across machines (most urgent first).
     const alerts = machines.filter((machine) => machine.active).flatMap((machine) => machine.slots.filter((slot) => ["empty", "low"].includes(slot.status)).map((slot) => ({ machine_id: machine.id, machine: machine.name, location: machine.location_name, ...slot })))
       .sort((a, b) => (a.in_machine - b.in_machine) || ((a.days_left ?? 99) - (b.days_left ?? 99)));
-    res.json({ machines: machines.map(({ slots, refills, ...rest }) => rest), alerts, uploads, locations, today: istDay() });
+    res.json({ machines: machines.map(({ slots, refills, all_refills, ...rest }) => rest), alerts, uploads, locations, today: istDay() });
   }));
 
   app.get("/stock/machines/:id", auth, guard, handle("STOCK MACHINE", async (req, res) => {
@@ -307,10 +336,23 @@ export function registerMachineStockRoutes(app, { auth }) {
     const machine = data.machines[0];
     if (!machine) return res.status(404).json({ error: "Machine not found" });
     const stock = stockOf(data, machine);
-    res.json({ ...stock, history: historyOf(data, machine, stock) });
+    const { all_refills, ...rest } = stock;
+    res.json({ ...rest, history: historyOf(data, machine, stock) });
   }));
 
-  // Link a machine to its Refill Schedule location (its refill photos then count as refills).
+  // The machine's fixed refill days (0 = Sunday … 6 = Saturday) and time ("09:00").
+  app.put("/stock/machines/:id/refill-time", auth, guard, handle("STOCK REFILL TIME", async (req, res) => {
+    const days = (Array.isArray(req.body?.days) ? req.body.days : []).map(Number).filter((day) => day >= 0 && day <= 6);
+    const time = String(req.body?.time || "");
+    if (!days.length) return res.status(400).json({ error: "Choose the refill days" });
+    if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(time)) return res.status(400).json({ error: "Choose the refill time" });
+    const { rowCount } = await db.query("UPDATE stock_machines SET refill_days = $2, refill_time = $3 WHERE id = $1", [req.params.id, [...new Set(days)].sort(), time]);
+    if (!rowCount) return res.status(404).json({ error: "Machine not found" });
+    res.locals.activity = { section: "Refills", action: `Set refill time for machine ${req.params.id}` };
+    res.json({ success: true });
+  }));
+
+  // Optional: which client location / site the machine is at (shown with it).
   app.patch("/stock/machines/:id", auth, guard, handle("STOCK MACHINE UPDATE", async (req, res) => {
     const fields = [];
     const values = [req.params.id];
@@ -334,10 +376,17 @@ export function registerMachineStockRoutes(app, { auth }) {
     res.json({ success: true });
   }));
 
-  // A spot check (actual number in a slot now), or a refill with no photo (whole machine full now).
+  // A spot check (actual number in a slot now), an extra refill (whole machine full now), or a skipped refill day.
   app.post("/stock/machines/:id/marks", auth, guard, handle("STOCK MARK", async (req, res) => {
-    const kind = req.body?.kind === "count" ? "count" : req.body?.kind === "refill" ? "refill" : null;
-    if (!kind) return res.status(400).json({ error: "Choose count or refill" });
+    const kind = ["count", "refill", "skip"].includes(req.body?.kind) ? req.body.kind : null;
+    if (!kind) return res.status(400).json({ error: "Choose count, refill or skip" });
+    // A fixed refill that didn't happen that day ("day": 2026-10-05).
+    if (kind === "skip") {
+      const day = String(req.body?.day || "");
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return res.status(400).json({ error: "Choose the day" });
+      await db.query("INSERT INTO stock_marks (machine_id, kind, at, by, note) VALUES ($1, 'skip', $2, $3, $4)", [req.params.id, new Date(`${day}T12:00:00+05:30`), who(req.user), String(req.body?.note || "").slice(0, 200) || null]);
+      return res.json({ success: true });
+    }
     const at = req.body?.at && !Number.isNaN(Date.parse(req.body.at)) ? new Date(req.body.at) : new Date();
     if (at > new Date(Date.now() + 5 * 60000)) return res.status(400).json({ error: "That time is in the future" });
     if (kind === "count") {
