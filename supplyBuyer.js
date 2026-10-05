@@ -30,6 +30,9 @@ import { validSegment } from "./supplySegments.js";
 export const BUYER_STEPS = ["Received", "Processing", "Ordered", "Goods received", "Sent"];
 const STEP_TEXT = { Received: "✅ List received", Processing: "⏳ Processing", Ordered: "🛒 Ordered", "Goods received": "📦 Goods received", Sent: "🚚 Sent" };
 const TEMPLATE = "supply_buyer_list";
+// The list without his page link (the link comes when he taps Ordered): "Hi, {{1}} is ready: {{2}}
+// items to buy. Please check the attached list and tap Received. Thank you." + document + "Received".
+const LIST_TEMPLATE = "supply_buyer_list_v2";
 
 let db = null;
 let onChange = () => {};
@@ -174,7 +177,13 @@ export async function sendListToBuyer(roundOrId, kind = "new") {
   } else {
     // Outside WhatsApp's 24 hours: the approved template, with the Excel file at the top.
     const params = [`${isUpdate ? "the updated" : "the"} ${kindOf(round)} stock list for ${label}`, String(rows.length), url];
-    const result = await sendWhatsAppTemplate(to, TEMPLATE, "en", params, [`SB:${round.id}:Received`], file ? { link: file.url, filename: fileName } : null);
+    const header = file ? { link: file.url, filename: fileName } : null;
+    // The new template (no link) first; until Meta approves it, the old one (with the link) still gets the list there.
+    let result = await sendWhatsAppTemplate(to, LIST_TEMPLATE, "en", params.slice(0, 2), [`SB:${round.id}:Received`], header);
+    if (!result.ok) {
+      console.log(`Template "${LIST_TEMPLATE}" didn't go (${result.error}); using "${TEMPLATE}".`);
+      result = await sendWhatsAppTemplate(to, TEMPLATE, "en", params, [`SB:${round.id}:Received`], header);
+    }
     if (!result.ok) {
       return { ok: false, error: `${contact.name || "The buyer"} hasn't messaged the Snackit number in the last 24 hours, and the "${TEMPLATE}" template didn't go (${result.error}). Ask them to send "hi" to the Snackit number, or check the template in Meta.` };
     }
