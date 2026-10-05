@@ -138,7 +138,6 @@ export async function sendListToBuyer(roundOrId, kind = "new") {
       ...changes.slice(0, 40),
       "",
       `Full list now: ${rows.length} items.`,
-      `👉 Open the list: ${url}`,
     ].join("\n");
   } else {
     const lines = rows.slice(0, 60).map((row) => {
@@ -152,7 +151,7 @@ export async function sendListToBuyer(roundOrId, kind = "new") {
       ...lines,
       rows.length > 60 ? `…and ${rows.length - 60} more in the Excel file.` : "",
       "",
-      `👉 After buying, fill how much you bought, the purchase price and the selling price here:\n${url}`,
+      "Tap Received below. The link to fill what you bought comes when you tap Ordered.",
     ].filter((line, index, all) => line !== "" || all[index - 1] !== "").join("\n");
   }
 
@@ -200,8 +199,21 @@ const nextStep = (status) => {
   return BUYER_STEPS[index + 1] || null;
 };
 
+// Items still without what was bought (quantity and price) — Goods received / Sent wait for them.
+// Items whose name is still being checked at the office can't be filled yet, so they don't count.
+async function missingEntries(round) {
+  const sheet = await masterOf(round.id);
+  const { rows: bought } = await db.query("SELECT DISTINCT product_id, unit FROM supply_purchases WHERE round_id = $1 AND qty > 0", [round.id]);
+  const have = new Set(bought.map((row) => `${row.product_id}|${row.unit}`));
+  return sheet.master.filter((row) => row.total > 0 && row.product_id && !have.has(`${row.product_id}|${row.unit}`)).map((row) => row.name);
+}
+
 async function setStep(round, step, by) {
   if (!BUYER_STEPS.includes(step)) return null;
+  if (["Goods received", "Sent"].includes(step)) {
+    const missing = await missingEntries(round);
+    if (missing.length) return { blocked: true, missing };
+  }
   const bought = ["Goods received", "Sent"].includes(step);
   const { rows } = await db.query(
     `UPDATE supply_rounds SET buyer_status = $2, buyer_steps = buyer_steps || jsonb_build_object($2::text, NOW()),
@@ -300,7 +312,8 @@ export async function handleSupplyBuyerWhatsApp(msg) {
       const round = { ...raw, delivery_date: plainDate(raw.delivery_date) };
       const { url } = await linkFor(round);
       const next = nextStep(round.buyer_status);
-      const body = `🛒 ${kindOf(round, true)} stock list for ${dayLabel(round.delivery_date)} (${round.ref})${round.buyer_status ? ` · now: ${round.buyer_status}` : ""}\n${url}`;
+      const linkShown = ["Ordered", "Goods received"].includes(round.buyer_status);
+      const body = `🛒 ${kindOf(round, true)} stock list for ${dayLabel(round.delivery_date)} (${round.ref})${round.buyer_status ? ` · now: ${round.buyer_status}` : ""}${linkShown ? `\nFill what you bought: ${url}` : ""}`;
       if (next) await sendWhatsAppButtons(msg.from, body, [{ id: `SB:${round.id}:${next}`, title: next }]);
       else await sendWhatsApp(msg.from, body);
     }
@@ -313,11 +326,22 @@ export async function handleSupplyBuyerWhatsApp(msg) {
   }
   const updated = await setStep(round, tapped[2], contact.name);
   if (!updated) return false;
+  const { url } = await linkFor(round);
+  // Goods received / Sent only after he has filled what he bought for every item.
+  if (updated.blocked) {
+    await sendWhatsAppButtons(
+      msg.from,
+      `Please fill what you bought first (quantity, purchase price, selling price) for: ${updated.missing.slice(0, 15).join(", ")}${updated.missing.length > 15 ? ` and ${updated.missing.length - 15} more` : ""}.\n\n${url}\n\nThen tap the button again.`,
+      [{ id: `SB:${round.id}:${tapped[2]}`, title: tapped[2] }]
+    );
+    return true;
+  }
   const next = nextStep(updated.buyer_status);
   const text = `${STEP_TEXT[updated.buyer_status]} · ${round.ref} (${dayLabel(round.delivery_date)})`;
-  // The link to his page is only in the list message itself, not in every step reply.
+  // His page's link comes once he has ordered (to fill what he bought), not before.
   if (next) {
-    await sendWhatsAppButtons(msg.from, `${text}\n\nTap the next step when it's done.`, [{ id: `SB:${round.id}:${next}`, title: next }]);
+    const withLink = updated.buyer_status === "Ordered" ? `\n\nAfter buying, fill how much you bought, the purchase price and the selling price here:\n${url}` : "";
+    await sendWhatsAppButtons(msg.from, `${text}${withLink}\n\nTap the next step when it's done.`, [{ id: `SB:${round.id}:${next}`, title: next }]);
   } else {
     await sendWhatsApp(msg.from, `${text}. Thank you! 🙏`);
   }
@@ -490,7 +514,9 @@ export function registerSupplyBuyerRoutes(app, { auth }) {
     if (!round) return res.status(404).json({ error: "This link isn't valid any more." });
     if (tooMany(req.params.token)) return res.status(429).json({ error: "Too many changes. Try again in a while." });
     const contact = await buyerContact();
-    if (!(await setStep(round, String(req.body?.step || ""), contact.name))) return res.status(400).json({ error: "Unknown step" });
+    const result = await setStep(round, String(req.body?.step || ""), contact.name);
+    if (!result) return res.status(400).json({ error: "Unknown step" });
+    if (result.blocked) return res.status(400).json({ error: `Fill what you bought first for: ${result.missing.join(", ")}` });
     res.json(await pageData(await roundByToken(req.params.token)));
   }));
 
