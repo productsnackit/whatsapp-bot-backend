@@ -15,10 +15,9 @@ export const PAGES = {
   // "operations" (inventory, clients, brands, demand, imports) is hidden on the dashboard; add it back here to offer it again.
   audit: "Refill Audit",
   findings: "Internal Audit",
-  expiry: "Expiry Tracking",
   refills: "Refill Schedule",
-  supply: "Direct Supply",
-  analytics: "Analytics",
+  supply: "Direct & Packaged Supply",
+  analytics: "Refund Analytics",
   activity: "Activity log",
   settings: "Bot settings",
 };
@@ -28,10 +27,10 @@ export const ROLE_PRESETS = {
   // A director has everything an admin has (all pages, settings, employees); only the label differs.
   director: { label: "Director", pages: ALL_PAGES, readOnly: false },
   admin: { label: "Admin", pages: ALL_PAGES, readOnly: false },
-  support: { label: "Support agent", pages: ["tickets", "feedback", "products", "findings", "expiry"], readOnly: false },
-  quality: { label: "Quality auditor", pages: ["audit", "refills", "findings", "expiry"], readOnly: false },
-  operations: { label: "Operations", pages: ["audit", "refills", "supply", "findings", "expiry"], readOnly: false },
-  staff: { label: "Staff", pages: ["findings", "expiry"], readOnly: false },
+  support: { label: "Support agent", pages: ["tickets", "feedback", "products", "findings"], readOnly: false },
+  quality: { label: "Quality auditor", pages: ["audit", "refills", "findings"], readOnly: false },
+  operations: { label: "Operations", pages: ["audit", "refills", "supply", "findings"], readOnly: false },
+  staff: { label: "Staff", pages: ["findings"], readOnly: false },
   viewer: { label: "Viewer (read only)", pages: ALL_PAGES.filter((page) => !["settings", "activity"].includes(page)), readOnly: true },
 };
 

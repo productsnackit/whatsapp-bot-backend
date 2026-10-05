@@ -108,7 +108,7 @@ export async function taskReminderTick() {
         const due = new Date(message.dueAt).getTime();
         const text = String(message.text || "Task").slice(0, 120);
         const assigneeKeys = message.mentions.map(String);
-        const payload = { chatId: String(chat.id), department: chat.department, view: "tasks" };
+        const payload = { chatId: String(chat.id), department: chat.department, view: "internal-chat" };
 
         if (due > now && due - now <= DUE_SOON_MS && !message.dueSoonNotifiedAt) {
           deps.sendPush(pushKeysFor(assigneeKeys), { ...payload, title: `⏰ Task due at ${whenLabel(message.dueAt)}`, body: text });
@@ -189,7 +189,7 @@ export function registerTaskRoutes(app, { auth, getUserKey, canSeeChat, emitChat
       res.locals.activity = { section: "Internal Chat", action: `Marked task "${String(message.text || "").slice(0, 60)}" as ${req.body.status.replace("-", " ")}` };
       if (req.body.status === "resolved") {
         const creator = senderKeyOf(message);
-        if (creator && creator !== me) sendPush(pushKeysFor([creator]), { chatId: String(chat.id), department: chat.department, view: "tasks", title: `✅ ${myName} resolved your task`, body: String(message.text || "").slice(0, 150) });
+        if (creator && creator !== me) sendPush(pushKeysFor([creator]), { chatId: String(chat.id), department: chat.department, view: "internal-chat", title: `✅ ${myName} resolved your task`, body: String(message.text || "").slice(0, 150) });
       }
     }
     emitChat(chat, "internal-chat-updated", { chat });
