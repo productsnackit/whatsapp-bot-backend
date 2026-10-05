@@ -83,6 +83,9 @@ export async function ensureDirectSupply(database) {
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
     CREATE INDEX IF NOT EXISTS supply_lines_round_idx ON supply_lines (round_id);
+    ALTER TABLE supply_rounds
+      ADD COLUMN IF NOT EXISTS closed_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS closed_by TEXT;
     ALTER TABLE supply_products
       ADD COLUMN IF NOT EXISTS pack_size NUMERIC,
       ADD COLUMN IF NOT EXISTS sell_price NUMERIC;
@@ -445,6 +448,22 @@ export function registerDirectSupplyRoutes(app, { auth }) {
     const { rows } = await db.query("DELETE FROM supply_rounds WHERE id = $1 RETURNING ref", [req.params.id]);
     if (!rows.length) return res.status(404).json({ error: "Not found" });
     res.locals.activity = { section: "Direct Supply", action: `Deleted supply round ${rows[0].ref}` };
+    res.json({ success: true });
+  }));
+
+  /* Admins close a delivery date fully: no new orders land on it (WhatsApp, order links), the
+     buyer is no longer sent or reminded about it, and it shows as Closed. It can be opened again. */
+  app.post("/supply/rounds/:id/close", auth, handle("SUPPLY ROUND CLOSE", async (req, res) => {
+    if (!req.user?.isAdmin) return res.status(403).json({ error: "Only an admin can close a delivery date" });
+    const reopen = req.body?.reopen === true;
+    const { rows } = await db.query(
+      reopen
+        ? "UPDATE supply_rounds SET status = CASE WHEN sent_at IS NULL THEN 'Collecting' ELSE 'Sent to buyer' END, closed_at = NULL, closed_by = NULL, updated_at = NOW() WHERE id = $1 RETURNING ref"
+        : "UPDATE supply_rounds SET status = 'Closed', closed_at = NOW(), closed_by = $2, updated_at = NOW() WHERE id = $1 RETURNING ref",
+      reopen ? [req.params.id] : [req.params.id, userName(req.user)]
+    );
+    if (!rows.length) return res.status(404).json({ error: "Not found" });
+    res.locals.activity = { section: "Direct Supply", action: `${reopen ? "Reopened" : "Closed"} ${rows[0].ref}` };
     res.json({ success: true });
   }));
 

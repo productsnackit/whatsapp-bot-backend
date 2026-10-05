@@ -310,7 +310,7 @@ export async function handleSupplyBuyerWhatsApp(msg) {
     if (parseOrderMessage(text).groups.some((group) => group.heading && group.lines.length)) return false;
     const { rows } = await db.query(
       `SELECT * FROM supply_rounds WHERE sent_at IS NOT NULL AND delivery_date >= $1::date
-       AND status <> 'Delivered' AND COALESCE(buyer_status, '') <> 'Sent' ORDER BY delivery_date, id LIMIT 3`,
+       AND status NOT IN ('Delivered', 'Closed') AND COALESCE(buyer_status, '') <> 'Sent' ORDER BY delivery_date, id LIMIT 3`,
       [istNow().slice(0, 10)]
     );
     if (!rows.length) {
@@ -445,7 +445,7 @@ export function registerSupplyBuyerRoutes(app, { auth }) {
       const invoice = invoices.rows.find((row) => row.round_id === raw.id);
       list.push({
         id: raw.id, ref: raw.ref, delivery_date: plainDate(raw.delivery_date), title: raw.title, status: raw.status,
-        buyer_status: raw.buyer_status, buyer_steps: raw.buyer_steps || {}, sent_at: raw.sent_at,
+        buyer_status: raw.buyer_status, buyer_steps: raw.buyer_steps || {}, sent_at: raw.sent_at, closed_at: raw.closed_at, closed_by: raw.closed_by,
         companies: sheet.companies.map((company) => company.name), companies_total: active.rows[0].count,
         items: sheet.master.filter((row) => row.total > 0).length,
         amounts: Object.entries(amounts).map(([unit, total]) => `${qtyText(total)} ${unit}`),

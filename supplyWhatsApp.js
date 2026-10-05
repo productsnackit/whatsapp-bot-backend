@@ -57,7 +57,7 @@ async function dayFor(date, companyId = null) {
     const { rows } = await db.query(
       `SELECT r.delivery_date FROM supply_orders o JOIN supply_rounds r ON r.id = o.round_id
        WHERE o.company_id = $1 AND o.source = 'whatsapp' AND o.created_at > NOW() - INTERVAL '12 hours'
-         AND r.status <> 'Delivered' AND r.delivery_date >= $2 ORDER BY o.created_at DESC LIMIT 1`,
+         AND r.status NOT IN ('Delivered', 'Closed') AND r.delivery_date >= $2 ORDER BY o.created_at DESC LIMIT 1`,
       [companyId, istDay()]
     );
     if (rows[0]) return plainDate(rows[0].delivery_date);
@@ -69,7 +69,7 @@ async function dayFor(date, companyId = null) {
 // That supply's delivery for the date (a delivered one isn't reopened: a new one is started).
 async function roundOf(day, segment, title, by) {
   const { rows } = await db.query(
-    "SELECT * FROM supply_rounds WHERE delivery_date = $1 AND segment = $2 AND status <> 'Delivered' ORDER BY (status = 'Collecting') DESC, id DESC LIMIT 1",
+    "SELECT * FROM supply_rounds WHERE delivery_date = $1 AND segment = $2 AND status NOT IN ('Delivered', 'Closed') ORDER BY (status = 'Collecting') DESC, id DESC LIMIT 1",
     [day, segment]
   );
   if (rows[0]) return rows[0];

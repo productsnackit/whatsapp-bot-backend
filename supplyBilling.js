@@ -232,7 +232,7 @@ export function registerSupplyBillingRoutes(app, { auth }) {
        FROM supply_lines l LEFT JOIN supply_deliveries d ON d.round_id = l.round_id AND d.company_id = l.company_id WHERE l.round_id = $1`,
       [roundId]
     );
-    if (rows[0].companies && rows[0].companies === rows[0].delivered) await db.query("UPDATE supply_rounds SET status = 'Delivered', updated_at = NOW() WHERE id = $1", [roundId]);
+    if (rows[0].companies && rows[0].companies === rows[0].delivered) await db.query("UPDATE supply_rounds SET status = 'Delivered', updated_at = NOW() WHERE id = $1 AND status <> 'Closed'", [roundId]);
     if (status) res.locals.activity = { section: "Direct Supply", action: `Delivery for company #${companyId} → ${status}` };
     res.json({ success: true });
   }));
