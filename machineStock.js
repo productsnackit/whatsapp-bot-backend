@@ -2,8 +2,9 @@
     LIVE STOCK (vending machines)
     How much is in each machine today, without refillers doing anything new:
       • sales come from the Wendor transactions report the office uploads each day (only
-        completed vends count; failed / started / not started don't). Uploading a report again,
-        or one that overlaps another, replaces those days, so nothing is counted twice;
+        completed vends count; failed / started / not started don't). Sales are kept for good:
+        a report only adds the Wendor orders not saved yet, so a report again, or one that
+        overlaps others (e.g. 28 Sep – 5 Oct after September), adds just what's missing;
       • every machine is refilled at a fixed time: the office sets its refill days and time once
         (e.g. Mon–Sat 9:00 am), and the machine counts as filled back up at each of those times.
         Refillers are not involved. A refill that didn't happen can be skipped for that day,
@@ -59,6 +60,7 @@ export async function ensureMachineStock(database) {
       id SERIAL PRIMARY KEY, machine_id INTEGER NOT NULL REFERENCES stock_machines(id) ON DELETE CASCADE,
       position TEXT, kind TEXT NOT NULL, qty INTEGER, at TIMESTAMPTZ NOT NULL DEFAULT NOW(), by TEXT, note TEXT
     );
+    CREATE TABLE IF NOT EXISTS stock_orders (order_id TEXT PRIMARY KEY, machine_id INTEGER, day DATE);
     CREATE TABLE IF NOT EXISTS stock_uploads (
       id SERIAL PRIMARY KEY, file_name TEXT, day_from DATE, day_to DATE, rows INTEGER, sold INTEGER, skipped INTEGER,
       machines TEXT[], uploaded_by TEXT, uploaded_at TIMESTAMPTZ DEFAULT NOW()
@@ -117,27 +119,22 @@ function whenOf(date, time) {
 export async function importReport({ base64, fileName, by }) {
   const rows = readReport(base64);
   if (!rows.length) throw new Error("This doesn't look like a Wendor transactions report (no Machine ID / Position columns).");
+  // Every completed vend in the file (failed, started, not started took nothing out).
   const seen = new Set();
-  const sales = new Map();
   const days = new Set();
   const machines = new Map();
+  const vends = [];
   let skipped = 0;
   for (const row of rows) {
     const when = whenOf(row.date, row.time);
     if (!when || !row.machineId) { skipped += 1; continue; }
     days.add(when.day);
     machines.set(row.machineId, row.machine || row.machineId);
-    // Only a completed vend took an item out (failed, started, not started didn't).
     const done = /^completed$/i.test(row.status) || /^vend_success$/i.test(row.comment);
     if (!done) { skipped += 1; continue; }
     if (row.order && seen.has(row.order)) continue; // the same order twice in a file
     if (row.order) seen.add(row.order);
-    const qty = Math.max(1, Math.round(Number(row.qty) || 1));
-    const key = `${when.day}|${when.bucket}|${row.machineId}|${row.position}|${row.product.replace(/\s+/g, " ")}`;
-    const entry = sales.get(key) || { ...when, wendor: row.machineId, position: row.position, product: row.product.replace(/\s+/g, " "), qty: 0, amount: 0 };
-    entry.qty += qty;
-    entry.amount += Number(row.amount) || 0;
-    sales.set(key, entry);
+    vends.push({ ...when, order: row.order || null, wendor: row.machineId, position: row.position, product: row.product.replace(/\s+/g, " "), qty: Math.max(1, Math.round(Number(row.qty) || 1)), amount: Number(row.amount) || 0 });
   }
   if (!days.size) throw new Error("No dated rows found in the report.");
   const ids = new Map();
@@ -155,28 +152,76 @@ export async function importReport({ base64, fileName, by }) {
     }
   }
   const dayList = [...days].sort();
-  // These days in this report replace whatever was uploaded for them before (for these machines).
-  await db.query("DELETE FROM stock_sales WHERE day = ANY($1) AND machine_id = ANY($2)", [dayList, [...ids.values()]]);
-  // Saved in batches (one query per 2,000 rows), not row by row.
+
+  // Sales are kept for good; a report only adds what isn't saved yet. Each Wendor order is
+  // remembered, so overlapping reports (or a day uploaded half-way and again later) add only
+  // the new orders. Days saved before orders were remembered count as complete.
+  const known = new Set();
+  const orderIds = vends.filter((vend) => vend.order).map((vend) => vend.order);
+  for (let start = 0; start < orderIds.length; start += 10000) {
+    const { rows: found } = await db.query("SELECT order_id FROM stock_orders WHERE order_id = ANY($1)", [orderIds.slice(start, start + 10000)]);
+    for (const row of found) known.add(row.order_id);
+  }
+  const { rows: oldDays } = await db.query(
+    `SELECT DISTINCT s.machine_id, s.day::text AS day FROM stock_sales s WHERE s.day = ANY($1) AND s.machine_id = ANY($2)
+       AND NOT EXISTS (SELECT 1 FROM stock_orders o WHERE o.machine_id = s.machine_id AND o.day = s.day)`,
+    [dayList, [...ids.values()]]
+  );
+  const { rows: haveDays } = await db.query("SELECT DISTINCT machine_id, day::text AS day FROM stock_sales WHERE day = ANY($1) AND machine_id = ANY($2)", [dayList, [...ids.values()]]);
+  const oldDay = new Set(oldDays.map((row) => `${row.machine_id}|${row.day}`));
+  const hasDay = new Set(haveDays.map((row) => `${row.machine_id}|${row.day}`));
+  const fresh = vends.filter((vend) => {
+    const machineDay = `${ids.get(vend.wendor)}|${vend.day}`;
+    if (vend.order) return !known.has(vend.order) && !oldDay.has(machineDay);
+    return !hasDay.has(machineDay); // no order ID: only a day not saved yet
+  });
+  const already = vends.length - fresh.length;
+  const sales = new Map();
+  for (const vend of fresh) {
+    const key = `${vend.day}|${vend.bucket}|${vend.wendor}|${vend.position}|${vend.product}`;
+    const entry = sales.get(key) || { day: vend.day, bucket: vend.bucket, wendor: vend.wendor, position: vend.position, product: vend.product, qty: 0, amount: 0 };
+    entry.qty += vend.qty;
+    entry.amount += vend.amount;
+    sales.set(key, entry);
+  }
+
+  // Saved in batches (one query per 2,000 rows), all or nothing.
   let sold = 0;
   const entries = [...sales.values()];
-  for (let start = 0; start < entries.length; start += 2000) {
-    const batch = entries.slice(start, start + 2000);
-    const machineIds = batch.map((entry) => ids.get(entry.wendor));
-    await db.query(
-      `INSERT INTO stock_sales (day, bucket, machine_id, position, product, qty, amount)
-       SELECT * FROM unnest($1::date[], $2::smallint[], $3::int[], $4::text[], $5::text[], $6::int[], $7::numeric[])
-       ON CONFLICT (day, bucket, machine_id, position, product) DO UPDATE SET qty = stock_sales.qty + EXCLUDED.qty, amount = stock_sales.amount + EXCLUDED.amount`,
-      [batch.map((entry) => entry.day), batch.map((entry) => entry.bucket), machineIds, batch.map((entry) => entry.position), batch.map((entry) => entry.product), batch.map((entry) => entry.qty), batch.map((entry) => entry.amount)]
-    );
-    await db.query("INSERT INTO stock_slots (machine_id, position) SELECT DISTINCT * FROM unnest($1::int[], $2::text[]) ON CONFLICT DO NOTHING", [machineIds, batch.map((entry) => entry.position)]);
-    sold += batch.reduce((sum, entry) => sum + entry.qty, 0);
+  const newOrders = fresh.filter((vend) => vend.order);
+  const client = await db.connect();
+  try {
+    await client.query("BEGIN");
+    for (let start = 0; start < entries.length; start += 2000) {
+      const batch = entries.slice(start, start + 2000);
+      const machineIds = batch.map((entry) => ids.get(entry.wendor));
+      await client.query(
+        `INSERT INTO stock_sales (day, bucket, machine_id, position, product, qty, amount)
+         SELECT * FROM unnest($1::date[], $2::smallint[], $3::int[], $4::text[], $5::text[], $6::int[], $7::numeric[])
+         ON CONFLICT (day, bucket, machine_id, position, product) DO UPDATE SET qty = stock_sales.qty + EXCLUDED.qty, amount = stock_sales.amount + EXCLUDED.amount`,
+        [batch.map((entry) => entry.day), batch.map((entry) => entry.bucket), machineIds, batch.map((entry) => entry.position), batch.map((entry) => entry.product), batch.map((entry) => entry.qty), batch.map((entry) => entry.amount)]
+      );
+      await client.query("INSERT INTO stock_slots (machine_id, position) SELECT DISTINCT * FROM unnest($1::int[], $2::text[]) ON CONFLICT DO NOTHING", [machineIds, batch.map((entry) => entry.position)]);
+      sold += batch.reduce((sum, entry) => sum + entry.qty, 0);
+    }
+    for (let start = 0; start < newOrders.length; start += 5000) {
+      const batch = newOrders.slice(start, start + 5000);
+      await client.query("INSERT INTO stock_orders (order_id, machine_id, day) SELECT * FROM unnest($1::text[], $2::int[], $3::date[]) ON CONFLICT DO NOTHING",
+        [batch.map((vend) => vend.order), batch.map((vend) => ids.get(vend.wendor)), batch.map((vend) => vend.day)]);
+    }
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw err;
+  } finally {
+    client.release();
   }
+  const newDays = [...new Set(fresh.map((vend) => vend.day))].sort();
   const { rows: upload } = await db.query(
     "INSERT INTO stock_uploads (file_name, day_from, day_to, rows, sold, skipped, machines, uploaded_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id, file_name, day_from::text, day_to::text, rows, sold, skipped, machines, uploaded_by, uploaded_at",
     [fileName || null, dayList[0], dayList[dayList.length - 1], rows.length, sold, skipped, [...machines.values()], by]
   );
-  return { ...upload[0], days: dayList.length };
+  return { ...upload[0], days: dayList.length, already, new_days: newDays };
 }
 
 /* ---------- Working out the stock ---------- */

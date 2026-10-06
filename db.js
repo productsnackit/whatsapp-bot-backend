@@ -17,4 +17,5 @@ console.log("✅ Pool Query Type:", typeof pool.query);
 // ✅ Export clean query wrapper (IMPORTANT FIX)
 export default {
   query: (...args) => pool.query(...args),
+  connect: () => pool.connect(), // a client of its own, for a transaction
 };
