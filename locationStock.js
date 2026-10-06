@@ -65,6 +65,7 @@ export async function ensureLocationStock(database, { onChanged } = {}) {
     -- Two names the admin said are different products (not asked again).
     CREATE TABLE IF NOT EXISTS stock_item_not_same (a INTEGER NOT NULL, b INTEGER NOT NULL, PRIMARY KEY (a, b));
   `);
+  setTimeout(() => seedProductList().catch((err) => console.log("PRODUCT LIST SEED ERROR:", err.message)), 5000);
 }
 
 /* ---------- Items: one list for warehouse, DC and Wendor names ---------- */
@@ -401,55 +402,80 @@ function productsFromPdf(text) {
   return out;
 }
 
+// Each row of the list is one product (a name listed twice stays two products, which the page
+// asks the admin to confirm as one). A product is found again by its Wendor ID, else by its name.
 async function importProducts(rows) {
-  // The list itself can have one product twice (same name, sometimes two prices).
-  const groups = new Map();
-  for (const row of rows) {
-    const key = cleanName(row.name);
-    if (!key) continue;
-    const group = groups.get(key) || { key, name: row.name, ids: [], prices: [], brand: row.brand };
-    if (row.id) group.ids.push(row.id);
-    if (row.price != null && !group.prices.includes(row.price)) group.prices.push(row.price);
-    group.brand = group.brand || row.brand;
-    groups.set(key, group);
+  itemCache.at = 0;
+  const list = await items();
+  const byWendor = new Map();
+  const byKey = new Map();
+  for (const item of list) {
+    for (const id of item.wendor_ids || []) byWendor.set(id, item);
+    byKey.set(item.key, item);
+    for (const alias of item.aliases || []) if (!byKey.has(alias)) byKey.set(alias, item);
   }
   let added = 0;
   let updated = 0;
-  for (const group of groups.values()) {
-    const list = await items();
-    const found = list.find((item) => item.key === group.key || (item.aliases || []).includes(group.key) || (group.ids.length && (item.wendor_ids || []).some((id) => group.ids.includes(id))));
-    const twoPrices = group.prices.length > 1;
+  const seen = new Set();
+  for (const row of rows) {
+    const key = cleanName(row.name);
+    if (!key || (row.id && seen.has(row.id))) continue;
+    if (row.id) seen.add(row.id);
+    let found = row.id ? byWendor.get(row.id) : null;
+    // Same name: that product, unless it is already another listed product (a name listed twice).
+    if (!found) {
+      const named = byKey.get(key);
+      if (named && !(named.in_list && (named.wendor_ids || []).length && row.id && !(named.wendor_ids || []).includes(row.id))) found = named;
+    }
+    const name = displayName(row.name).slice(0, 160);
     if (found) {
       await db.query(
-        `UPDATE stock_items SET in_list = TRUE, name = CASE WHEN in_list THEN name ELSE $2 END,
-           wendor_ids = (SELECT ARRAY(SELECT DISTINCT unnest(wendor_ids || $3::text[]))), brand = COALESCE($4, brand),
-           price = CASE WHEN COALESCE(price_from, '') = 'page' THEN price ELSE $5 END,
-           price_from = CASE WHEN COALESCE(price_from, '') = 'page' THEN price_from WHEN $5 IS NULL THEN price_from ELSE 'product list' END,
-           price_options = CASE WHEN $6 AND NOT price_ok THEN $7::numeric[] ELSE price_options END
+        `UPDATE stock_items SET in_list = TRUE, name = $2, brand = COALESCE($4, brand),
+           wendor_ids = CASE WHEN $3::text IS NULL OR $3 = ANY(wendor_ids) THEN wendor_ids ELSE array_append(wendor_ids, $3) END,
+           price = CASE WHEN COALESCE(price_from, '') = 'page' OR $5::numeric IS NULL THEN price ELSE $5 END,
+           price_from = CASE WHEN COALESCE(price_from, '') = 'page' OR $5::numeric IS NULL THEN price_from ELSE 'product list' END
          WHERE id = $1`,
-        [found.id, displayName(group.name).slice(0, 160), group.ids, group.brand, group.prices[0] ?? found.price ?? null, twoPrices, group.prices]
+        [found.id, name, row.id || null, row.brand || null, row.price ?? null]
       );
+      found.in_list = true;
+      if (row.id) { found.wendor_ids = [...new Set([...(found.wendor_ids || []), row.id])]; byWendor.set(row.id, found); }
       updated += 1;
     } else {
-      await db.query(
-        "INSERT INTO stock_items (name, key, in_list, wendor_ids, brand, price, price_from, price_options) VALUES ($1, $2, TRUE, $3, $4, $5, $6, $7) ON CONFLICT (key) DO NOTHING",
-        [displayName(group.name).slice(0, 160), group.key, group.ids, group.brand, group.prices[0] ?? null, group.prices.length ? "product list" : null, twoPrices ? group.prices : []]
+      const uniqueKey = byKey.has(key) ? `${key} ~${row.id || added}` : key;
+      const { rows: saved } = await db.query(
+        `INSERT INTO stock_items (name, key, in_list, wendor_ids, brand, price, price_from) VALUES ($1, $2, TRUE, $3, $4, $5, $6)
+         ON CONFLICT (key) DO NOTHING RETURNING id, key, aliases, wendor_ids, in_list`,
+        [name, uniqueKey, row.id ? [row.id] : [], row.brand || null, row.price ?? null, row.price != null ? "product list" : null]
       );
-      added += 1;
+      if (saved[0]) {
+        if (!byKey.has(key)) byKey.set(key, saved[0]);
+        if (row.id) byWendor.set(row.id, saved[0]);
+        added += 1;
+      }
     }
-    itemCache.at = 0;
   }
+  itemCache.at = 0;
   // Names already in use (closing stocks, DCs, Wendor sales) that surely are a listed product join it.
-  const list = await items();
-  const listed = list.filter((item) => item.in_list);
+  const fresh = await items();
+  const listed = fresh.filter((item) => item.in_list);
   const notSame = await notSamePairs();
   let linked = 0;
-  for (const item of list.filter((row) => !row.in_list)) {
+  for (const item of fresh.filter((row) => !row.in_list)) {
     const match = sure(bestMatches(item.name, listed.filter((other) => !notSame.has(`${item.id}|${other.id}`))));
     if (match && !(await mergeItems(item.id, match.id)).error) linked += 1;
   }
   onChange();
-  return { products: groups.size, rows: rows.length, added, updated, linked };
+  return { products: rows.length, rows: rows.length, added, updated, linked };
+}
+
+// The product list shared on 6 Oct 2026 goes in once by itself (productListData.js).
+async function seedProductList() {
+  const { rows } = await db.query("SELECT 1 FROM app_settings WHERE key = 'product_list_236_loaded'").catch(() => ({ rows: [] }));
+  if (rows.length) return;
+  const { PRODUCT_LIST_236 } = await import("./productListData.js");
+  const result = await importProducts(PRODUCT_LIST_236.map(([id, name, price, brand]) => ({ id, name, price, brand })));
+  await db.query("INSERT INTO app_settings (key, value, updated_at) VALUES ('product_list_236_loaded', $1, NOW()) ON CONFLICT (key) DO NOTHING", [JSON.stringify(result)]);
+  console.log(`🏷️ Product List: loaded ${result.products} products (${result.added} new, ${result.updated} updated), ${result.linked} names linked`);
 }
 
 async function notSamePairs() {
@@ -495,7 +521,9 @@ async function productsPage() {
   }
   duplicates.sort((x, y) => y.score - x.score);
   // 3. Prices to confirm: two prices for one product, or no price for one in use.
-  const prices = list.filter((item) => (!item.price_ok && (item.price_options || []).length > 1) || (item.price == null && (used.has(item.id) || sold.has(item.id)))).map(view);
+  // (A name still waiting for "which product is this?" gets its price there.)
+  const asking = new Set(matches.filter((match) => match.options.length).map((match) => match.item.id));
+  const prices = list.filter((item) => !asking.has(item.id) && ((!item.price_ok && (item.price_options || []).length > 1) || (item.price == null && (used.has(item.id) || sold.has(item.id))))).map(view);
   return {
     products: list.map(view),
     confirm: { matches: matches.sort((x, y) => (y.item.locations + y.item.sold_60d) - (x.item.locations + x.item.sold_60d)), duplicates, prices },
