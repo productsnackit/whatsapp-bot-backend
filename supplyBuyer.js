@@ -5,13 +5,15 @@
         has ordered, or at the cutoff time (default 6 pm) the day before delivery with whatever
         has come in; it can also be sent from the dashboard (Buy page);
       • if orders change after that, the buyer gets an "updated list" with just the changes
-        (once the change has settled for a couple of minutes), until he marks Goods received;
+        (once the change has settled for a couple of minutes), until he marks Out for delivery;
       • the message has a private link to a phone page (no login) where he fills, per item,
         how much he bought, the purchase price, the selling price and where he bought it; the
         margin (selling − purchase, and % of selling) is worked out and stored, the selling price
         becomes the item's price on invoices, and the place's rate is saved;
       • WhatsApp buttons take him through the steps:
-        Received → Processing → Ordered → Goods received → Sent.
+        Received → Processing → Ordered → Out for delivery → Delivered.
+        Delivered needs a photo of the delivery (sent on WhatsApp after tapping it, or taken on
+        his page).
     The Excel master sheet is attached every time (and the updated one with each update).
     Outside WhatsApp's 24-hour window the approved template "supply_buyer_list" is used, with the
     Excel file as its document header:
@@ -20,15 +22,16 @@
 import crypto from "crypto";
 import { masterOf, buyingOf, masterWorkbook, roundById } from "./directSupply.js";
 import { parseOrderMessage } from "./supplyParse.js";
-import { storeDashboardFile, sendStoredFile } from "./ticketChat.js";
+import { storeDashboardFile, storeIncomingMedia, sendStoredFile } from "./ticketChat.js";
 import { sendWhatsApp, sendWhatsAppPayload, sendWhatsAppButtons, sendWhatsAppTemplate } from "./whatsapp.js";
 import { refillerWindowOpen } from "./whatsappOutbox.js";
 import { sendPushToUsers } from "./pushNotifications.js";
 import { makeAndSendChallans } from "./supplyChallan.js";
 import { validSegment } from "./supplySegments.js";
 
-export const BUYER_STEPS = ["Received", "Processing", "Ordered", "Goods received", "Sent"];
-const STEP_TEXT = { Received: "✅ List received", Processing: "⏳ Processing", Ordered: "🛒 Ordered", "Goods received": "📦 Goods received", Sent: "🚚 Sent" };
+export const BUYER_STEPS = ["Received", "Processing", "Ordered", "Out for delivery", "Delivered"];
+const STEP_TEXT = { Received: "✅ List received", Processing: "⏳ Processing", Ordered: "🛒 Ordered", "Out for delivery": "🚚 Out for delivery", Delivered: "📦 Delivered" };
+const BOUGHT_STEPS = ["Out for delivery", "Delivered"];
 const TEMPLATE = "supply_buyer_list";
 // The list without his page link (the link comes when he taps Ordered): "Hi, {{1}} is ready: {{2}}
 // items to buy. Please check the attached list and tap Received. Thank you." + document + "Received".
@@ -56,11 +59,22 @@ export async function ensureSupplyBuyer(database, { onChanged } = {}) {
       ADD COLUMN IF NOT EXISTS buyer_token TEXT UNIQUE,
       ADD COLUMN IF NOT EXISTS buyer_status TEXT,
       ADD COLUMN IF NOT EXISTS buyer_steps JSONB NOT NULL DEFAULT '{}',
-      ADD COLUMN IF NOT EXISTS buyer_snapshot JSONB;
+      ADD COLUMN IF NOT EXISTS buyer_snapshot JSONB,
+      ADD COLUMN IF NOT EXISTS buyer_photos JSONB NOT NULL DEFAULT '[]',
+      ADD COLUMN IF NOT EXISTS buyer_photo_wait TIMESTAMPTZ;
     ALTER TABLE supply_purchases
       ADD COLUMN IF NOT EXISTS source TEXT,
       ADD COLUMN IF NOT EXISTS margin_percent NUMERIC,
       ADD COLUMN IF NOT EXISTS sell_price NUMERIC;
+  `);
+  // The steps were renamed: Goods received → Out for delivery, Sent → Delivered.
+  await db.query(`
+    UPDATE supply_rounds SET
+      buyer_status = CASE buyer_status WHEN 'Goods received' THEN 'Out for delivery' WHEN 'Sent' THEN 'Delivered' ELSE buyer_status END,
+      buyer_steps = (buyer_steps - 'Goods received' - 'Sent')
+        || CASE WHEN buyer_steps ? 'Goods received' THEN jsonb_build_object('Out for delivery', buyer_steps->'Goods received') ELSE '{}'::jsonb END
+        || CASE WHEN buyer_steps ? 'Sent' THEN jsonb_build_object('Delivered', buyer_steps->'Sent') ELSE '{}'::jsonb END
+    WHERE buyer_status IN ('Goods received', 'Sent') OR buyer_steps ?| ARRAY['Goods received', 'Sent']
   `);
 }
 
@@ -121,7 +135,7 @@ export async function sendListToBuyer(roundOrId, kind = "new") {
   const round = typeof roundOrId === "object" ? roundOrId : await roundById(roundOrId);
   if (!round) return { ok: false, error: "Delivery date not found" };
   const contact = await buyerContact();
-  if (!contact.phone) return { ok: false, error: "Add the buyer's WhatsApp number in Admin Settings → Direct Supply buyer." };
+  if (!contact.phone) return { ok: false, error: "Add the buyer's WhatsApp number in Admin Settings → Supply buyer." };
   const sheet = await masterOf(round.id);
   const rows = snapshotOf(sheet);
   if (!rows.length) return { ok: false, error: "There are no orders for this date yet" };
@@ -208,7 +222,7 @@ const nextStep = (status) => {
   return BUYER_STEPS[index + 1] || null;
 };
 
-// Items still without what was bought (quantity and price) — Goods received / Sent wait for them.
+// Items still without what was bought (quantity and price) — Out for delivery / Delivered wait for them.
 // Items whose name is still being checked at the office can't be filled yet, so they don't count.
 async function missingEntries(round) {
   const sheet = await masterOf(round.id);
@@ -217,22 +231,26 @@ async function missingEntries(round) {
   return sheet.master.filter((row) => row.total > 0 && row.product_id && !have.has(`${row.product_id}|${row.unit}`)).map((row) => row.name);
 }
 
-async function setStep(round, step, by) {
+// Delivered needs a photo of the delivery: without one it answers { needPhoto: true }.
+async function setStep(round, step, by, { photo = null } = {}) {
   if (!BUYER_STEPS.includes(step)) return null;
-  if (["Goods received", "Sent"].includes(step)) {
+  if (BOUGHT_STEPS.includes(step)) {
     const missing = await missingEntries(round);
     if (missing.length) return { blocked: true, missing };
   }
-  const bought = ["Goods received", "Sent"].includes(step);
+  if (step === "Delivered" && !photo) return { needPhoto: true };
+  const bought = BOUGHT_STEPS.includes(step);
+  const photos = photo ? JSON.stringify([{ url: photo, at: new Date().toISOString(), by: by || "Buyer" }]) : "[]";
   const { rows } = await db.query(
     `UPDATE supply_rounds SET buyer_status = $2, buyer_steps = buyer_steps || jsonb_build_object($2::text, NOW()),
+       buyer_photos = COALESCE(buyer_photos, '[]'::jsonb) || $4::jsonb, buyer_photo_wait = NULL,
        status = CASE WHEN $3 AND status IN ('Collecting', 'Sent to buyer') THEN 'Bought' ELSE status END, updated_at = NOW()
      WHERE id = $1 RETURNING *`,
-    [round.id, step, bought]
+    [round.id, step, bought, photos]
   );
   onChange();
-  // Goods are in: the delivery challans (one per company) go to the buyer's WhatsApp.
-  if (step === "Goods received") {
+  // Goods are on the way: the delivery challans (one per company) go to the buyer's WhatsApp.
+  if (step === "Out for delivery") {
     setTimeout(() => makeAndSendChallans(round.id).then((result) => {
       console.log(`📄 DCs for ${round.ref}: made ${result.made}, sent ${result.sent}${result.error ? ` (${result.error})` : ""}`);
       if (result.error) sendPushToUsers(db, ["admin"], { title: "Delivery challans", body: `${round.ref}: ${result.error}`.slice(0, 180), view: "supply" }).catch(() => {});
@@ -270,7 +288,7 @@ export async function supplyBuyerTick() {
         const ofSupply = active.filter((company) => (company.segments || []).includes(round.segment || "fruits"));
         const everyone = ofSupply.length > 0 && ofSupply.every((company) => have.has(company.id));
         if (everyone || now >= `${dayBefore(round.delivery_date)}T${contact.cutoff}`) kind = "new";
-      } else if (!["Goods received", "Sent"].includes(round.buyer_status)) {
+      } else if (!BOUGHT_STEPS.includes(round.buyer_status)) {
         const current = JSON.stringify(snapshotOf(await masterOf(round.id)));
         // Sent before the buyer tracking existed: take today's list as what he has seen.
         if (!round.buyer_snapshot) { await db.query("UPDATE supply_rounds SET buyer_snapshot = $2 WHERE id = $1", [round.id, current]); continue; }
@@ -303,6 +321,26 @@ export async function handleSupplyBuyerWhatsApp(msg) {
   const tapped = choice.match(/^SB:(\d+):(.+)$/);
   const contact = await buyerContact();
   if (!contact.phone || last10(contact.phone) !== last10(msg.from)) return false;
+  // The delivery photo after he tapped Delivered: it marks that date Delivered.
+  if (!tapped && msg.type === "image") {
+    const { rows: waiting } = await db.query("SELECT * FROM supply_rounds WHERE buyer_photo_wait > NOW() - INTERVAL '2 days' ORDER BY buyer_photo_wait DESC LIMIT 1");
+    if (waiting[0]) {
+      const round = { ...waiting[0], delivery_date: plainDate(waiting[0].delivery_date) };
+      const media = await storeIncomingMedia(msg).catch(() => null);
+      if (!media?.url) {
+        await sendWhatsApp(msg.from, "⚠️ Couldn't save that photo. Please send it again.");
+        return true;
+      }
+      const updated = await setStep(round, "Delivered", contact.name, { photo: media.url });
+      if (updated?.blocked) {
+        const { url } = await linkFor(round);
+        await sendWhatsApp(msg.from, `Please fill what you bought first for: ${updated.missing.slice(0, 15).join(", ")}.\n\n${url}`);
+        return true;
+      }
+      await sendWhatsApp(msg.from, `${STEP_TEXT.Delivered} · ${round.ref} (${dayLabel(round.delivery_date)}). Photo received. Thank you! 🙏`);
+      return true;
+    }
+  }
   if (!tapped) {
     // Anything else from the buyer (e.g. "hi"): never the customer bot. A message listing
     // companies' orders still goes on to the order reader.
@@ -310,7 +348,7 @@ export async function handleSupplyBuyerWhatsApp(msg) {
     if (parseOrderMessage(text).groups.some((group) => group.heading && group.lines.length)) return false;
     const { rows } = await db.query(
       `SELECT * FROM supply_rounds WHERE sent_at IS NOT NULL AND delivery_date >= $1::date
-       AND status NOT IN ('Delivered', 'Closed') AND COALESCE(buyer_status, '') <> 'Sent' ORDER BY delivery_date, id LIMIT 3`,
+       AND status NOT IN ('Delivered', 'Closed') AND COALESCE(buyer_status, '') <> 'Delivered' ORDER BY delivery_date, id LIMIT 3`,
       [istNow().slice(0, 10)]
     );
     if (!rows.length) {
@@ -321,7 +359,7 @@ export async function handleSupplyBuyerWhatsApp(msg) {
       const round = { ...raw, delivery_date: plainDate(raw.delivery_date) };
       const { url } = await linkFor(round);
       const next = nextStep(round.buyer_status);
-      const linkShown = ["Ordered", "Goods received"].includes(round.buyer_status);
+      const linkShown = ["Ordered", "Out for delivery"].includes(round.buyer_status);
       const body = `🛒 ${kindOf(round, true)} stock list for ${dayLabel(round.delivery_date)} (${round.ref})${round.buyer_status ? ` · now: ${round.buyer_status}` : ""}${linkShown ? `\nFill what you bought: ${url}` : ""}`;
       if (next) await sendWhatsAppButtons(msg.from, body, [{ id: `SB:${round.id}:${next}`, title: next }]);
       else await sendWhatsApp(msg.from, body);
@@ -333,16 +371,24 @@ export async function handleSupplyBuyerWhatsApp(msg) {
     await sendWhatsApp(msg.from, "That delivery date isn't on the dashboard any more.");
     return true;
   }
-  const updated = await setStep(round, tapped[2], contact.name);
+  // Buttons sent before the steps were renamed still work.
+  const step = { "Goods received": "Out for delivery", Sent: "Delivered" }[tapped[2]] || tapped[2];
+  const updated = await setStep(round, step, contact.name);
   if (!updated) return false;
   const { url } = await linkFor(round);
-  // Goods received / Sent only after he has filled what he bought for every item.
+  // Out for delivery / Delivered only after he has filled what he bought for every item.
   if (updated.blocked) {
     await sendWhatsAppButtons(
       msg.from,
       `Please fill what you bought first (quantity, purchase price, selling price) for: ${updated.missing.slice(0, 15).join(", ")}${updated.missing.length > 15 ? ` and ${updated.missing.length - 15} more` : ""}.\n\n${url}\n\nThen tap the button again.`,
-      [{ id: `SB:${round.id}:${tapped[2]}`, title: tapped[2] }]
+      [{ id: `SB:${round.id}:${step}`, title: step }]
     );
+    return true;
+  }
+  // Delivered: wait for the photo of the delivery.
+  if (updated.needPhoto) {
+    await db.query("UPDATE supply_rounds SET buyer_photo_wait = NOW() WHERE id = $1", [round.id]);
+    await sendWhatsApp(msg.from, `📸 Please send a photo of the delivery for ${round.ref} (${dayLabel(round.delivery_date)}). It's marked Delivered once the photo comes.`);
     return true;
   }
   const next = nextStep(updated.buyer_status);
@@ -392,7 +438,7 @@ export function registerSupplyBuyerRoutes(app, { auth }) {
     }
   };
 
-  // Admin Settings → Direct Supply buyer.
+  // Admin Settings → Supply buyer.
   app.get("/admin/supply-buyer", auth, handle("SUPPLY BUYER SETTINGS", async (req, res) => {
     res.json(await buyerContact());
   }));
@@ -413,7 +459,7 @@ export function registerSupplyBuyerRoutes(app, { auth }) {
        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
       [JSON.stringify(value)]
     );
-    res.locals.activity = { section: "Admin Settings", action: `Direct Supply buyer set to ${value.name || value.phone || "nobody"}` };
+    res.locals.activity = { section: "Admin Settings", action: `Supply buyer set to ${value.name || value.phone || "nobody"}` };
     res.json(await buyerContact());
   }));
 
@@ -445,7 +491,7 @@ export function registerSupplyBuyerRoutes(app, { auth }) {
       const invoice = invoices.rows.find((row) => row.round_id === raw.id);
       list.push({
         id: raw.id, ref: raw.ref, delivery_date: plainDate(raw.delivery_date), title: raw.title, status: raw.status,
-        buyer_status: raw.buyer_status, buyer_steps: raw.buyer_steps || {}, sent_at: raw.sent_at, closed_at: raw.closed_at, closed_by: raw.closed_by,
+        buyer_status: raw.buyer_status, buyer_steps: raw.buyer_steps || {}, buyer_photos: raw.buyer_photos || [], sent_at: raw.sent_at, closed_at: raw.closed_at, closed_by: raw.closed_by,
         companies: sheet.companies.map((company) => company.name), companies_total: active.rows[0].count,
         items: sheet.master.filter((row) => row.total > 0).length,
         amounts: Object.entries(amounts).map(([unit, total]) => `${qtyText(total)} ${unit}`),
@@ -470,7 +516,7 @@ export function registerSupplyBuyerRoutes(app, { auth }) {
     if (!round) return res.status(404).json({ error: "Not found" });
     const result = await sendListToBuyer(round, "new");
     if (!result.ok) return res.status(400).json({ error: result.error });
-    res.locals.activity = { section: "Direct Supply", action: `Sent ${round.ref} stock list to the buyer` };
+    res.locals.activity = { section: "Supply", action: `Sent ${round.ref} stock list to the buyer` };
     res.json({ success: true, ...result, round: await roundById(round.id) });
   }));
 
@@ -496,7 +542,7 @@ export function registerSupplyBuyerRoutes(app, { auth }) {
     const companyName = new Map(sheet.companies.map((company) => [String(company.id), company.name]));
     return {
       seller: seller.name || "Snackit",
-      round: { ref: round.ref, delivery_date: round.delivery_date, title: round.title, buyer_status: round.buyer_status, buyer_steps: round.buyer_steps || {} },
+      round: { ref: round.ref, delivery_date: round.delivery_date, title: round.title, buyer_status: round.buyer_status, buyer_steps: round.buyer_steps || {}, photos: (round.buyer_photos || []).length },
       steps: BUYER_STEPS,
       items: buying.rows.filter((row) => row.need > 0).map((row) => {
         const own = mine.find((item) => item.product_id === row.product_id && item.unit === row.unit);
@@ -523,9 +569,15 @@ export function registerSupplyBuyerRoutes(app, { auth }) {
     if (!round) return res.status(404).json({ error: "This link isn't valid any more." });
     if (tooMany(req.params.token)) return res.status(429).json({ error: "Too many changes. Try again in a while." });
     const contact = await buyerContact();
-    const result = await setStep(round, String(req.body?.step || ""), contact.name);
+    let photo = null;
+    if (req.body?.photo?.data) {
+      if (!/^image\//.test(String(req.body.photo.type || ""))) return res.status(400).json({ error: "The delivery photo must be an image" });
+      photo = (await storeDashboardFile(req.body.photo)).url;
+    }
+    const result = await setStep(round, String(req.body?.step || ""), contact.name, { photo });
     if (!result) return res.status(400).json({ error: "Unknown step" });
     if (result.blocked) return res.status(400).json({ error: `Fill what you bought first for: ${result.missing.join(", ")}` });
+    if (result.needPhoto) return res.status(400).json({ error: "Take a photo of the delivery to mark it Delivered", need_photo: true });
     res.json(await pageData(await roundByToken(req.params.token)));
   }));
 

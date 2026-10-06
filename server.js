@@ -4817,7 +4817,7 @@ try {
   initSupplyWhatsApp(db, { onChanged: () => io.emit("supply-changed") });
   // The master sheet goes to the buyer (Admin Settings) when all companies have ordered or at the cutoff.
   await ensureSupplyBuyer(db, { onChanged: () => io.emit("supply-changed") }).catch((err) => console.error("SUPPLY BUYER SETUP ERROR:", err.message));
-  // Delivery challans (one per company) when the buyer taps Goods received.
+  // Delivery challans (one per company) when the buyer taps Out for delivery.
   await ensureSupplyChallan(db, { getBuyer: buyerContact, onChanged: () => io.emit("supply-changed") }).catch((err) => console.error("SUPPLY CHALLAN SETUP ERROR:", err.message));
   setInterval(supplyBuyerTick, 2 * 60 * 1000);
   setTimeout(supplyBuyerTick, 60 * 1000);

@@ -3,7 +3,7 @@
     One DC per company for a delivery date, in Snackit's format (seller box with logo, DC number,
     date and place of supply; Bill To / Ship To; items with HSN, Exp. and Mfg. date, quantity and
     unit; total; terms; Received By / Delivered By / Authorized Signatory with the stamp).
-      • made by itself when the stock buyer taps "Goods received", and sent to his WhatsApp as
+      • made by itself when the stock buyer taps "Out for delivery", and sent to his WhatsApp as
         PDFs (one per company), ready to print and go with the delivery;
       • quantities are what each company ordered, or the packed quantity if it was changed on
         the dashboard (Delivery & bills);

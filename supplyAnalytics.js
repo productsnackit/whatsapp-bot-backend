@@ -1,6 +1,6 @@
 /* =========================================================
     SUPPLY ANALYTICS
-    Direct Supply (fruits) and Packaged Supply on one page, for a period of delivery dates
+    Fruits Supply and Direct Supply (packaged) on one page, for a period of delivery dates
     (India dates), for both supplies or one: delivery dates, orders, companies, quantities,
     order value (quantity × the company's price, else the item's selling price), what the buyer
     spent, margin (only items with both a price and a purchase), invoices and payments, deliveries,
@@ -156,7 +156,7 @@ export function registerSupplyAnalyticsRoutes(app, { auth }) {
       }
       // How long the buyer took from getting the list to having the goods.
       const buyerHours = rounds
-        .map((round) => (round.sent_at && round.buyer_steps?.["Goods received"] ? (new Date(round.buyer_steps["Goods received"]) - new Date(round.sent_at)) / 3600000 : null))
+        .map((round) => (round.sent_at && round.buyer_steps?.["Out for delivery"] ? (new Date(round.buyer_steps["Out for delivery"]) - new Date(round.sent_at)) / 3600000 : null))
         .filter((hours) => hours != null && hours >= 0);
 
       const finish = (entry) => ({

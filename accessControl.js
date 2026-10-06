@@ -16,7 +16,7 @@ export const PAGES = {
   audit: "Refill Audit",
   findings: "Internal Audit",
   refills: "Refill Schedule",
-  supply: "Direct & Packaged Supply",
+  supply: "Fruits & Direct Supply",
   analytics: "Refund Analytics",
   activity: "Activity log",
   settings: "Bot settings",
