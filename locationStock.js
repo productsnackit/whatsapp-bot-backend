@@ -30,7 +30,7 @@ let onChange = () => {};
 let version = 0;
 const results = new Map();
 export function stockChanged() { version += 1; results.clear(); }
-const changed = () => { stockChanged(); changed(); };
+const changed = () => { stockChanged(); onChange(); };
 async function remembered(key, fn, ttl = 10 * 60000) {
   const hit = results.get(key);
   if (hit && hit.version === version && Date.now() - hit.at < ttl) return hit.value;
