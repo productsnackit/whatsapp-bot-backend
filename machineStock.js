@@ -67,19 +67,37 @@ export async function ensureMachineStock(database) {
 }
 
 /* ---------- Reading a Wendor transactions report ---------- */
+// A month's report is ~55,000 rows: read it lean (dense sheet, no formatted text or styles),
+// taking only the columns used.
 function readReport(base64) {
-  const workbook = XLSX.read(Buffer.from(String(base64).replace(/^data:[^,]+,/, ""), "base64"), { type: "buffer" });
+  let buffer = Buffer.from(String(base64).replace(/^data:[^,]+,/, ""), "base64");
+  let workbook = XLSX.read(buffer, { type: "buffer", dense: true, cellFormula: false, cellHTML: false, cellStyles: false, cellText: false, cellDates: false });
+  buffer = null;
   const rows = [];
   for (const name of workbook.SheetNames) {
-    const sheet = XLSX.utils.sheet_to_json(workbook.Sheets[name], { header: 1, defval: "", raw: false });
-    const headerAt = sheet.findIndex((row) => row.some((cell) => /machine id/i.test(String(cell))) && row.some((cell) => /position/i.test(String(cell))));
+    const sheet = workbook.Sheets[name];
+    const grid = sheet["!data"] || (Array.isArray(sheet) ? sheet : []); // dense: rows of cells
+    const text = (cell) => (cell == null || cell.v == null ? "" : String(cell.v).trim());
+    const headerAt = grid.findIndex((row) => row && row.some((cell) => /machine id/i.test(text(cell))) && row.some((cell) => /position/i.test(text(cell))));
     if (headerAt < 0) continue;
-    const header = sheet[headerAt].map((cell) => String(cell).trim().toLowerCase());
+    const header = grid[headerAt].map((cell) => text(cell).toLowerCase());
     const col = (label) => header.indexOf(label);
     const at = { date: col("date"), time: col("time"), order: col("order id"), product: col("product name"), qty: col("quantity"), amount: col("amount"), position: col("position"), status: col("vend status"), comment: col("vend comment"), machine: col("machine name"), machineId: col("machine id") };
     if ([at.date, at.product, at.position, at.machineId].some((index) => index < 0)) continue;
-    for (const row of sheet.slice(headerAt + 1)) rows.push(Object.fromEntries(Object.entries(at).map(([key, index]) => [key, index >= 0 ? String(row[index] ?? "").trim() : ""])));
+    const keys = Object.entries(at);
+    for (let index = headerAt + 1; index < grid.length; index += 1) {
+      const row = grid[index];
+      if (!row) continue;
+      const out = {};
+      for (const [key, column] of keys) out[key] = column >= 0 ? text(row[column]) : "";
+      // A date cell stored as an Excel date number → "dd/mm/yyyy".
+      if (/^\d+(\.\d+)?$/.test(out.date)) { const d = XLSX.SSF.parse_date_code(Number(out.date)); if (d) out.date = `${pad(d.d)}/${pad(d.m)}/${d.y}`; }
+      if (/^0?\.\d+$/.test(out.time)) { const d = XLSX.SSF.parse_date_code(Number(out.time)); if (d) out.time = `${d.H}:${pad(d.M)}`; }
+      rows.push(out);
+    }
+    grid.length = 0;
   }
+  workbook = null;
   return rows;
 }
 
@@ -115,7 +133,7 @@ export async function importReport({ base64, fileName, by }) {
     if (row.order && seen.has(row.order)) continue; // the same order twice in a file
     if (row.order) seen.add(row.order);
     const qty = Math.max(1, Math.round(Number(row.qty) || 1));
-    const key = `${when.day}|${when.bucket}|${row.machineId}|${row.position}|${row.product}`;
+    const key = `${when.day}|${when.bucket}|${row.machineId}|${row.position}|${row.product.replace(/\s+/g, " ")}`;
     const entry = sales.get(key) || { ...when, wendor: row.machineId, position: row.position, product: row.product.replace(/\s+/g, " "), qty: 0, amount: 0 };
     entry.qty += qty;
     entry.amount += Number(row.amount) || 0;
@@ -139,16 +157,20 @@ export async function importReport({ base64, fileName, by }) {
   const dayList = [...days].sort();
   // These days in this report replace whatever was uploaded for them before (for these machines).
   await db.query("DELETE FROM stock_sales WHERE day = ANY($1) AND machine_id = ANY($2)", [dayList, [...ids.values()]]);
+  // Saved in batches (one query per 2,000 rows), not row by row.
   let sold = 0;
-  for (const entry of sales.values()) {
-    const machineId = ids.get(entry.wendor);
+  const entries = [...sales.values()];
+  for (let start = 0; start < entries.length; start += 2000) {
+    const batch = entries.slice(start, start + 2000);
+    const machineIds = batch.map((entry) => ids.get(entry.wendor));
     await db.query(
-      `INSERT INTO stock_sales (day, bucket, machine_id, position, product, qty, amount) VALUES ($1, $2, $3, $4, $5, $6, $7)
+      `INSERT INTO stock_sales (day, bucket, machine_id, position, product, qty, amount)
+       SELECT * FROM unnest($1::date[], $2::smallint[], $3::int[], $4::text[], $5::text[], $6::int[], $7::numeric[])
        ON CONFLICT (day, bucket, machine_id, position, product) DO UPDATE SET qty = stock_sales.qty + EXCLUDED.qty, amount = stock_sales.amount + EXCLUDED.amount`,
-      [entry.day, entry.bucket, machineId, entry.position, entry.product, entry.qty, entry.amount]
+      [batch.map((entry) => entry.day), batch.map((entry) => entry.bucket), machineIds, batch.map((entry) => entry.position), batch.map((entry) => entry.product), batch.map((entry) => entry.qty), batch.map((entry) => entry.amount)]
     );
-    await db.query("INSERT INTO stock_slots (machine_id, position) VALUES ($1, $2) ON CONFLICT DO NOTHING", [machineId, entry.position]);
-    sold += entry.qty;
+    await db.query("INSERT INTO stock_slots (machine_id, position) SELECT DISTINCT * FROM unnest($1::int[], $2::text[]) ON CONFLICT DO NOTHING", [machineIds, batch.map((entry) => entry.position)]);
+    sold += batch.reduce((sum, entry) => sum + entry.qty, 0);
   }
   const { rows: upload } = await db.query(
     "INSERT INTO stock_uploads (file_name, day_from, day_to, rows, sold, skipped, machines, uploaded_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id, file_name, day_from::text, day_to::text, rows, sold, skipped, machines, uploaded_by, uploaded_at",
