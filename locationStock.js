@@ -18,7 +18,7 @@ import { hasPage } from "./accessControl.js";
 import { matchSite, normaliseText } from "./siteMatcher.js";
 import { cleanName, displayName, likeness } from "./supplyParse.js";
 import { bestMatches, nameParts, similarity, sure } from "./productMatch.js";
-import { storeIncomingMedia } from "./ticketChat.js";
+import { storeDashboardFile, storeIncomingMedia } from "./ticketChat.js";
 import { sendWhatsApp } from "./whatsapp.js";
 import { noteInbound } from "./whatsappOutbox.js";
 import { sendPushToUsers } from "./pushNotifications.js";
@@ -164,7 +164,17 @@ export function parseDcText(text) {
     const rest = lines[index].replace(new RegExp(`^${label}\\s*:?\\s*`, "i"), "").trim();
     return rest && !/^(ship to|bill to)$/i.test(rest) ? rest : lines[index + 1] || null;
   };
-  const ref = (raw.match(/\b([A-Z]{2,6}\d{5,12})\b/) || [])[1] || (raw.match(/(?:invoice|challan|dc)\s*no\.?\s*[:\n ]\s*([A-Z0-9/-]{4,20})/i) || [])[1] || null;
+  // The DC number: after "Invoice No." / "Challan No." / "DC No." on that line, or on the next
+  // few lines (in a box its label sits on one line and the number below, e.g. "MAC1869").
+  const CODE = /\b([A-Z]{1,6}[-/]?\d{3,12})\b/;
+  let ref = null;
+  const labelAt = lines.findIndex((line) => /\b(invoice|challan|dc|delivery\s*note|bill)\s*(no|number|#)\b/i.test(line));
+  if (labelAt >= 0) {
+    const sameLine = lines[labelAt].replace(/^.*?\b(?:invoice|challan|dc|delivery\s*note|bill)\s*(?:no|number|#)\.?\s*:?\s*/i, "");
+    ref = (sameLine.match(CODE) || [])[1] || null;
+    for (let index = labelAt + 1; !ref && index <= labelAt + 4 && index < lines.length; index += 1) ref = (lines[index].match(CODE) || [])[1] || null;
+  }
+  if (!ref) ref = (raw.match(/\b([A-Z]{2,6}\d{5,12})\b/) || [])[1] || null;
   const date = raw.match(/\b(\d{2})[-/](\d{2})[-/](\d{4})(?:,?\s*(\d{1,2}):(\d{2})\s*([AP]M))?/i);
   let dcAt = null;
   if (date) {
@@ -203,10 +213,9 @@ export function parseDcText(text) {
   return { ref, dc_at: dcAt, party, ship_to: shipTo, lines: rows };
 }
 
-// PDF text line by line, keeping table cells apart (cells on one line are joined with spaces
-// by their position on the page, so "21069099" and "12" never run together). A broken PDF
-// gives an error, never a crash.
-export async function pdfText(buffer) {
+// A PDF's text pieces with their place on the page (x from the left, y from the bottom).
+// A broken PDF gives an error, never a crash.
+export async function pdfPages(buffer) {
   const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
   const task = pdfjs.getDocument({ data: new Uint8Array(buffer), isEvalSupported: false, useSystemFonts: false, disableFontFace: true, verbosity: 0 });
   const doc = await task.promise;
@@ -215,21 +224,86 @@ export async function pdfText(buffer) {
     for (let number = 1; number <= Math.min(doc.numPages, 10); number += 1) {
       const page = await doc.getPage(number);
       const content = await page.getTextContent();
-      const lines = [];
-      for (const item of content.items) {
-        const text = String(item.str || "");
-        if (!text.trim()) continue;
-        const [x, y] = [item.transform[4], item.transform[5]];
-        let line = lines.find((entry) => Math.abs(entry.y - y) < 3);
-        if (!line) { line = { y, cells: [] }; lines.push(line); }
-        line.cells.push({ x, text });
-      }
-      pages.push(lines.sort((a, b) => b.y - a.y).map((line) => line.cells.sort((a, b) => a.x - b.x).map((cell) => cell.text.trim()).join("  ")).join("\n"));
+      pages.push(content.items.filter((item) => String(item.str || "").trim()).map((item) => ({ text: String(item.str).trim(), x: item.transform[4], y: item.transform[5], w: item.width || 0 })));
     }
   } finally {
     await doc.destroy().catch(() => {});
   }
-  return pages.join("\n");
+  return pages;
+}
+
+// Text line by line, cells on one line kept apart by two spaces ("21069099  12", never "2106909912").
+function pagesText(pages) {
+  return pages.map((items) => {
+    const lines = [];
+    for (const item of items) {
+      let line = lines.find((entry) => Math.abs(entry.y - item.y) < 3);
+      if (!line) { line = { y: item.y, cells: [] }; lines.push(line); }
+      line.cells.push(item);
+    }
+    return lines.sort((a, b) => b.y - a.y).map((line) => line.cells.sort((a, b) => a.x - b.x).map((cell) => cell.text).join("  ")).join("\n");
+  }).join("\n");
+}
+
+export async function pdfText(buffer) {
+  return pagesText(await pdfPages(buffer));
+}
+
+/* The item table of a DC, read by its columns as a person would: the header row (Item name …
+   Quantity … Unit) gives each column's place; each row starts at its number in the "#" column;
+   a long name wrapped onto lines above and below the row still belongs to that row; HSN, dates
+   and GST in other columns never get into the name. Returns [] when there's no such table. */
+export function dcTableFromPages(pages) {
+  const out = [];
+  let columns = null;
+  for (const items of pages) {
+    const isName = (text) => /^(item\s*name|item|items|particulars|product|product\s*name|description(\s*of\s*goods)?)$/i.test(text);
+    const isQty = (text) => /^(qty|quantity)\.?$/i.test(text);
+    const nameHead = items.find((item) => isName(item.text) && items.some((other) => isQty(other.text) && Math.abs(other.y - item.y) < 3));
+    let top = Infinity;
+    if (nameHead) {
+      const header = items.filter((item) => Math.abs(item.y - nameHead.y) < 3).sort((a, b) => a.x - b.x);
+      columns = header.map((cell, index) => {
+        const prev = header[index - 1];
+        const next = header[index + 1];
+        return {
+          text: cell.text,
+          from: prev ? (prev.x + prev.w + cell.x) / 2 : -Infinity,
+          to: next ? (cell.x + cell.w + next.x) / 2 : Infinity,
+        };
+      });
+      top = nameHead.y - 2;
+    }
+    if (!columns) continue;
+    const columnOf = (item) => columns.findIndex((column) => item.x + item.w / 2 >= column.from && item.x + item.w / 2 < column.to);
+    const nameAt = columns.findIndex((column) => isName(column.text));
+    const qtyAt = columns.findIndex((column) => isQty(column.text));
+    const unitAt = columns.findIndex((column) => /^(unit|uom|units)$/i.test(column.text));
+    const numberAt = columns.findIndex((column) => /^(#|s\.?\s*no\.?|sl\.?\s*no\.?|sr\.?\s*no\.?|no\.?)$/i.test(column.text));
+    const below = items.filter((item) => item.y < top);
+    // The table ends at its "Total" row.
+    const totalRow = below.filter((item) => /^(grand\s*)?total$/i.test(item.text)).sort((a, b) => b.y - a.y)[0];
+    const rows = below.filter((item) => !totalRow || item.y > totalRow.y + 2);
+    const anchors = rows.filter((item) => columnOf(item) === (numberAt >= 0 ? numberAt : qtyAt) && /^\d+(\.\d+)?$/.test(item.text)).sort((a, b) => b.y - a.y);
+    if (!anchors.length) continue;
+    const nearest = (item) => anchors.reduce((best, anchor) => (Math.abs(anchor.y - item.y) < Math.abs(best.y - item.y) ? anchor : best), anchors[0]);
+    const byRow = new Map(anchors.map((anchor) => [anchor, { name: [], qty: null, unit: null }]));
+    for (const item of rows) {
+      const column = columnOf(item);
+      const row = byRow.get(nearest(item));
+      if (column === nameAt) row.name.push(item);
+      else if (column === qtyAt && /^\d+(\.\d+)?$/.test(item.text.replace(/,/g, ""))) row.qty = row.qty ?? Number(item.text.replace(/,/g, ""));
+      else if (column === unitAt) row.unit = row.unit || item.text;
+    }
+    for (const anchor of anchors) {
+      const row = byRow.get(anchor);
+      const name = row.name.sort((a, b) => b.y - a.y || a.x - b.x).map((item) => item.text).join(" ").replace(/\s+/g, " ").trim();
+      if (!name || !(row.qty > 0)) continue;
+      const unit = String(row.unit || "").toLowerCase();
+      out.push({ name, qty: row.qty * (/^(dozen|doz)$/.test(unit) ? 12 : 1), unit: /^(kg|kgs)$/.test(unit) ? "kg" : "pcs" });
+    }
+  }
+  return out;
 }
 async function imageText(buffer) {
   const { createWorker } = await import("tesseract.js");
@@ -283,8 +357,12 @@ async function addDcMoves(dc) {
 
 export async function readDcFile({ buffer, mime, fileName, fileUrl, fromPhone, source, by }) {
   const isPdf = /pdf/i.test(mime || "") || /\.pdf$/i.test(fileName || "");
-  const text = isPdf ? await pdfText(buffer) : await imageText(buffer);
+  const pages = isPdf ? await pdfPages(buffer) : null;
+  const text = isPdf ? pagesText(pages) : await imageText(buffer);
   const parsed = parseDcText(text);
+  // A PDF's table read by its columns is surer than reading its text line by line.
+  const table = isPdf ? dcTableFromPages(pages) : [];
+  if (table.length) parsed.lines = table;
   if (!parsed.lines.length && isPdf) parsed.problem = "No items could be read";
   return saveDc({ parsed, fileUrl, fromPhone, source: isPdf ? source : `${source} (photo)`, by });
 }
@@ -673,7 +751,18 @@ export function registerLocationStockRoutes(app, { auth }) {
     const stock = await stockFor([Number(req.params.id)]);
     const location = stock.get(Number(req.params.id));
     if (!location) return res.status(404).json({ error: "Location not found" });
-    const { rows: dcs } = await db.query("SELECT id, ref, dc_date::text, units, jsonb_array_length(lines) AS items, source, file_url, created_at FROM stock_dcs WHERE location_id = $1 ORDER BY COALESCE(dc_at, created_at) DESC LIMIT 30", [location.id]);
+    const { rows: dcs } = await db.query(
+      `SELECT id, ref, dc_date::text, dc_at, units, lines, jsonb_array_length(lines) AS items, source, file_url, from_phone, by, created_at
+       FROM stock_dcs WHERE location_id = $1 AND status = 'added' ORDER BY COALESCE(dc_at, created_at) DESC LIMIT 50`,
+      [location.id]
+    );
+    // A DC from before the latest closing stock is already in that count (not added again).
+    const lastCount = location.last_count_at ? new Date(location.last_count_at) : null;
+    const productName = new Map((await items()).map((item) => [item.id, item.name]));
+    for (const dc of dcs) {
+      dc.in_count = Boolean(lastCount && new Date(dc.dc_at || dc.created_at) <= lastCount);
+      dc.lines = (dc.lines || []).map((line) => ({ name: line.name, qty: line.qty, unit: line.unit, product: productName.get(line.item_id) || null }));
+    }
     const { rows: counts } = await db.query(
       `SELECT at, (at AT TIME ZONE 'Asia/Kolkata')::date::text AS day, COUNT(*)::int AS items, SUM(qty) AS units, MAX(by) AS by
        FROM stock_moves WHERE location_id = $1 AND kind = 'count' AND ref LIKE 'warehouse%' GROUP BY at ORDER BY at DESC LIMIT 20`,
@@ -763,7 +852,9 @@ export function registerLocationStockRoutes(app, { auth }) {
     const file = req.body?.file || {};
     const buffer = Buffer.from(String(file.data || "").replace(/^data:[^,]+,/, ""), "base64");
     if (!buffer.length) return res.status(400).json({ error: "Choose the DC file" });
-    const dc = await readDcFile({ buffer, mime: file.type, fileName: file.name, fileUrl: null, fromPhone: null, source: "upload", by: who(req.user) });
+    // The DC itself is kept, to open from the dashboard.
+    const stored = await storeDashboardFile({ name: file.name || "DC.pdf", type: file.type || (/\.pdf$/i.test(file.name || "") ? "application/pdf" : "image/jpeg"), data: file.data }).catch(() => null);
+    const dc = await readDcFile({ buffer, mime: file.type, fileName: file.name, fileUrl: stored?.url || null, fromPhone: null, source: "upload", by: who(req.user) });
     res.json(dc);
   }));
 
