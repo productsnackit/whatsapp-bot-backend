@@ -25,6 +25,19 @@ import { sendPushToUsers } from "./pushNotifications.js";
 
 let db = null;
 let onChange = () => {};
+// Results are kept until something changes (a count, a DC, sales, a product or price), so the
+// pages open at once instead of working everything out again on every visit.
+let version = 0;
+const results = new Map();
+export function stockChanged() { version += 1; results.clear(); }
+const changed = () => { stockChanged(); changed(); };
+async function remembered(key, fn, ttl = 10 * 60000) {
+  const hit = results.get(key);
+  if (hit && hit.version === version && Date.now() - hit.at < ttl) return hit.value;
+  const value = await fn();
+  results.set(key, { version, at: Date.now(), value });
+  return value;
+}
 const IST = 330 * 60000;
 const istDay = (date = new Date()) => new Date(new Date(date).getTime() + IST).toISOString().slice(0, 10);
 const addDays = (date, days) => { const day = new Date(`${date}T00:00:00Z`); day.setUTCDate(day.getUTCDate() + days); return day.toISOString().slice(0, 10); };
@@ -134,7 +147,7 @@ async function mergeItems(from, into) {
   // DC lines keep pointing at the right item.
   await db.query(`UPDATE stock_dcs SET lines = (SELECT jsonb_agg(CASE WHEN (line->>'item_id')::int = $1 THEN jsonb_set(line, '{item_id}', to_jsonb($2::int)) ELSE line END) FROM jsonb_array_elements(lines) AS line) WHERE lines @> $3::jsonb`, [from, into, JSON.stringify([{ item_id: from }])]);
   itemCache.at = 0;
-  onChange();
+  changed();
   return { success: true };
 }
 
@@ -349,7 +362,7 @@ async function saveDc({ parsed, fileUrl, fromPhone, source, by, locationId = nul
     dc = rows[0];
   }
   if (status === "added") await addDcMoves(dc);
-  onChange();
+  changed();
   return dc;
 }
 
@@ -541,7 +554,7 @@ async function importProducts(rows) {
   }
   itemCache.at = 0;
   const linked = await linkNames();
-  onChange();
+  changed();
   return { products: rows.length, rows: rows.length, added, updated, linked };
 }
 
@@ -559,7 +572,7 @@ async function linkNames() {
     const match = sure(bestMatches(item.name, listed.filter((other) => !notSame.has(`${item.id}|${other.id}`)), { price: item.price }));
     if (match && !(await mergeItems(item.id, match.id)).error) linked += 1;
   }
-  if (linked) onChange();
+  if (linked) changed();
   return linked;
 }
 
@@ -675,7 +688,7 @@ export async function saveClosing({ locationId, at, day, lines, by, source, file
     "INSERT INTO stock_closings (location_id, at, day, lines, units, expired, value, source, file_name, note, by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *",
     [locationId, at, day, JSON.stringify(saved), units, expired, Math.round(value), source, fileName, note, by]
   );
-  onChange();
+  changed();
   return rows[0];
 }
 
@@ -688,23 +701,31 @@ async function stockFor(locationIds = null) {
     db.query("SELECT id, name, location_id FROM stock_machines WHERE location_id = ANY($1)", [ids]).catch(() => ({ rows: [] })),
     items(),
   ]);
-  const machineIds = machines.rows.map((machine) => machine.id);
-  const { rows: sales } = await db.query(
-    "SELECT day::text AS day, bucket, machine_id, product, SUM(qty)::int AS qty, SUM(amount)::float AS amount FROM stock_sales WHERE machine_id = ANY($1) GROUP BY day, bucket, machine_id, product ORDER BY day, bucket",
-    [machineIds]
-  ).catch(() => ({ rows: [] }));
+  // Only locations with stock data need their machines' sales, and only from their first count
+  // or DC on (and the last week, for "per day").
+  const tracked = new Set(moves.rows.map((move) => move.location_id));
+  const machineIds = machines.rows.filter((machine) => tracked.has(machine.location_id)).map((machine) => machine.id);
+  const firstDay = moves.rows[0]?.at ? addDays(istDay(moves.rows[0].at), -1) : istDay();
+  const { rows: sales } = machineIds.length ? await db.query(
+    `SELECT day::text AS day, bucket, machine_id, product, SUM(qty)::int AS qty, SUM(amount)::float AS amount FROM stock_sales
+     WHERE machine_id = ANY($1) AND day >= LEAST($2::date, COALESCE((SELECT MAX(day) FROM stock_sales WHERE machine_id = ANY($1)), $2::date) - 8)
+     GROUP BY day, bucket, machine_id, product ORDER BY day, bucket`,
+    [machineIds, firstDay]
+  ).catch(() => ({ rows: [] })) : { rows: [] };
   // Wendor product names → items (same cleaned name or remembered spelling; unknown names become items).
   const byKey = new Map();
   for (const item of itemRows) { byKey.set(item.key, item.id); for (const alias of item.aliases || []) byKey.set(alias, item.id); }
-  const unknown = [...new Set(sales.map((sale) => sale.product))].filter((product) => !byKey.has(cleanName(product)));
-  for (const product of unknown) byKey.set(cleanName(product), await itemFor(product));
+  const keyOf = new Map();
+  for (const sale of sales) if (!keyOf.has(sale.product)) keyOf.set(sale.product, cleanName(sale.product));
+  for (const [product, key] of keyOf) if (!byKey.has(key)) byKey.set(key, await itemFor(product));
+  for (const sale of sales) sale.item_id = byKey.get(keyOf.get(sale.product));
   const allItems = await items();
   const itemName = new Map(allItems.map((item) => [item.id, item.name]));
   // Price of a unit: the item's price (MRP), else what the machines sold it for on average.
   const itemPrice = new Map(allItems.filter((item) => item.price > 0).map((item) => [item.id, item]));
   const salePrice = new Map();
   for (const sale of sales) {
-    const id = byKey.get(cleanName(sale.product));
+    const id = sale.item_id;
     const sum = salePrice.get(id) || { qty: 0, amount: 0 };
     sum.qty += sale.qty; sum.amount += Number(sale.amount) || 0;
     salePrice.set(id, sum);
@@ -722,10 +743,24 @@ async function stockFor(locationIds = null) {
   const saleAt = (sale) => new Date(`${sale.day}T${String(Math.floor(sale.bucket / 6)).padStart(2, "0")}:${String((sale.bucket % 6) * 10).padStart(2, "0")}:00+05:30`);
   const lastSaleDay = sales.length ? sales[sales.length - 1].day : null;
 
+  // Grouped once by location (and by product inside it), not searched again for every product.
+  const movesBy = new Map();
+  for (const move of moves.rows) { if (!movesBy.has(move.location_id)) movesBy.set(move.location_id, []); movesBy.get(move.location_id).push(move); }
+  const salesBy = new Map();
+  for (const sale of sales) {
+    const place = machineLocation.get(sale.machine_id);
+    sale.at = saleAt(sale);
+    if (!salesBy.has(place)) salesBy.set(place, []);
+    salesBy.get(place).push(sale);
+  }
+  const groupBy = (rows) => { const out = new Map(); for (const row of rows) { if (!out.has(row.item_id)) out.set(row.item_id, []); out.get(row.item_id).push(row); } return out; };
+
   const result = new Map();
   for (const location of list) {
-    const locMoves = moves.rows.filter((move) => move.location_id === location.id);
-    const locSales = sales.filter((sale) => machineLocation.get(sale.machine_id) === location.id).map((sale) => ({ ...sale, at: saleAt(sale), item_id: byKey.get(cleanName(sale.product)) }));
+    const locMoves = movesBy.get(location.id) || [];
+    const locSales = salesBy.get(location.id) || [];
+    const movesOf = groupBy(locMoves);
+    const salesOf = groupBy(locSales);
     // Tracking starts at this location's first count or DC: sales before that don't count.
     const firstMove = locMoves[0]?.at ? new Date(locMoves[0].at) : null;
     // The latest closing stock (an uploaded count of the whole location).
@@ -734,8 +769,10 @@ async function stockFor(locationIds = null) {
     const itemIds = [...new Set([...locMoves.map((move) => move.item_id), ...locSales.filter((sale) => !firstMove || sale.at >= firstMove).map((sale) => sale.item_id)])];
     const salesDays = [...new Set(locSales.map((sale) => sale.day))].sort();
     const recentDays = salesDays.filter((day) => day > addDays(salesDays[salesDays.length - 1] || istDay(), -7));
+    const recentSet = new Set(recentDays);
     const rows = itemIds.map((itemId) => {
-      const ofItem = locMoves.filter((move) => move.item_id === itemId);
+      const ofItem = movesOf.get(itemId) || [];
+      const itemSales = salesOf.get(itemId) || [];
       const counts = ofItem.filter((move) => move.kind === "count");
       // The latest count; two names counted at the same time that are one product add up.
       let latest = counts[counts.length - 1] || null;
@@ -745,12 +782,12 @@ async function stockFor(locationIds = null) {
       const from = lastCount ? new Date(lastCount.at) : firstMove;
       const dcIn = ofItem.filter((move) => move.kind === "dc" && (!lastCount || new Date(move.at) > from)).reduce((sum, move) => sum + Number(move.qty), 0);
       const adjust = ofItem.filter((move) => move.kind === "adjust" && (!lastCount || new Date(move.at) > from)).reduce((sum, move) => sum + Number(move.qty), 0);
-      const soldSales = from ? locSales.filter((sale) => sale.item_id === itemId && sale.at >= from) : [];
+      const soldSales = from ? itemSales.filter((sale) => sale.at >= from) : [];
       const sold = soldSales.reduce((sum, sale) => sum + sale.qty, 0);
       const { price, from: priceFrom } = priceInfo(itemId);
       const base = lastCount ? Number(lastCount.qty) : 0;
       const raw = base + dcIn + adjust - sold;
-      const recentSold = locSales.filter((sale) => sale.item_id === itemId && recentDays.includes(sale.day)).reduce((sum, sale) => sum + sale.qty, 0);
+      const recentSold = itemSales.filter((sale) => recentSet.has(sale.day)).reduce((sum, sale) => sum + sale.qty, 0);
       const perDay = recentDays.length ? recentSold / recentDays.length : 0;
       const available = Math.max(0, raw);
       return {
@@ -797,7 +834,7 @@ export function registerLocationStockRoutes(app, { auth }) {
   };
 
   app.get("/locstock/overview", auth, guard, handle("LOCSTOCK OVERVIEW", async (req, res) => {
-    const stock = await stockFor();
+    const stock = await remembered("stock:all", () => stockFor());
     const { rows: inbox } = await db.query("SELECT COUNT(*)::int AS count FROM stock_dcs WHERE status <> 'added'");
     const { rows: machines } = await db.query("SELECT id, name, wendor_id, location_id FROM stock_machines ORDER BY name").catch(() => ({ rows: [] }));
     const { rows: uploads } = await db.query("SELECT id, file_name, day_from::text, day_to::text, sold, uploaded_by, uploaded_at FROM stock_uploads ORDER BY uploaded_at DESC LIMIT 5").catch(() => ({ rows: [] }));
@@ -808,7 +845,7 @@ export function registerLocationStockRoutes(app, { auth }) {
   }));
 
   app.get("/locstock/locations/:id", auth, guard, handle("LOCSTOCK LOCATION", async (req, res) => {
-    const stock = await stockFor([Number(req.params.id)]);
+    const stock = await remembered(`stock:${Number(req.params.id)}`, () => stockFor([Number(req.params.id)]));
     const location = stock.get(Number(req.params.id));
     if (!location) return res.status(404).json({ error: "Location not found" });
     const { rows: dcs } = await db.query(
@@ -837,7 +874,7 @@ export function registerLocationStockRoutes(app, { auth }) {
     if (Number.isNaN(at.getTime())) return res.status(400).json({ error: "Which closing stock?" });
     const { rowCount } = await db.query("DELETE FROM stock_moves WHERE location_id = $1 AND kind = 'count' AND ref LIKE 'warehouse%' AND at = $2", [req.params.id, at]);
     await db.query("DELETE FROM stock_closings WHERE location_id = $1 AND at = $2", [req.params.id, at]);
-    onChange();
+    changed();
     res.json({ removed: rowCount });
   }));
 
@@ -943,14 +980,14 @@ export function registerLocationStockRoutes(app, { auth }) {
     if (dc.party && req.body?.location_id) await db.query("INSERT INTO stock_party_links (party_key, location_id) VALUES ($1, $2) ON CONFLICT (party_key) DO UPDATE SET location_id = EXCLUDED.location_id", [partyKey(dc.party), locationId]);
     if (dc.ship_to && req.body?.location_id) await db.query("INSERT INTO stock_party_links (party_key, location_id) VALUES ($1, $2) ON CONFLICT (party_key) DO UPDATE SET location_id = EXCLUDED.location_id", [partyKey(dc.ship_to), locationId]);
     await addDcMoves(updated[0]);
-    onChange();
+    changed();
     res.json(updated[0]);
   }));
 
   app.delete("/locstock/dcs/:id", auth, guard, handle("LOCSTOCK DC DELETE", async (req, res) => {
     const { rows } = await db.query("DELETE FROM stock_dcs WHERE id = $1 RETURNING ref, id", [req.params.id]);
     if (rows[0]) await db.query("DELETE FROM stock_moves WHERE kind = 'dc' AND ref = $1", [rows[0].ref || `dc-${rows[0].id}`]);
-    onChange();
+    changed();
     res.json({ success: Boolean(rows[0]) });
   }));
 
@@ -962,7 +999,7 @@ export function registerLocationStockRoutes(app, { auth }) {
     const itemId = Number(req.body?.item_id) || (req.body?.name ? await itemFor(req.body.name) : null);
     if (!itemId) return res.status(400).json({ error: "Choose the item" });
     await db.query("INSERT INTO stock_moves (location_id, item_id, kind, qty, ref, by) VALUES ($1, $2, $3, $4, $5, $6)", [req.params.id, itemId, kind, qty, String(req.body?.note || kind).slice(0, 120), who(req.user)]);
-    onChange();
+    changed();
     res.json({ success: true });
   }));
 
@@ -995,7 +1032,7 @@ export function registerLocationStockRoutes(app, { auth }) {
     );
     if (!rowCount) return res.status(404).json({ error: "Item not found" });
     itemCache.at = 0;
-    onChange();
+    changed();
     res.json({ success: true });
   }));
 
@@ -1102,7 +1139,7 @@ export function registerLocationStockRoutes(app, { auth }) {
 
   // Every product, with where it is used, and what the admin should confirm.
   app.get("/locstock/products", auth, guard, handle("LOCSTOCK PRODUCTS", async (req, res) => {
-    res.json(await productsPage());
+    res.json(await remembered("products", () => productsPage()));
   }));
 
   // "These two are the same product": keep one (its name), and the price to use.
@@ -1125,6 +1162,7 @@ export function registerLocationStockRoutes(app, { auth }) {
     const b = Number(req.body?.b_id);
     if (!a || !b || a === b) return res.status(400).json({ error: "Choose two products" });
     await db.query("INSERT INTO stock_item_not_same (a, b) VALUES ($1, $2), ($2, $1) ON CONFLICT DO NOTHING", [a, b]);
+    stockChanged();
     res.json({ success: true });
   }));
 

@@ -22,6 +22,7 @@
 import XLSX from "xlsx";
 import { hasPage } from "./accessControl.js";
 import { matchSite } from "./siteMatcher.js";
+import { stockChanged } from "./locationStock.js";
 
 let db = null;
 const pad = (n) => String(n).padStart(2, "0");
@@ -398,6 +399,22 @@ export function registerMachineStockRoutes(app, { auth }) {
     try { await fn(req, res); } catch (err) { console.log(`${label} ERROR:`, err.message); res.status(err.message?.length < 160 ? 400 : 500).json({ error: err.message || "Server error" }); }
   };
 
+  // Pages are kept for a minute (refill times move the stock on), and at once after any change
+  // here (an upload, a refill time, a count…), which also changes the locations' stock.
+  let machinesVersion = 0;
+  const kept = new Map();
+  const keep = async (key, fn) => {
+    const hit = kept.get(key);
+    if (hit && hit.version === machinesVersion && Date.now() - hit.at < 60000) return hit.value;
+    const value = await fn();
+    kept.set(key, { version: machinesVersion, at: Date.now(), value });
+    return value;
+  };
+  app.use("/stock", (req, res, next) => {
+    if (req.method !== "GET") res.on("finish", () => { machinesVersion += 1; kept.clear(); stockChanged(); });
+    next();
+  });
+
   app.post("/stock/upload", auth, guard, handle("STOCK UPLOAD", async (req, res) => {
     const result = await importReport({ base64: req.body?.file?.data, fileName: req.body?.file?.name, by: who(req.user) });
     res.locals.activity = { section: "Refills", action: `Uploaded Wendor sales ${result.day_from === result.day_to ? plainDate(result.day_from) : `${plainDate(result.day_from)} to ${plainDate(result.day_to)}`} (${result.sold} items sold)` };
@@ -405,6 +422,7 @@ export function registerMachineStockRoutes(app, { auth }) {
   }));
 
   app.get("/stock/overview", auth, guard, handle("STOCK OVERVIEW", async (req, res) => {
+    res.json(await keep("overview", async () => {
     const data = await loadMachines();
     const machines = data.machines.map((machine) => stockOf(data, machine));
     const { rows: uploads } = await db.query("SELECT id, file_name, day_from::text, day_to::text, rows, sold, skipped, machines, uploaded_by, uploaded_at FROM stock_uploads ORDER BY uploaded_at DESC LIMIT 10");
@@ -412,16 +430,21 @@ export function registerMachineStockRoutes(app, { auth }) {
     // Everything running out, across machines (most urgent first).
     const alerts = machines.filter((machine) => machine.active).flatMap((machine) => machine.slots.filter((slot) => ["empty", "low"].includes(slot.status)).map((slot) => ({ machine_id: machine.id, machine: machine.name, location: machine.location_name, ...slot })))
       .sort((a, b) => (a.in_machine - b.in_machine) || ((a.days_left ?? 99) - (b.days_left ?? 99)));
-    res.json({ machines: machines.map(({ slots, refills, all_refills, ...rest }) => rest), alerts, uploads, locations, today: istDay() });
+    return { machines: machines.map(({ slots, refills, all_refills, ...rest }) => rest), alerts, uploads, locations, today: istDay() };
+    }));
   }));
 
   app.get("/stock/machines/:id", auth, guard, handle("STOCK MACHINE", async (req, res) => {
-    const data = await loadMachines(Number(req.params.id));
-    const machine = data.machines[0];
-    if (!machine) return res.status(404).json({ error: "Machine not found" });
-    const stock = stockOf(data, machine);
-    const { all_refills, ...rest } = stock;
-    res.json({ ...rest, history: historyOf(data, machine, stock) });
+    const result = await keep(`machine:${Number(req.params.id)}`, async () => {
+      const data = await loadMachines(Number(req.params.id));
+      const machine = data.machines[0];
+      if (!machine) return null;
+      const stock = stockOf(data, machine);
+      const { all_refills, ...rest } = stock;
+      return { ...rest, history: historyOf(data, machine, stock) };
+    });
+    if (!result) return res.status(404).json({ error: "Machine not found" });
+    res.json(result);
   }));
 
   // The machine's fixed refill days (0 = Sunday … 6 = Saturday) and time ("09:00").
