@@ -400,7 +400,21 @@ export function registerLocationStockRoutes(app, { auth }) {
     const location = stock.get(Number(req.params.id));
     if (!location) return res.status(404).json({ error: "Location not found" });
     const { rows: dcs } = await db.query("SELECT id, ref, dc_date::text, units, jsonb_array_length(lines) AS items, source, file_url, created_at FROM stock_dcs WHERE location_id = $1 ORDER BY COALESCE(dc_at, created_at) DESC LIMIT 30", [location.id]);
-    res.json({ ...location, dcs });
+    const { rows: counts } = await db.query(
+      `SELECT at, (at AT TIME ZONE 'Asia/Kolkata')::date::text AS day, COUNT(*)::int AS items, SUM(qty) AS units, MAX(by) AS by
+       FROM stock_moves WHERE location_id = $1 AND kind = 'count' AND ref LIKE 'warehouse%' GROUP BY at ORDER BY at DESC LIMIT 20`,
+      [location.id]
+    );
+    res.json({ ...location, dcs, counts });
+  }));
+
+  // Remove one closing stock of a location (e.g. uploaded with the wrong date).
+  app.delete("/locstock/locations/:id/counts", auth, guard, handle("LOCSTOCK COUNT DELETE", async (req, res) => {
+    const at = new Date(String(req.query.at || ""));
+    if (Number.isNaN(at.getTime())) return res.status(400).json({ error: "Which closing stock?" });
+    const { rowCount } = await db.query("DELETE FROM stock_moves WHERE location_id = $1 AND kind = 'count' AND ref LIKE 'warehouse%' AND at = $2", [req.params.id, at]);
+    onChange();
+    res.json({ removed: rowCount });
   }));
 
   // Warehouse data: an Excel with location, item and quantity (a count: it sets the stock).
@@ -412,6 +426,10 @@ export function registerLocationStockRoutes(app, { auth }) {
     if (!rows.length) return res.status(400).json({ error: "No rows found. The Excel needs columns for the item (Product) and the quantity." });
     const list = await locations();
     const chosen = Number(req.body?.location_id) || null;
+    // The day the closing stock was taken: it is the stock at the end of that day (sales from the
+    // next day are taken away). Default today.
+    const day = /^\d{4}-\d{2}-\d{2}$/.test(String(req.body?.date || "")) ? req.body.date : istDay();
+    if (day > istDay()) return res.status(400).json({ error: "The closing stock date can't be in the future" });
     if (chosen && !list.some((location) => location.id === chosen)) return res.status(400).json({ error: "Location not found" });
     // A location named in the file name or sheet name ("Bitgo_Closing_Stock.xlsx" → Bitgo).
     const named = (text) => {
@@ -440,18 +458,21 @@ export function registerLocationStockRoutes(app, { auth }) {
       total.expired += Math.min(row.expired, row.qty);
       totals.set(key, total);
     }
-    const at = new Date();
+    const at = new Date(`${day}T23:59:59+05:30`);
     const by = who(req.user);
+    // A closing stock replaces the earlier closing stocks uploaded for that location for the same
+    // day or a later one (e.g. one uploaded with the wrong date).
+    const places = [...new Set([...totals.values()].map((total) => total.locationId))];
+    await db.query("DELETE FROM stock_moves WHERE kind = 'count' AND ref LIKE 'warehouse%' AND location_id = ANY($1) AND at >= $2", [places, new Date(`${day}T00:00:00+05:30`)]);
     for (const total of totals.values()) {
       await db.query("INSERT INTO stock_moves (location_id, item_id, kind, qty, at, ref, raw_name, by) VALUES ($1, $2, 'count', $3, $4, $5, $6, $7)",
-        [total.locationId, total.itemId, Math.max(0, total.qty - total.expired), at, `warehouse ${istDay(at)}${total.expired ? ` (${total.expired} expired)` : ""}`, total.raw, by]);
+        [total.locationId, total.itemId, Math.max(0, total.qty - total.expired), at, `warehouse ${day}${total.expired ? ` (${total.expired} expired)` : ""}`, total.raw, by]);
     }
     onChange();
-    const places = [...new Set([...totals.values()].map((total) => total.locationId))];
     const names = list.filter((location) => places.includes(location.id)).map((location) => location.name);
     res.locals.activity = { section: "Refills", action: `Uploaded closing stock for ${names.join(", ") || "no location"} (${totals.size} items)` };
     res.json({
-      saved: totals.size, rows: rows.length, locations: places.length, location_names: names, unmatched: [...unmatched],
+      saved: totals.size, rows: rows.length, date: day, locations: places.length, location_names: names, unmatched: [...unmatched],
       units: [...totals.values()].reduce((sum, total) => sum + Math.max(0, total.qty - total.expired), 0),
       expired: [...totals.values()].reduce((sum, total) => sum + total.expired, 0),
     });
