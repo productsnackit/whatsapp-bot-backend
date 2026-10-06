@@ -52,6 +52,8 @@ export async function ensureLocationStock(database, { onChanged } = {}) {
     );
     CREATE UNIQUE INDEX IF NOT EXISTS stock_dcs_ref_idx ON stock_dcs (ref) WHERE ref IS NOT NULL;
     CREATE TABLE IF NOT EXISTS stock_party_links (party_key TEXT PRIMARY KEY, location_id INTEGER NOT NULL);
+    -- Price of one unit (MRP from closing stock, or set on the page), for stock values.
+    ALTER TABLE stock_items ADD COLUMN IF NOT EXISTS price NUMERIC, ADD COLUMN IF NOT EXISTS price_from TEXT;
   `);
 }
 
@@ -59,7 +61,7 @@ export async function ensureLocationStock(database, { onChanged } = {}) {
 let itemCache = { at: 0, rows: [] };
 async function items() {
   if (Date.now() - itemCache.at < 30000) return itemCache.rows;
-  const { rows } = await db.query("SELECT id, name, key, aliases, unit FROM stock_items ORDER BY name");
+  const { rows } = await db.query("SELECT id, name, key, aliases, unit, price::float AS price, price_from FROM stock_items ORDER BY name");
   itemCache = { at: Date.now(), rows };
   return rows;
 }
@@ -288,6 +290,7 @@ function readWarehouse(base64) {
       qty: find(/closing|balance|stock|qty|quantity|count/),
       unit: find(/^unit|uom/),
       expired: find(/expir|damage/),
+      price: find(/mrp|price|rate/),
     };
     if (col.item < 0 || col.qty < 0) continue;
     for (const row of sheet.slice(headerAt + 1)) {
@@ -295,9 +298,10 @@ function readWarehouse(base64) {
       if (/^(grand\s*)?total$/i.test(item)) continue;
       const qty = Number(String(row[col.qty] || "").replace(/[, ]/g, "")); // blank = none left
       const expired = col.expired >= 0 ? Number(String(row[col.expired] || "").replace(/[, ]/g, "")) || 0 : 0;
+      const price = col.price >= 0 ? Number(String(row[col.price] || "").replace(/[₹, ]/g, "")) || null : null;
       if (!item || Number.isNaN(qty)) continue;
       // No location column: the location is chosen on upload, or read from the file / sheet name.
-      out.push({ location: col.location >= 0 ? String(row[col.location] || "").trim() : null, sheet: sheetName, item, qty, expired, unit: col.unit >= 0 ? String(row[col.unit] || "").trim() : "" });
+      out.push({ location: col.location >= 0 ? String(row[col.location] || "").trim() : null, sheet: sheetName, item, qty, expired, price, unit: col.unit >= 0 ? String(row[col.unit] || "").trim() : "" });
     }
   }
   return out;
@@ -314,7 +318,7 @@ async function stockFor(locationIds = null) {
   ]);
   const machineIds = machines.rows.map((machine) => machine.id);
   const { rows: sales } = await db.query(
-    "SELECT day::text AS day, bucket, machine_id, product, SUM(qty)::int AS qty FROM stock_sales WHERE machine_id = ANY($1) GROUP BY day, bucket, machine_id, product ORDER BY day, bucket",
+    "SELECT day::text AS day, bucket, machine_id, product, SUM(qty)::int AS qty, SUM(amount)::float AS amount FROM stock_sales WHERE machine_id = ANY($1) GROUP BY day, bucket, machine_id, product ORDER BY day, bucket",
     [machineIds]
   ).catch(() => ({ rows: [] }));
   // Wendor product names → items (same cleaned name or remembered spelling; unknown names become items).
@@ -324,6 +328,24 @@ async function stockFor(locationIds = null) {
   for (const product of unknown) byKey.set(cleanName(product), await itemFor(product));
   const allItems = await items();
   const itemName = new Map(allItems.map((item) => [item.id, item.name]));
+  // Price of a unit: the item's price (MRP), else what the machines sold it for on average.
+  const itemPrice = new Map(allItems.filter((item) => item.price > 0).map((item) => [item.id, item]));
+  const salePrice = new Map();
+  for (const sale of sales) {
+    const id = byKey.get(cleanName(sale.product));
+    const sum = salePrice.get(id) || { qty: 0, amount: 0 };
+    sum.qty += sale.qty; sum.amount += Number(sale.amount) || 0;
+    salePrice.set(id, sum);
+  }
+  const avgSale = (id) => (salePrice.get(id)?.qty && salePrice.get(id).amount ? Math.round((salePrice.get(id).amount / salePrice.get(id).qty) * 100) / 100 : null);
+  // A closing-stock sheet's "Sum of MRP" can be added up over rows (330 for a ₹110 item): when the
+  // machines sell it for under half of that, their price is the one used. A price set on the page wins.
+  const priceInfo = (id) => {
+    const item = itemPrice.get(id);
+    const sale = avgSale(id);
+    if (item && !(item.price_from === "closing stock" && sale && item.price >= sale * 1.8)) return { price: item.price, from: item.price_from === "page" ? "page" : "mrp" };
+    return sale ? { price: sale, from: "sales" } : { price: null, from: null };
+  };
   const machineLocation = new Map(machines.rows.map((machine) => [machine.id, machine.location_id]));
   const saleAt = (sale) => new Date(`${sale.day}T${String(Math.floor(sale.bucket / 6)).padStart(2, "0")}:${String((sale.bucket % 6) * 10).padStart(2, "0")}:00+05:30`);
   const lastSaleDay = sales.length ? sales[sales.length - 1].day : null;
@@ -344,7 +366,9 @@ async function stockFor(locationIds = null) {
       const from = lastCount ? new Date(lastCount.at) : firstMove;
       const dcIn = ofItem.filter((move) => move.kind === "dc" && (!lastCount || new Date(move.at) > from)).reduce((sum, move) => sum + Number(move.qty), 0);
       const adjust = ofItem.filter((move) => move.kind === "adjust" && (!lastCount || new Date(move.at) > from)).reduce((sum, move) => sum + Number(move.qty), 0);
-      const sold = from ? locSales.filter((sale) => sale.item_id === itemId && sale.at >= from).reduce((sum, sale) => sum + sale.qty, 0) : 0;
+      const soldSales = from ? locSales.filter((sale) => sale.item_id === itemId && sale.at >= from) : [];
+      const sold = soldSales.reduce((sum, sale) => sum + sale.qty, 0);
+      const { price, from: priceFrom } = priceInfo(itemId);
       const base = lastCount ? Number(lastCount.qty) : 0;
       const raw = base + dcIn + adjust - sold;
       const recentSold = locSales.filter((sale) => sale.item_id === itemId && recentDays.includes(sale.day)).reduce((sum, sale) => sum + sale.qty, 0);
@@ -358,6 +382,11 @@ async function stockFor(locationIds = null) {
         per_day: Math.round(perDay * 10) / 10,
         days_left: perDay ? Math.round((available / perDay) * 10) / 10 : null,
         status: available <= 0 ? "out" : perDay && available / perDay < 2 ? "low" : "ok",
+        price, price_from: priceFrom,
+        value: price != null ? Math.round(available * price) : null, // stock value now
+        // What went out: the sales amount (a ₹0 sale, e.g. a free vend, at the item's price).
+        sold_value: Math.round(soldSales.reduce((sum, sale) => sum + (Number(sale.amount) || sale.qty * (price || 0)), 0)),
+        dc_value: price != null ? Math.round(dcIn * price) : null,
       };
     }).sort((a, b) => (a.status === "out") - (b.status === "out") || a.name.localeCompare(b.name));
     const locDcs = [...new Set(locMoves.filter((move) => move.kind === "dc").map((move) => move.ref))];
@@ -370,6 +399,10 @@ async function stockFor(locationIds = null) {
         out: rows.filter((row) => row.status === "out").length, low: rows.filter((row) => row.status === "low").length,
         short: rows.filter((row) => row.short > 0).length, per_day: Math.round(rows.reduce((sum, row) => sum + row.per_day, 0) * 10) / 10,
         dcs: locDcs.length,
+        value: rows.reduce((sum, row) => sum + (row.value || 0), 0),
+        sold_value: rows.reduce((sum, row) => sum + row.sold_value, 0),
+        dc_value: rows.reduce((sum, row) => sum + (row.dc_value || 0), 0),
+        no_price: rows.filter((row) => row.available > 0 && row.price == null).length,
       },
       last_count_at: lastCountAt, sales_to: salesDays[salesDays.length - 1] || null, last_sale_day: lastSaleDay,
     });
@@ -440,6 +473,7 @@ export function registerLocationStockRoutes(app, { auth }) {
     const cache = new Map();
     const unmatched = new Set();
     const totals = new Map(); // location|item → { qty, expired }
+    const prices = new Map(); // item → MRP in the sheet
     for (const row of rows) {
       let locationId = null;
       if (row.location) {
@@ -454,6 +488,7 @@ export function registerLocationStockRoutes(app, { auth }) {
       if (!itemId) continue;
       const key = `${locationId}|${itemId}`;
       const total = totals.get(key) || { locationId, itemId, raw: row.item, qty: 0, expired: 0 };
+      if (row.price > 0) prices.set(itemId, row.price);
       total.qty += row.qty;
       total.expired += Math.min(row.expired, row.qty);
       totals.set(key, total);
@@ -468,6 +503,9 @@ export function registerLocationStockRoutes(app, { auth }) {
       await db.query("INSERT INTO stock_moves (location_id, item_id, kind, qty, at, ref, raw_name, by) VALUES ($1, $2, 'count', $3, $4, $5, $6, $7)",
         [total.locationId, total.itemId, Math.max(0, total.qty - total.expired), at, `warehouse ${day}${total.expired ? ` (${total.expired} expired)` : ""}`, total.raw, by]);
     }
+    // The sheet's MRP becomes the item's price (unless someone set the price on the page).
+    for (const [itemId, price] of prices) await db.query("UPDATE stock_items SET price = $2, price_from = 'closing stock' WHERE id = $1 AND COALESCE(price_from, '') <> 'page'", [itemId, price]);
+    if (prices.size) itemCache.at = 0;
     onChange();
     const names = list.filter((location) => places.includes(location.id)).map((location) => location.name);
     res.locals.activity = { section: "Refills", action: `Uploaded closing stock for ${names.join(", ") || "no location"} (${totals.size} items)` };
@@ -559,9 +597,22 @@ export function registerLocationStockRoutes(app, { auth }) {
     if (!old || !rows.find((row) => row.id === into)) return res.status(404).json({ error: "Item not found" });
     await db.query("UPDATE stock_moves SET item_id = $2 WHERE item_id = $1", [from, into]);
     await db.query("UPDATE stock_items SET aliases = (SELECT ARRAY(SELECT DISTINCT unnest(aliases || $2::text[]))) WHERE id = $1", [into, [old.key, ...(old.aliases || [])]]);
+    if (old.price != null) await db.query("UPDATE stock_items SET price = $2, price_from = $3 WHERE id = $1 AND price IS NULL", [into, old.price, old.price_from]);
     await db.query("DELETE FROM stock_items WHERE id = $1", [from]);
     // DC lines keep pointing at the right item.
     await db.query(`UPDATE stock_dcs SET lines = (SELECT jsonb_agg(CASE WHEN (line->>'item_id')::int = $1 THEN jsonb_set(line, '{item_id}', to_jsonb($2::int)) ELSE line END) FROM jsonb_array_elements(lines) AS line) WHERE lines @> $3::jsonb`, [from, into, JSON.stringify([{ item_id: from }])]);
+    itemCache.at = 0;
+    onChange();
+    res.json({ success: true });
+  }));
+
+  // An item's price (one unit), used for stock values. Blank = back to the MRP / sales price.
+  app.patch("/locstock/items/:id", auth, guard, handle("LOCSTOCK ITEM", async (req, res) => {
+    const raw = String(req.body?.price ?? "").trim();
+    const price = raw === "" ? null : Number(raw);
+    if (price != null && (Number.isNaN(price) || price < 0)) return res.status(400).json({ error: "Enter the price" });
+    const { rowCount } = await db.query("UPDATE stock_items SET price = $2, price_from = $3 WHERE id = $1", [req.params.id, price, price == null ? null : "page"]);
+    if (!rowCount) return res.status(404).json({ error: "Item not found" });
     itemCache.at = 0;
     onChange();
     res.json({ success: true });
