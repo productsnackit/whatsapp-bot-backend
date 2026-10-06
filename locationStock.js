@@ -681,6 +681,9 @@ async function stockFor(locationIds = null) {
     const locSales = sales.filter((sale) => machineLocation.get(sale.machine_id) === location.id).map((sale) => ({ ...sale, at: saleAt(sale), item_id: byKey.get(cleanName(sale.product)) }));
     // Tracking starts at this location's first count or DC: sales before that don't count.
     const firstMove = locMoves[0]?.at ? new Date(locMoves[0].at) : null;
+    // The latest closing stock (an uploaded count of the whole location).
+    const closings = locMoves.filter((move) => move.kind === "count" && String(move.ref || "").startsWith("warehouse"));
+    const closingAt = closings.length ? new Date(closings[closings.length - 1].at) : null;
     const itemIds = [...new Set([...locMoves.map((move) => move.item_id), ...locSales.filter((sale) => !firstMove || sale.at >= firstMove).map((sale) => sale.item_id)])];
     const salesDays = [...new Set(locSales.map((sale) => sale.day))].sort();
     const recentDays = salesDays.filter((day) => day > addDays(salesDays[salesDays.length - 1] || istDay(), -7));
@@ -688,8 +691,10 @@ async function stockFor(locationIds = null) {
       const ofItem = locMoves.filter((move) => move.item_id === itemId);
       const counts = ofItem.filter((move) => move.kind === "count");
       // The latest count; two names counted at the same time that are one product add up.
-      const latest = counts[counts.length - 1] || null;
-      const lastCount = latest ? { ...latest, qty: counts.filter((move) => new Date(move.at).getTime() === new Date(latest.at).getTime()).reduce((sum, move) => sum + Number(move.qty), 0) } : null;
+      let latest = counts[counts.length - 1] || null;
+      let lastCount = latest ? { ...latest, qty: counts.filter((move) => new Date(move.at).getTime() === new Date(latest.at).getTime()).reduce((sum, move) => sum + Number(move.qty), 0) } : null;
+      // A closing stock covers the whole location: a product not in the latest one had none then.
+      if (closingAt && (!lastCount || new Date(lastCount.at) < closingAt)) { latest = { at: closingAt }; lastCount = { kind: "count", qty: 0, at: closingAt }; }
       const from = lastCount ? new Date(lastCount.at) : firstMove;
       const dcIn = ofItem.filter((move) => move.kind === "dc" && (!lastCount || new Date(move.at) > from)).reduce((sum, move) => sum + Number(move.qty), 0);
       const adjust = ofItem.filter((move) => move.kind === "adjust" && (!lastCount || new Date(move.at) > from)).reduce((sum, move) => sum + Number(move.qty), 0);
