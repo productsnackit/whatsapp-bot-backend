@@ -64,6 +64,13 @@ export async function ensureLocationStock(database, { onChanged } = {}) {
       ADD COLUMN IF NOT EXISTS price_options NUMERIC[] NOT NULL DEFAULT '{}';
     -- Two names the admin said are different products (not asked again).
     CREATE TABLE IF NOT EXISTS stock_item_not_same (a INTEGER NOT NULL, b INTEGER NOT NULL, PRIMARY KEY (a, b));
+    -- Each closing stock taken (on the Closing Stock page or uploaded), to look back and export.
+    CREATE TABLE IF NOT EXISTS stock_closings (
+      id SERIAL PRIMARY KEY, location_id INTEGER NOT NULL, at TIMESTAMPTZ NOT NULL, day DATE NOT NULL,
+      lines JSONB NOT NULL DEFAULT '[]', units NUMERIC NOT NULL DEFAULT 0, expired NUMERIC NOT NULL DEFAULT 0, value NUMERIC,
+      source TEXT, file_name TEXT, note TEXT, by TEXT, created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS stock_closings_loc_idx ON stock_closings (location_id, at);
   `);
   setTimeout(() => seedProductList().catch((err) => console.log("PRODUCT LIST SEED ERROR:", err.message)), 5000);
 }
@@ -632,6 +639,46 @@ async function productsPage() {
   };
 }
 
+/* ---------- Closing stock: saving one ---------- */
+// A closing stock of a location at a time: it replaces earlier closing stocks of that location
+// for the same day or a later one (e.g. one entered with the wrong date). lines: [{ itemId, name,
+// qty, expired, mrp }] — qty counted (expired included), expired not counted as stock.
+export async function saveClosing({ locationId, at, day, lines, by, source, fileName = null, note = null, mrpIsSheet = false }) {
+  const dayStart = new Date(`${day}T00:00:00+05:30`);
+  await db.query("DELETE FROM stock_moves WHERE kind = 'count' AND ref LIKE 'warehouse%' AND location_id = $1 AND at >= $2", [locationId, dayStart]);
+  await db.query("DELETE FROM stock_closings WHERE location_id = $1 AND at >= $2", [locationId, dayStart]);
+  const list = await items();
+  const priceOf = new Map(list.map((item) => [item.id, item]));
+  const saved = [];
+  // A product with nothing counted needs no line: not in the closing stock = none there.
+  for (const line of lines.filter((row) => Number(row.qty) > 0)) {
+    const good = Math.max(0, Number(line.qty) - Math.min(Number(line.expired) || 0, Number(line.qty)));
+    await db.query("INSERT INTO stock_moves (location_id, item_id, kind, qty, at, ref, raw_name, by) VALUES ($1, $2, 'count', $3, $4, $5, $6, $7)",
+      [locationId, line.itemId, good, at, `warehouse ${day}${line.expired ? ` (${line.expired} expired)` : ""}`, line.name, by]);
+    const item = priceOf.get(line.itemId);
+    const mrp = line.mrp != null && Number(line.mrp) > 0 ? Number(line.mrp) : null;
+    saved.push({ item_id: line.itemId, name: item?.name || line.name, qty: Number(line.qty), expired: Number(line.expired) || 0, mrp: mrp ?? item?.price ?? null });
+    if (mrp == null || !item) continue;
+    if (!item.in_list && !["page", "product list"].includes(item.price_from || "")) {
+      // A product not in the Product List takes the MRP written here.
+      await db.query("UPDATE stock_items SET price = $2, price_from = 'closing stock' WHERE id = $1", [item.id, mrp]);
+    } else if (!mrpIsSheet && item.in_list && !item.price_ok && item.price != null && Number(item.price) !== mrp) {
+      // A different MRP for a listed product: asked on the Product List ("prices to confirm").
+      await db.query("UPDATE stock_items SET price_options = (SELECT ARRAY(SELECT DISTINCT unnest(price_options || ARRAY[price, $2::numeric]))) WHERE id = $1", [item.id, mrp]);
+    }
+  }
+  itemCache.at = 0;
+  const units = saved.reduce((sum, line) => sum + line.qty - Math.min(line.expired, line.qty), 0);
+  const expired = saved.reduce((sum, line) => sum + Math.min(line.expired, line.qty), 0);
+  const value = saved.reduce((sum, line) => sum + (line.qty - Math.min(line.expired, line.qty)) * (line.mrp || 0), 0);
+  const { rows } = await db.query(
+    "INSERT INTO stock_closings (location_id, at, day, lines, units, expired, value, source, file_name, note, by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *",
+    [locationId, at, day, JSON.stringify(saved), units, expired, Math.round(value), source, fileName, note, by]
+  );
+  onChange();
+  return rows[0];
+}
+
 /* ---------- Working out the stock ---------- */
 async function stockFor(locationIds = null) {
   const list = (await locations()).filter((location) => !locationIds || locationIds.includes(location.id));
@@ -789,6 +836,7 @@ export function registerLocationStockRoutes(app, { auth }) {
     const at = new Date(String(req.query.at || ""));
     if (Number.isNaN(at.getTime())) return res.status(400).json({ error: "Which closing stock?" });
     const { rowCount } = await db.query("DELETE FROM stock_moves WHERE location_id = $1 AND kind = 'count' AND ref LIKE 'warehouse%' AND at = $2", [req.params.id, at]);
+    await db.query("DELETE FROM stock_closings WHERE location_id = $1 AND at = $2", [req.params.id, at]);
     onChange();
     res.json({ removed: rowCount });
   }));
@@ -841,23 +889,16 @@ export function registerLocationStockRoutes(app, { auth }) {
     const at = new Date(`${day}T${time}+05:30`);
     if (at > new Date()) return res.status(400).json({ error: "The closing stock time can't be in the future" });
     const by = who(req.user);
-    // A closing stock replaces the earlier closing stocks uploaded for that location for the same
-    // day or a later one (e.g. one uploaded with the wrong date).
     const places = [...new Set([...totals.values()].map((total) => total.locationId))];
-    await db.query("DELETE FROM stock_moves WHERE kind = 'count' AND ref LIKE 'warehouse%' AND location_id = ANY($1) AND at >= $2", [places, new Date(`${day}T00:00:00+05:30`)]);
-    for (const total of totals.values()) {
-      await db.query("INSERT INTO stock_moves (location_id, item_id, kind, qty, at, ref, raw_name, by) VALUES ($1, $2, 'count', $3, $4, $5, $6, $7)",
-        [total.locationId, total.itemId, Math.max(0, total.qty - total.expired), at, `warehouse ${day}${total.expired ? ` (${total.expired} expired)` : ""}`, total.raw, by]);
+    for (const place of places) {
+      const lines = [...totals.values()].filter((total) => total.locationId === place)
+        .map((total) => ({ itemId: total.itemId, name: total.raw, qty: total.qty, expired: total.expired, mrp: prices.get(total.itemId) ?? null }));
+      await saveClosing({ locationId: place, at, day, lines, by, source: "upload", fileName: req.body?.file?.name || null, mrpIsSheet: true });
     }
-    // The sheet's MRP becomes the item's price (unless someone set the price on the page).
-    // (The Product List's price and a price set on the page win over the sheet.)
-    for (const [itemId, price] of prices) await db.query("UPDATE stock_items SET price = $2, price_from = 'closing stock' WHERE id = $1 AND NOT in_list AND COALESCE(price_from, '') NOT IN ('page', 'product list')", [itemId, price]);
-    if (prices.size) itemCache.at = 0;
-    onChange();
     const names = list.filter((location) => places.includes(location.id)).map((location) => location.name);
     res.locals.activity = { section: "Refills", action: `Uploaded closing stock for ${names.join(", ") || "no location"} (${totals.size} items)` };
     res.json({
-      saved: totals.size, rows: rows.length, date: day, time: time.slice(0, 5), locations: places.length, location_names: names, unmatched: [...unmatched],
+      saved: [...totals.values()].filter((total) => total.qty > 0).length, rows: rows.length, date: day, time: time.slice(0, 5), locations: places.length, location_names: names, unmatched: [...unmatched],
       units: [...totals.values()].reduce((sum, total) => sum + Math.max(0, total.qty - total.expired), 0),
       expired: [...totals.values()].reduce((sum, total) => sum + total.expired, 0),
     });
@@ -956,6 +997,94 @@ export function registerLocationStockRoutes(app, { auth }) {
     itemCache.at = 0;
     onChange();
     res.json({ success: true });
+  }));
+
+  /* ---------- Closing Stock page ---------- */
+  // Products to count: the Product List first, then other names in use.
+  app.get("/locstock/catalog", auth, guard, handle("LOCSTOCK CATALOG", async (req, res) => {
+    itemCache.at = 0;
+    const list = await items();
+    res.json(list.map((item) => ({ id: item.id, name: item.name, price: item.price, brand: item.brand, in_list: item.in_list, wendor_ids: item.wendor_ids }))
+      .sort((a, b) => (b.in_list - a.in_list) || a.name.localeCompare(b.name)));
+  }));
+
+  // A closing stock entered on the page: it becomes that location's stock right away.
+  app.post("/locstock/closings", auth, guard, handle("LOCSTOCK CLOSING", async (req, res) => {
+    const list = await locations();
+    const locationId = Number(req.body?.location_id);
+    const location = list.find((row) => row.id === locationId);
+    if (!location) return res.status(400).json({ error: "Choose the location" });
+    const day = String(req.body?.date || "");
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return res.status(400).json({ error: "Choose the date of the closing stock" });
+    const time = /^([01]\d|2[0-3]):[0-5]\d$/.test(String(req.body?.time || "")) ? `${req.body.time}:00` : "23:59:59";
+    const at = new Date(`${day}T${time}+05:30`);
+    if (at > new Date(Date.now() + 5 * 60000)) return res.status(400).json({ error: "The closing stock time can't be in the future" });
+    const known = new Set((await items()).map((item) => item.id));
+    const merged = new Map();
+    for (const line of Array.isArray(req.body?.lines) ? req.body.lines.slice(0, 1000) : []) {
+      const qty = Number(line.qty);
+      if (line.qty === "" || line.qty == null || Number.isNaN(qty) || qty < 0) continue;
+      const itemId = Number(line.item_id) && known.has(Number(line.item_id)) ? Number(line.item_id) : (line.name ? await itemFor(line.name) : null);
+      if (!itemId) continue;
+      const entry = merged.get(itemId) || { itemId, name: line.name || "", qty: 0, expired: 0, mrp: null };
+      entry.qty += qty;
+      entry.expired += Math.max(0, Number(line.expired) || 0);
+      if (Number(line.mrp) > 0) entry.mrp = Number(line.mrp);
+      merged.set(itemId, entry);
+    }
+    if (!merged.size) return res.status(400).json({ error: "Enter the quantity of at least one product" });
+    const closing = await saveClosing({ locationId, at, day, lines: [...merged.values()], by: who(req.user), source: "page", note: String(req.body?.note || "").slice(0, 300) || null });
+    res.locals.activity = { section: "Refills", action: `Closing stock for ${location.name} on ${day} (${merged.size} products)` };
+    res.json({ ...closing, location_name: location.name });
+  }));
+
+  app.get("/locstock/closings", auth, guard, handle("LOCSTOCK CLOSINGS", async (req, res) => {
+    const locationId = Number(req.query.location_id) || null;
+    const { rows } = await db.query(
+      `SELECT c.id, c.location_id, l.name AS location_name, c.at, c.day::text AS day, jsonb_array_length(c.lines) AS products, c.units, c.expired, c.value, c.source, c.file_name, c.note, c.by, c.created_at
+       FROM stock_closings c LEFT JOIN audit_locations l ON l.id = c.location_id WHERE ($1::int IS NULL OR c.location_id = $1) ORDER BY c.at DESC LIMIT 100`,
+      [locationId]
+    );
+    res.json(rows);
+  }));
+
+  app.get("/locstock/closings/:id", auth, guard, handle("LOCSTOCK CLOSING ONE", async (req, res) => {
+    const { rows } = await db.query("SELECT c.*, c.day::text AS day, l.name AS location_name FROM stock_closings c LEFT JOIN audit_locations l ON l.id = c.location_id WHERE c.id = $1", [req.params.id]);
+    if (!rows[0]) return res.status(404).json({ error: "Not found" });
+    res.json(rows[0]);
+  }));
+
+  // Excel of a closing stock; or (id "sheet") a sheet to fill for a location: every product with
+  // its MRP and what Live Stock expects there now.
+  app.get("/locstock/closings/:id/export", auth, guard, handle("LOCSTOCK CLOSING EXPORT", async (req, res) => {
+    const book = XLSX.utils.book_new();
+    let name;
+    if (req.params.id === "sheet") {
+      const locationId = Number(req.query.location_id);
+      const location = (await locations()).find((row) => row.id === locationId);
+      if (!location) return res.status(400).json({ error: "Choose the location" });
+      const stock = (await stockFor([locationId])).get(locationId);
+      const expected = new Map((stock?.items || []).map((row) => [row.item_id, row.available]));
+      const list = (await items()).filter((item) => item.in_list || expected.has(item.id)).sort((a, b) => a.name.localeCompare(b.name));
+      const rows = [["Location", "Product", "Wendor ID", "MRP", "Expected now", "Quantity", "Expired"], ...list.map((item) => [location.name, item.name, (item.wendor_ids || []).join(", "), item.price ?? "", expected.get(item.id) ?? "", "", ""])];
+      XLSX.utils.book_append_sheet(book, XLSX.utils.aoa_to_sheet(rows), "Closing stock");
+      name = `Closing stock sheet - ${location.name}.xlsx`;
+    } else {
+      const { rows } = await db.query("SELECT c.*, c.day::text AS day, l.name AS location_name FROM stock_closings c LEFT JOIN audit_locations l ON l.id = c.location_id WHERE c.id = $1", [req.params.id]);
+      const closing = rows[0];
+      if (!closing) return res.status(404).json({ error: "Not found" });
+      const when = new Date(closing.at).toLocaleString("en-IN", { timeZone: "Asia/Kolkata", day: "numeric", month: "short", year: "numeric", hour: "numeric", minute: "2-digit" });
+      const lines = closing.lines || [];
+      const sheet = [
+        ["Closing stock", closing.location_name], ["Taken", when], ["By", closing.by || ""], [],
+        ["Product", "MRP", "Quantity", "Expired", "Good stock", "Value (₹)"],
+        ...lines.map((line) => { const good = line.qty - Math.min(line.expired, line.qty); return [line.name, line.mrp ?? "", line.qty, line.expired || 0, good, line.mrp != null ? good * line.mrp : ""]; }),
+        [], ["Total", "", lines.reduce((sum, line) => sum + line.qty, 0), Number(closing.expired), Number(closing.units), Number(closing.value || 0)],
+      ];
+      XLSX.utils.book_append_sheet(book, XLSX.utils.aoa_to_sheet(sheet), "Closing stock");
+      name = `Closing stock - ${closing.location_name} - ${closing.day}.xlsx`;
+    }
+    res.json({ name, data: XLSX.write(book, { type: "base64", bookType: "xlsx" }) });
   }));
 
   /* ---------- Product List ---------- */
