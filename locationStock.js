@@ -603,14 +603,22 @@ async function productsPage() {
     matches.push({ item: view(item), options: options.map((option) => ({ ...view(option), score: Math.round(option.score * 100) })) });
   }
   // 2. Two listed products that look like one (the list has some twice).
+  // (Pairs sharing at least two words are compared, whatever word they start with:
+  // "FAB BOURBON CHOCOLATE (20g)" and "PARLE FAB BOURBON (MRP-20)".)
   const duplicates = [];
-  for (let a = 0; a < listed.length; a += 1) {
-    for (let b = a + 1; b < listed.length; b += 1) {
-      if (listed[a].parts.words[0] !== listed[b].parts.words[0] && listed[a].parts.words[0]?.slice(0, 4) !== listed[b].parts.words[0]?.slice(0, 4)) continue;
-      if (notSame.has(`${listed[a].id}|${listed[b].id}`)) continue;
-      const score = similarity(listed[a].parts, listed[b].parts);
-      if (score >= 0.9) duplicates.push({ a: view(listed[a]), b: view(listed[b]), score: Math.round(score * 100) });
-    }
+  const byWord = new Map();
+  listed.forEach((item, index) => { for (const word of new Set(item.parts.words)) if (word.length >= 3) byWord.set(word, [...(byWord.get(word) || []), index]); });
+  const shared = new Map();
+  for (const indexes of byWord.values()) {
+    if (indexes.length > 60) continue; // a very common word ("chocolate") says little
+    for (let i = 0; i < indexes.length; i += 1) for (let j = i + 1; j < indexes.length; j += 1) { const key = `${indexes[i]}|${indexes[j]}`; shared.set(key, (shared.get(key) || 0) + 1); }
+  }
+  for (const [key, count] of shared) {
+    if (count < 2) continue;
+    const [a, b] = key.split("|").map(Number);
+    if (notSame.has(`${listed[a].id}|${listed[b].id}`)) continue;
+    const score = Math.max(similarity(listed[a].parts, listed[b].parts), similarity(listed[b].parts, listed[a].parts));
+    if (score >= 0.9) duplicates.push({ a: view(listed[a]), b: view(listed[b]), score: Math.round(score * 100) });
   }
   duplicates.sort((x, y) => y.score - x.score);
   // 3. Prices to confirm: two prices for one product, or no price for one in use.
@@ -793,6 +801,8 @@ export function registerLocationStockRoutes(app, { auth }) {
     // next day are taken away). Default today.
     const day = /^\d{4}-\d{2}-\d{2}$/.test(String(req.body?.date || "")) ? req.body.date : istDay();
     if (day > istDay()) return res.status(400).json({ error: "The closing stock date can't be in the future" });
+    // The time it was counted (India time); none = the end of that day.
+    const time = /^([01]\d|2[0-3]):[0-5]\d$/.test(String(req.body?.time || "")) ? `${req.body.time}:00` : "23:59:59";
     if (chosen && !list.some((location) => location.id === chosen)) return res.status(400).json({ error: "Location not found" });
     // A location named in the file name or sheet name ("Bitgo_Closing_Stock.xlsx" → Bitgo).
     const named = (text) => {
@@ -823,7 +833,8 @@ export function registerLocationStockRoutes(app, { auth }) {
       total.expired += Math.min(row.expired, row.qty);
       totals.set(key, total);
     }
-    const at = new Date(`${day}T23:59:59+05:30`);
+    const at = new Date(`${day}T${time}+05:30`);
+    if (at > new Date()) return res.status(400).json({ error: "The closing stock time can't be in the future" });
     const by = who(req.user);
     // A closing stock replaces the earlier closing stocks uploaded for that location for the same
     // day or a later one (e.g. one uploaded with the wrong date).
@@ -841,7 +852,7 @@ export function registerLocationStockRoutes(app, { auth }) {
     const names = list.filter((location) => places.includes(location.id)).map((location) => location.name);
     res.locals.activity = { section: "Refills", action: `Uploaded closing stock for ${names.join(", ") || "no location"} (${totals.size} items)` };
     res.json({
-      saved: totals.size, rows: rows.length, date: day, locations: places.length, location_names: names, unmatched: [...unmatched],
+      saved: totals.size, rows: rows.length, date: day, time: time.slice(0, 5), locations: places.length, location_names: names, unmatched: [...unmatched],
       units: [...totals.values()].reduce((sum, total) => sum + Math.max(0, total.qty - total.expired), 0),
       expired: [...totals.values()].reduce((sum, total) => sum + total.expired, 0),
     });

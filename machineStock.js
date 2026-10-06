@@ -130,11 +130,22 @@ export async function importReport({ base64, fileName, by }) {
     if (!when || !row.machineId) { skipped += 1; continue; }
     days.add(when.day);
     machines.set(row.machineId, row.machine || row.machineId);
-    const done = /^completed$/i.test(row.status) || /^vend_success$/i.test(row.comment);
+    // The item came out: "completed" or "vend complete", or any VEND_SUCCESS… note (…_NUDGES_1,
+    // …_MOTOR_NO_FEEDBACK). Failed, started and not started vends took nothing out.
+    const failed = /fail|not\s*started|^started$|cancel/i.test(`${row.status} ${row.comment}`) && !/^vend_success/i.test(row.comment);
+    const done = !failed && (/^(completed|vend\s*complete(d)?)$/i.test(row.status) || /^vend_success/i.test(row.comment));
     if (!done) { skipped += 1; continue; }
-    if (row.order && seen.has(row.order)) continue; // the same order twice in a file
-    if (row.order) seen.add(row.order);
-    vends.push({ ...when, order: row.order || null, wendor: row.machineId, position: row.position, product: row.product.replace(/\s+/g, " "), qty: Math.max(1, Math.round(Number(row.qty) || 1)), amount: Number(row.amount) || 0 });
+    // One order can have several items (one row each): each item is its own line. The same line
+    // twice in a file counts once.
+    const line = row.order ? `${row.order}#${row.position}#${row.product.replace(/\s+/g, " ").trim()}` : null;
+    if (line && seen.has(line)) continue;
+    if (line) seen.add(line);
+    // Before 6 Oct 2026 only an order's first row counting by the old rule was saved, under the
+    // order ID alone: that row is "already saved" for such orders.
+    const oldRule = /^completed$/i.test(row.status) || /^vend_success$/i.test(row.comment);
+    const firstOld = Boolean(row.order && oldRule && !seen.has(`old:${row.order}`));
+    if (firstOld) seen.add(`old:${row.order}`);
+    vends.push({ ...when, order: row.order || null, line, first_old: firstOld, wendor: row.machineId, position: row.position, product: row.product.replace(/\s+/g, " "), qty: Math.max(1, Math.round(Number(row.qty) || 1)), amount: Number(row.amount) || 0 });
   }
   if (!days.size) throw new Error("No dated rows found in the report.");
   const ids = new Map();
@@ -157,9 +168,9 @@ export async function importReport({ base64, fileName, by }) {
   // remembered, so overlapping reports (or a day uploaded half-way and again later) add only
   // the new orders. Days saved before orders were remembered count as complete.
   const known = new Set();
-  const orderIds = vends.filter((vend) => vend.order).map((vend) => vend.order);
-  for (let start = 0; start < orderIds.length; start += 10000) {
-    const { rows: found } = await db.query("SELECT order_id FROM stock_orders WHERE order_id = ANY($1)", [orderIds.slice(start, start + 10000)]);
+  const keys = [...new Set(vends.flatMap((vend) => (vend.order ? [vend.line, vend.order] : [])))];
+  for (let start = 0; start < keys.length; start += 10000) {
+    const { rows: found } = await db.query("SELECT order_id FROM stock_orders WHERE order_id = ANY($1)", [keys.slice(start, start + 10000)]);
     for (const row of found) known.add(row.order_id);
   }
   const { rows: oldDays } = await db.query(
@@ -172,7 +183,7 @@ export async function importReport({ base64, fileName, by }) {
   const hasDay = new Set(haveDays.map((row) => `${row.machine_id}|${row.day}`));
   const fresh = vends.filter((vend) => {
     const machineDay = `${ids.get(vend.wendor)}|${vend.day}`;
-    if (vend.order) return !known.has(vend.order) && !oldDay.has(machineDay);
+    if (vend.order) return !known.has(vend.line) && !(vend.first_old && known.has(vend.order)) && !oldDay.has(machineDay);
     return !hasDay.has(machineDay); // no order ID: only a day not saved yet
   });
   const already = vends.length - fresh.length;
@@ -207,7 +218,7 @@ export async function importReport({ base64, fileName, by }) {
     for (let start = 0; start < newOrders.length; start += 5000) {
       const batch = newOrders.slice(start, start + 5000);
       await client.query("INSERT INTO stock_orders (order_id, machine_id, day) SELECT * FROM unnest($1::text[], $2::int[], $3::date[]) ON CONFLICT DO NOTHING",
-        [batch.map((vend) => vend.order), batch.map((vend) => ids.get(vend.wendor)), batch.map((vend) => vend.day)]);
+        [batch.map((vend) => vend.line), batch.map((vend) => ids.get(vend.wendor)), batch.map((vend) => vend.day)]);
     }
     await client.query("COMMIT");
   } catch (err) {
