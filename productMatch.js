@@ -28,6 +28,11 @@ function editDistance(a, b) {
       diag = keep;
     }
   }
+  // Two letters swapped ("museli" / "muesli") count as one slip.
+  if (prev[b.length] === 2 && a.length === b.length) {
+    const diff = [...a].map((ch, i) => (ch === b[i] ? -1 : i)).filter((i) => i >= 0);
+    if (diff.length === 2 && diff[1] === diff[0] + 1 && a[diff[0]] === b[diff[1]] && a[diff[1]] === b[diff[0]]) return 1;
+  }
   return prev[b.length];
 }
 
@@ -62,6 +67,7 @@ function wordsMatch(x, y) {
   const short = x.length <= y.length ? x : y;
   const long = x.length <= y.length ? y : x;
   if (short.length >= 4 && long.length - short.length <= 4 && long.startsWith(short)) return true; // choco / chocolate (not milk / milkshake)
+  if (short.length === 3 && long.length === 4 && long.startsWith(short)) return true; // yum / yumm
   if (short.length >= 5) { // coke / cake are different
     const distance = editDistance(x, y);
     return distance <= 1 || (short.length >= 7 && distance <= 2 && x[0] === y[0]);
@@ -85,11 +91,12 @@ export function similarity(a, b) {
   return compare(a, b).score;
 }
 
-// { score, dice }: dice = words in common over all words (how alike the whole names are).
+// { score, dice, cover }: dice = words in common over all words (how alike the whole names are);
+// cover = share of the shorter name's words found in the other.
 function compare(a, b) {
   const pa = typeof a === "string" ? nameParts(a) : a;
   const pb = typeof b === "string" ? nameParts(b) : b;
-  const none = { score: 0, dice: 0 };
+  const none = { score: 0, dice: 0, cover: 0 };
   if (pa.sizes.length && pb.sizes.length && !pa.sizes.some((size) => pb.sizes.includes(size))) return none;
   const wa = joined(pa.words, pb.words);
   const wb = joined(pb.words, wa);
@@ -103,37 +110,59 @@ function compare(a, b) {
   const dice = (2 * matched) / (wa.length + wb.length);
   const cover = matched / Math.min(wa.length, wb.length);
   const round = (value) => Math.round(value * 1000) / 1000;
+  // The same pack size written in both names is a little closer.
+  const sameSize = pa.sizes.length && pb.sizes.length ? 0.03 : 0;
   // A one-word name ("Twix", "Coke") is only as close as the whole names are.
-  if (Math.min(wa.length, wb.length) === 1) return { score: round(dice), dice: round(dice) };
+  if (Math.min(wa.length, wb.length) === 1) return { score: round(dice), dice: round(dice), cover: round(matched / wa.length) };
   // One word in common is too little to say anything.
-  if (matched < 2) return { score: round(Math.min(dice, 0.4)), dice: round(dice) };
-  return { score: round(0.5 * dice + 0.5 * cover), dice: round(dice) };
+  if (matched < 2) return { score: round(Math.min(dice, 0.4)), dice: round(dice), cover: round(matched / wa.length) };
+  // cover here: how much of the name being matched (a) is in the product (b).
+  return { score: round(Math.min(1, 0.5 * dice + 0.5 * cover + sameSize)), dice: round(dice), cover: round(matched / wa.length) };
 }
 
 /* The best products for a name. candidates: [{ id, name, price, parts? }].
    price (optional): the price written with the name (a closing stock's MRP) — a product with the
    same price is preferred when names are equally close. */
-export function bestMatches(name, candidates, { price = null, limit = 3 } = {}) {
+export function bestMatches(name, candidates, { price = null, limit = 8 } = {}) {
   const parts = nameParts(name);
   return candidates
     .map((candidate) => {
       const result = compare(parts, candidate.parts || nameParts(candidate.name));
       let score = result.score;
-      if (score > 0 && price != null && candidate.price != null && Number(candidate.price) === Number(price)) score = Math.min(1, score + 0.05);
-      return { ...candidate, score: Math.round(score * 1000) / 1000, dice: result.dice };
+      const samePrice = price != null && candidate.price != null && Number(candidate.price) === Number(price);
+      if (score > 0 && samePrice) score = Math.min(1, score + 0.05);
+      return { ...candidate, score: Math.round(score * 1000) / 1000, dice: result.dice, cover: result.cover, same_price: samePrice, words: parts.words.length };
     })
     .filter((candidate) => candidate.score > 0)
     .sort((x, y) => y.score - x.score)
     .slice(0, limit);
 }
 
-// Safe to link without asking: very close, or close and well ahead of the next one.
+// Safe to link without asking (matches from bestMatches, best first):
+//   • very close, or close and well ahead of the next one — a product listed twice (two IDs,
+//     names nearly the same) is not "another one", the closest of them is taken;
+//   • or every word of the name is in exactly one product, at the same price as written with the
+//     name ("RITEBITE ALMOND MOCHA" ₹45 → "Rite Bite Sports Bar Almond Mocha …" ₹45).
 export function sure(matches) {
-  const [first, second] = matches;
-  if (!first) return null;
-  const lead = first.score - (second?.score || 0);
-  if (first.dice < 0.8) return null; // e.g. "Cocojal Coconut Water" vs "Cocojal Mango Tender Coconut Water": ask
-  if (first.score >= 0.92 && lead >= 0.05) return first;
-  if (first.score >= 0.85 && lead >= 0.15) return first;
-  return null;
+  if (!matches.length) return null;
+  // Prefer, among equally close ones, the same price as written with the name.
+  const ordered = [...matches].sort((x, y) => y.score - x.score || (y.same_price ? 1 : 0) - (x.same_price ? 1 : 0));
+  const first = ordered[0];
+  const isTwin = (a, b) => similarity(a.parts || a.name, b.parts || b.name) >= 0.93;
+  const rivals = ordered.slice(1).filter((other) => !isTwin(first, other));
+  const lead = first.score - (rivals[0]?.score || 0);
+  if (first.dice >= 0.8 && first.score >= 0.92 && lead >= 0.05) return first;
+  if (first.dice >= 0.8 && first.score >= 0.85 && lead >= 0.15) return first;
+  // Neck and neck, but only the first is at the written price ("DIET COKE CAN" ₹50 → "Diet Coke" ₹50).
+  if (first.dice >= 0.8 && first.score >= 0.9 && first.same_price && rivals.every((other) => !other.same_price || first.score - other.score >= 0.15)) return first;
+  // Every word found in one product only, at the written price, and no other product of that
+  // price comes close ("Cocojal Coconut Water" ₹60 has "Cocojal" and "Cocojal Mango" at ₹60: ask).
+  const whole = ordered.filter((match) => match.cover === 1 && match.words >= 2);
+  const groups = [];
+  for (const match of whole) if (!groups.some((group) => isTwin(group, match))) groups.push(match);
+  if (groups.length !== 1) return null;
+  const pick = whole.find((match) => match.same_price);
+  if (!pick) return null;
+  const close = ordered.filter((other) => other !== pick && !isTwin(pick, other) && other.same_price && other.score >= 0.5);
+  return close.length ? null : pick;
 }

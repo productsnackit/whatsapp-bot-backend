@@ -455,23 +455,38 @@ async function importProducts(rows) {
     }
   }
   itemCache.at = 0;
-  // Names already in use (closing stocks, DCs, Wendor sales) that surely are a listed product join it.
-  const fresh = await items();
-  const listed = fresh.filter((item) => item.in_list);
-  const notSame = await notSamePairs();
-  let linked = 0;
-  for (const item of fresh.filter((row) => !row.in_list)) {
-    const match = sure(bestMatches(item.name, listed.filter((other) => !notSame.has(`${item.id}|${other.id}`))));
-    if (match && !(await mergeItems(item.id, match.id)).error) linked += 1;
-  }
+  const linked = await linkNames();
   onChange();
   return { products: rows.length, rows: rows.length, added, updated, linked };
+}
+
+// Names in use (closing stocks, DCs, Wendor sales) that surely are a listed product join it
+// (their stock, sales and DCs move to it; the name is remembered). The price written with the
+// name (a closing stock's MRP) helps tell apart products that are otherwise alike.
+async function linkNames() {
+  itemCache.at = 0;
+  const all = await items();
+  const listed = all.filter((item) => item.in_list);
+  if (!listed.length) return 0;
+  const notSame = await notSamePairs();
+  let linked = 0;
+  for (const item of all.filter((row) => !row.in_list)) {
+    const match = sure(bestMatches(item.name, listed.filter((other) => !notSame.has(`${item.id}|${other.id}`)), { price: item.price }));
+    if (match && !(await mergeItems(item.id, match.id)).error) linked += 1;
+  }
+  if (linked) onChange();
+  return linked;
 }
 
 // The product list shared on 6 Oct 2026 goes in once by itself (productListData.js).
 async function seedProductList() {
   const { rows } = await db.query("SELECT 1 FROM app_settings WHERE key = 'product_list_236_loaded'").catch(() => ({ rows: [] }));
-  if (rows.length) return;
+  if (rows.length) {
+    // Already loaded: link any names that are surely a listed product (matching may have improved).
+    const linked = await linkNames();
+    if (linked) console.log(`🏷️ Product List: linked ${linked} more names`);
+    return;
+  }
   const { PRODUCT_LIST_236 } = await import("./productListData.js");
   const result = await importProducts(PRODUCT_LIST_236.map(([id, name, price, brand]) => ({ id, name, price, brand })));
   await db.query("INSERT INTO app_settings (key, value, updated_at) VALUES ('product_list_236_loaded', $1, NOW()) ON CONFLICT (key) DO NOTHING", [JSON.stringify(result)]);
