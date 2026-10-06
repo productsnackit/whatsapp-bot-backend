@@ -17,6 +17,7 @@ import XLSX from "xlsx";
 import { hasPage } from "./accessControl.js";
 import { matchSite, normaliseText } from "./siteMatcher.js";
 import { cleanName, displayName, likeness } from "./supplyParse.js";
+import { bestMatches, nameParts, similarity, sure } from "./productMatch.js";
 import { storeIncomingMedia } from "./ticketChat.js";
 import { sendWhatsApp } from "./whatsapp.js";
 import { noteInbound } from "./whatsappOutbox.js";
@@ -54,6 +55,15 @@ export async function ensureLocationStock(database, { onChanged } = {}) {
     CREATE TABLE IF NOT EXISTS stock_party_links (party_key TEXT PRIMARY KEY, location_id INTEGER NOT NULL);
     -- Price of one unit (MRP from closing stock, or set on the page), for stock values.
     ALTER TABLE stock_items ADD COLUMN IF NOT EXISTS price NUMERIC, ADD COLUMN IF NOT EXISTS price_from TEXT;
+    -- The Product List (Wendor's active products): the master names every other name links to.
+    ALTER TABLE stock_items
+      ADD COLUMN IF NOT EXISTS in_list BOOLEAN NOT NULL DEFAULT FALSE,
+      ADD COLUMN IF NOT EXISTS wendor_ids TEXT[] NOT NULL DEFAULT '{}',
+      ADD COLUMN IF NOT EXISTS brand TEXT,
+      ADD COLUMN IF NOT EXISTS price_ok BOOLEAN NOT NULL DEFAULT FALSE,
+      ADD COLUMN IF NOT EXISTS price_options NUMERIC[] NOT NULL DEFAULT '{}';
+    -- Two names the admin said are different products (not asked again).
+    CREATE TABLE IF NOT EXISTS stock_item_not_same (a INTEGER NOT NULL, b INTEGER NOT NULL, PRIMARY KEY (a, b));
   `);
 }
 
@@ -61,23 +71,63 @@ export async function ensureLocationStock(database, { onChanged } = {}) {
 let itemCache = { at: 0, rows: [] };
 async function items() {
   if (Date.now() - itemCache.at < 30000) return itemCache.rows;
-  const { rows } = await db.query("SELECT id, name, key, aliases, unit, price::float AS price, price_from FROM stock_items ORDER BY name");
+  const { rows } = await db.query(
+    `SELECT id, name, key, aliases, unit, price::float AS price, price_from, in_list, wendor_ids, brand, price_ok,
+       ARRAY(SELECT unnest(price_options)::float) AS price_options FROM stock_items ORDER BY name`
+  );
+  for (const row of rows) row.parts = nameParts(row.name);
   itemCache = { at: Date.now(), rows };
   return rows;
 }
-// The item for a name: same cleaned name or a remembered spelling; else a new item.
-export async function itemFor(name, unit = null) {
+// The item for a name: same cleaned name or a remembered spelling; else the Product List product
+// it surely is (spelling slips, short names — see productMatch.js), remembered as its spelling;
+// else a new item, which the Product List page asks the admin about.
+export async function itemFor(name, unit = null, { price = null } = {}) {
   const key = cleanName(name);
   if (!key) return null;
   const list = await items();
   const found = list.find((item) => item.key === key || (item.aliases || []).includes(key));
   if (found) return found.id;
+  const match = sure(bestMatches(name, list.filter((item) => item.in_list), { price }));
+  if (match) {
+    await db.query("UPDATE stock_items SET aliases = array_append(aliases, $2) WHERE id = $1 AND NOT ($2 = ANY(aliases))", [match.id, key]);
+    itemCache.at = 0;
+    return match.id;
+  }
   const { rows } = await db.query(
     "INSERT INTO stock_items (name, key, unit) VALUES ($1, $2, $3) ON CONFLICT (key) DO UPDATE SET key = EXCLUDED.key RETURNING id",
     [displayName(name).slice(0, 160), key, unit]
   );
   itemCache.at = 0;
   return rows[0].id;
+}
+
+// Two names are one product: everything of "from" moves to "into", whose name stays; "from"'s
+// spellings are remembered for "into".
+async function mergeItems(from, into) {
+  if (!from || !into || from === into) return { error: "Choose two different items" };
+  const { rows } = await db.query("SELECT * FROM stock_items WHERE id = ANY($1)", [[from, into]]);
+  const old = rows.find((row) => row.id === from);
+  const keep = rows.find((row) => row.id === into);
+  if (!old || !keep) return { error: "Item not found" };
+  await db.query("UPDATE stock_moves SET item_id = $2 WHERE item_id = $1", [from, into]);
+  await db.query(
+    `UPDATE stock_items SET aliases = (SELECT ARRAY(SELECT DISTINCT unnest(aliases || $2::text[]))),
+       wendor_ids = (SELECT ARRAY(SELECT DISTINCT unnest(wendor_ids || $3::text[]))), in_list = in_list OR $4,
+       brand = COALESCE(brand, $5), price_options = (SELECT ARRAY(SELECT DISTINCT unnest(price_options || $6::numeric[])))
+     WHERE id = $1`,
+    [into, [old.key, ...(old.aliases || [])], old.wendor_ids || [], old.in_list, old.brand, old.in_list && old.price != null ? [old.price] : []]
+  );
+  if (old.price != null) await db.query("UPDATE stock_items SET price = $2, price_from = $3 WHERE id = $1 AND price IS NULL", [into, old.price, old.price_from]);
+  // Two Product List products with different prices: the admin confirms which.
+  await db.query("UPDATE stock_items SET price_ok = FALSE WHERE id = $1 AND array_length(price_options, 1) > 1 AND NOT price_ok", [into]);
+  await db.query("DELETE FROM stock_items WHERE id = $1", [from]);
+  await db.query("DELETE FROM stock_item_not_same WHERE a = $1 OR b = $1", [from]);
+  // DC lines keep pointing at the right item.
+  await db.query(`UPDATE stock_dcs SET lines = (SELECT jsonb_agg(CASE WHEN (line->>'item_id')::int = $1 THEN jsonb_set(line, '{item_id}', to_jsonb($2::int)) ELSE line END) FROM jsonb_array_elements(lines) AS line) WHERE lines @> $3::jsonb`, [from, into, JSON.stringify([{ item_id: from }])]);
+  itemCache.at = 0;
+  onChange();
+  return { success: true };
 }
 
 /* ---------- Locations ---------- */
@@ -307,6 +357,152 @@ function readWarehouse(base64) {
   return out;
 }
 
+/* ---------- Product List ---------- */
+function productsFromExcel(buffer) {
+  const workbook = XLSX.read(buffer, { type: "buffer" });
+  const out = [];
+  for (const sheetName of workbook.SheetNames) {
+    const sheet = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { header: 1, defval: "", raw: false });
+    const headerAt = sheet.findIndex((row) => row.some((cell) => /product\s*name|item\s*name/i.test(String(cell))));
+    if (headerAt < 0) continue;
+    const header = sheet[headerAt].map((cell) => String(cell).trim().toLowerCase());
+    const col = {
+      id: header.findIndex((cell) => /^(product\s*)?id$|product\s*code|sku/.test(cell)),
+      name: header.findIndex((cell) => /product\s*name|item\s*name/.test(cell)),
+      price: header.findIndex((cell) => /price|mrp|rate/.test(cell)),
+      brand: header.findIndex((cell) => /brand\s*name|^brand$/.test(cell)),
+      status: header.findIndex((cell) => /^status$/.test(cell)),
+    };
+    for (const row of sheet.slice(headerAt + 1)) {
+      const name = String(row[col.name] || "").replace(/\s+/g, " ").trim();
+      if (!name) continue;
+      if (col.status >= 0 && /^(false|inactive|no)$/i.test(String(row[col.status]).trim())) continue;
+      const price = Number(String(row[col.price] ?? "").replace(/[₹, ]/g, ""));
+      out.push({ id: col.id >= 0 ? String(row[col.id] || "").trim() || null : null, name, price: price > 0 ? price : null, brand: col.brand >= 0 ? String(row[col.brand] || "").trim() || null : null });
+    }
+  }
+  return out;
+}
+
+// Wendor's "Product Active List" PDF: "25823  Coca-Cola Zero Sugar Can (300ml)  40  28  1344010  Universal  True …";
+// a long name wraps onto the next line.
+function productsFromPdf(text) {
+  const out = [];
+  for (const line of String(text || "").split("\n").map((item) => item.trim()).filter(Boolean)) {
+    const cells = line.split(/\s{2,}/);
+    if (/^\d{4,7}$/.test(cells[0]) && cells[1] && /[a-z]/i.test(cells[1])) {
+      const price = Number(String(cells[2] || "").replace(/[₹,]/g, ""));
+      const brandAt = cells.findIndex((cell, index) => index > 2 && /^\d{6,8}$/.test(cell));
+      out.push({ id: cells[0], name: cells[1].trim(), price: price > 0 ? price : null, brand: brandAt > 0 ? cells[brandAt + 1] || null : null });
+    } else if (out.length && cells.length === 1 && /^[a-z(]/i.test(line) && !/product (active )?list|page \d|product id/i.test(line)) {
+      out[out.length - 1].name = `${out[out.length - 1].name} ${line}`.trim(); // the name's second line
+    }
+  }
+  return out;
+}
+
+async function importProducts(rows) {
+  // The list itself can have one product twice (same name, sometimes two prices).
+  const groups = new Map();
+  for (const row of rows) {
+    const key = cleanName(row.name);
+    if (!key) continue;
+    const group = groups.get(key) || { key, name: row.name, ids: [], prices: [], brand: row.brand };
+    if (row.id) group.ids.push(row.id);
+    if (row.price != null && !group.prices.includes(row.price)) group.prices.push(row.price);
+    group.brand = group.brand || row.brand;
+    groups.set(key, group);
+  }
+  let added = 0;
+  let updated = 0;
+  for (const group of groups.values()) {
+    const list = await items();
+    const found = list.find((item) => item.key === group.key || (item.aliases || []).includes(group.key) || (group.ids.length && (item.wendor_ids || []).some((id) => group.ids.includes(id))));
+    const twoPrices = group.prices.length > 1;
+    if (found) {
+      await db.query(
+        `UPDATE stock_items SET in_list = TRUE, name = CASE WHEN in_list THEN name ELSE $2 END,
+           wendor_ids = (SELECT ARRAY(SELECT DISTINCT unnest(wendor_ids || $3::text[]))), brand = COALESCE($4, brand),
+           price = CASE WHEN COALESCE(price_from, '') = 'page' THEN price ELSE $5 END,
+           price_from = CASE WHEN COALESCE(price_from, '') = 'page' THEN price_from WHEN $5 IS NULL THEN price_from ELSE 'product list' END,
+           price_options = CASE WHEN $6 AND NOT price_ok THEN $7::numeric[] ELSE price_options END
+         WHERE id = $1`,
+        [found.id, displayName(group.name).slice(0, 160), group.ids, group.brand, group.prices[0] ?? found.price ?? null, twoPrices, group.prices]
+      );
+      updated += 1;
+    } else {
+      await db.query(
+        "INSERT INTO stock_items (name, key, in_list, wendor_ids, brand, price, price_from, price_options) VALUES ($1, $2, TRUE, $3, $4, $5, $6, $7) ON CONFLICT (key) DO NOTHING",
+        [displayName(group.name).slice(0, 160), group.key, group.ids, group.brand, group.prices[0] ?? null, group.prices.length ? "product list" : null, twoPrices ? group.prices : []]
+      );
+      added += 1;
+    }
+    itemCache.at = 0;
+  }
+  // Names already in use (closing stocks, DCs, Wendor sales) that surely are a listed product join it.
+  const list = await items();
+  const listed = list.filter((item) => item.in_list);
+  const notSame = await notSamePairs();
+  let linked = 0;
+  for (const item of list.filter((row) => !row.in_list)) {
+    const match = sure(bestMatches(item.name, listed.filter((other) => !notSame.has(`${item.id}|${other.id}`))));
+    if (match && !(await mergeItems(item.id, match.id)).error) linked += 1;
+  }
+  onChange();
+  return { products: groups.size, rows: rows.length, added, updated, linked };
+}
+
+async function notSamePairs() {
+  const { rows } = await db.query("SELECT a, b FROM stock_item_not_same");
+  return new Set(rows.map((row) => `${row.a}|${row.b}`));
+}
+
+// The Product List page: every product, where it's used, and what to confirm.
+async function productsPage() {
+  itemCache.at = 0;
+  const list = await items();
+  const notSame = await notSamePairs();
+  const [{ rows: moves }, { rows: sales }] = await Promise.all([
+    db.query("SELECT item_id, COUNT(DISTINCT location_id)::int AS locations, COUNT(*)::int AS entries FROM stock_moves GROUP BY item_id"),
+    db.query("SELECT product, SUM(qty)::int AS qty FROM stock_sales WHERE day >= CURRENT_DATE - 60 GROUP BY product").catch(() => ({ rows: [] })),
+  ]);
+  const byKey = new Map();
+  for (const item of list) { byKey.set(item.key, item.id); for (const alias of item.aliases || []) byKey.set(alias, item.id); }
+  const sold = new Map();
+  for (const sale of sales) { const id = byKey.get(cleanName(sale.product)); if (id) sold.set(id, (sold.get(id) || 0) + sale.qty); }
+  const used = new Map(moves.map((row) => [row.item_id, row]));
+  const view = (item) => ({
+    id: item.id, name: item.name, in_list: item.in_list, wendor_ids: item.wendor_ids, brand: item.brand, aliases: item.aliases,
+    price: item.price, price_from: item.price_from, price_ok: item.price_ok, price_options: item.price_options,
+    locations: used.get(item.id)?.locations || 0, sold_60d: sold.get(item.id) || 0,
+  });
+  const listed = list.filter((item) => item.in_list);
+  // 1. Names not in the Product List: which listed product is it?
+  const matches = [];
+  for (const item of list.filter((row) => !row.in_list)) {
+    const options = bestMatches(item.name, listed.filter((other) => !notSame.has(`${item.id}|${other.id}`)), { price: item.price, limit: 3 }).filter((option) => option.score >= 0.5);
+    matches.push({ item: view(item), options: options.map((option) => ({ ...view(option), score: Math.round(option.score * 100) })) });
+  }
+  // 2. Two listed products that look like one (the list has some twice).
+  const duplicates = [];
+  for (let a = 0; a < listed.length; a += 1) {
+    for (let b = a + 1; b < listed.length; b += 1) {
+      if (listed[a].parts.words[0] !== listed[b].parts.words[0] && listed[a].parts.words[0]?.slice(0, 4) !== listed[b].parts.words[0]?.slice(0, 4)) continue;
+      if (notSame.has(`${listed[a].id}|${listed[b].id}`)) continue;
+      const score = similarity(listed[a].parts, listed[b].parts);
+      if (score >= 0.9) duplicates.push({ a: view(listed[a]), b: view(listed[b]), score: Math.round(score * 100) });
+    }
+  }
+  duplicates.sort((x, y) => y.score - x.score);
+  // 3. Prices to confirm: two prices for one product, or no price for one in use.
+  const prices = list.filter((item) => (!item.price_ok && (item.price_options || []).length > 1) || (item.price == null && (used.has(item.id) || sold.has(item.id)))).map(view);
+  return {
+    products: list.map(view),
+    confirm: { matches: matches.sort((x, y) => (y.item.locations + y.item.sold_60d) - (x.item.locations + x.item.sold_60d)), duplicates, prices },
+    counts: { total: list.length, listed: listed.length, not_listed: list.length - listed.length },
+  };
+}
+
 /* ---------- Working out the stock ---------- */
 async function stockFor(locationIds = null) {
   const list = (await locations()).filter((location) => !locationIds || locationIds.includes(location.id));
@@ -343,7 +539,7 @@ async function stockFor(locationIds = null) {
   const priceInfo = (id) => {
     const item = itemPrice.get(id);
     const sale = avgSale(id);
-    if (item && !(item.price_from === "closing stock" && sale && item.price >= sale * 1.8)) return { price: item.price, from: item.price_from === "page" ? "page" : "mrp" };
+    if (item && !(item.price_from === "closing stock" && sale && item.price >= sale * 1.8)) return { price: item.price, from: item.price_from === "page" ? "page" : item.price_from === "product list" ? "list" : "mrp" };
     return sale ? { price: sale, from: "sales" } : { price: null, from: null };
   };
   const machineLocation = new Map(machines.rows.map((machine) => [machine.id, machine.location_id]));
@@ -362,7 +558,9 @@ async function stockFor(locationIds = null) {
     const rows = itemIds.map((itemId) => {
       const ofItem = locMoves.filter((move) => move.item_id === itemId);
       const counts = ofItem.filter((move) => move.kind === "count");
-      const lastCount = counts[counts.length - 1] || null;
+      // The latest count; two names counted at the same time that are one product add up.
+      const latest = counts[counts.length - 1] || null;
+      const lastCount = latest ? { ...latest, qty: counts.filter((move) => new Date(move.at).getTime() === new Date(latest.at).getTime()).reduce((sum, move) => sum + Number(move.qty), 0) } : null;
       const from = lastCount ? new Date(lastCount.at) : firstMove;
       const dcIn = ofItem.filter((move) => move.kind === "dc" && (!lastCount || new Date(move.at) > from)).reduce((sum, move) => sum + Number(move.qty), 0);
       const adjust = ofItem.filter((move) => move.kind === "adjust" && (!lastCount || new Date(move.at) > from)).reduce((sum, move) => sum + Number(move.qty), 0);
@@ -484,7 +682,7 @@ export function registerLocationStockRoutes(app, { auth }) {
         locationId = chosen || fromFile || named(row.sheet);
         if (!locationId) return res.status(400).json({ error: "Which location is this stock for? Choose it and upload again.", need_location: true });
       }
-      const itemId = await itemFor(row.item, row.unit);
+      const itemId = await itemFor(row.item, row.unit, { price: row.price });
       if (!itemId) continue;
       const key = `${locationId}|${itemId}`;
       const total = totals.get(key) || { locationId, itemId, raw: row.item, qty: 0, expired: 0 };
@@ -504,7 +702,8 @@ export function registerLocationStockRoutes(app, { auth }) {
         [total.locationId, total.itemId, Math.max(0, total.qty - total.expired), at, `warehouse ${day}${total.expired ? ` (${total.expired} expired)` : ""}`, total.raw, by]);
     }
     // The sheet's MRP becomes the item's price (unless someone set the price on the page).
-    for (const [itemId, price] of prices) await db.query("UPDATE stock_items SET price = $2, price_from = 'closing stock' WHERE id = $1 AND COALESCE(price_from, '') <> 'page'", [itemId, price]);
+    // (The Product List's price and a price set on the page win over the sheet.)
+    for (const [itemId, price] of prices) await db.query("UPDATE stock_items SET price = $2, price_from = 'closing stock' WHERE id = $1 AND NOT in_list AND COALESCE(price_from, '') NOT IN ('page', 'product list')", [itemId, price]);
     if (prices.size) itemCache.at = 0;
     onChange();
     const names = list.filter((location) => places.includes(location.id)).map((location) => location.name);
@@ -589,20 +788,8 @@ export function registerLocationStockRoutes(app, { auth }) {
   }));
 
   app.post("/locstock/items/merge", auth, guard, handle("LOCSTOCK MERGE", async (req, res) => {
-    const from = Number(req.body?.from_id);
-    const into = Number(req.body?.into_id);
-    if (!from || !into || from === into) return res.status(400).json({ error: "Choose two different items" });
-    const { rows } = await db.query("SELECT * FROM stock_items WHERE id = ANY($1)", [[from, into]]);
-    const old = rows.find((row) => row.id === from);
-    if (!old || !rows.find((row) => row.id === into)) return res.status(404).json({ error: "Item not found" });
-    await db.query("UPDATE stock_moves SET item_id = $2 WHERE item_id = $1", [from, into]);
-    await db.query("UPDATE stock_items SET aliases = (SELECT ARRAY(SELECT DISTINCT unnest(aliases || $2::text[]))) WHERE id = $1", [into, [old.key, ...(old.aliases || [])]]);
-    if (old.price != null) await db.query("UPDATE stock_items SET price = $2, price_from = $3 WHERE id = $1 AND price IS NULL", [into, old.price, old.price_from]);
-    await db.query("DELETE FROM stock_items WHERE id = $1", [from]);
-    // DC lines keep pointing at the right item.
-    await db.query(`UPDATE stock_dcs SET lines = (SELECT jsonb_agg(CASE WHEN (line->>'item_id')::int = $1 THEN jsonb_set(line, '{item_id}', to_jsonb($2::int)) ELSE line END) FROM jsonb_array_elements(lines) AS line) WHERE lines @> $3::jsonb`, [from, into, JSON.stringify([{ item_id: from }])]);
-    itemCache.at = 0;
-    onChange();
+    const result = await mergeItems(Number(req.body?.from_id), Number(req.body?.into_id));
+    if (result.error) return res.status(400).json(result);
     res.json({ success: true });
   }));
 
@@ -611,10 +798,54 @@ export function registerLocationStockRoutes(app, { auth }) {
     const raw = String(req.body?.price ?? "").trim();
     const price = raw === "" ? null : Number(raw);
     if (price != null && (Number.isNaN(price) || price < 0)) return res.status(400).json({ error: "Enter the price" });
-    const { rowCount } = await db.query("UPDATE stock_items SET price = $2, price_from = $3 WHERE id = $1", [req.params.id, price, price == null ? null : "page"]);
+    const { rowCount } = await db.query(
+      "UPDATE stock_items SET price = $2, price_from = $3, price_ok = $4, price_options = CASE WHEN $4 THEN '{}' ELSE price_options END WHERE id = $1",
+      [req.params.id, price, price == null ? null : "page", price != null]
+    );
     if (!rowCount) return res.status(404).json({ error: "Item not found" });
     itemCache.at = 0;
     onChange();
+    res.json({ success: true });
+  }));
+
+  /* ---------- Product List ---------- */
+  // Wendor's product list (Excel or PDF: Product ID, Product Name, Product Price, Brand Name).
+  app.post("/locstock/products/upload", auth, guard, handle("LOCSTOCK PRODUCTS UPLOAD", async (req, res) => {
+    const file = req.body?.file || {};
+    const buffer = Buffer.from(String(file.data || "").replace(/^data:[^,]+,/, ""), "base64");
+    if (!buffer.length) return res.status(400).json({ error: "Choose the product list file" });
+    const isPdf = /pdf/i.test(file.type || "") || /\.pdf$/i.test(file.name || "");
+    const rows = isPdf ? productsFromPdf(await pdfText(buffer)) : productsFromExcel(buffer);
+    if (!rows.length) return res.status(400).json({ error: "No products found. The file needs Product Name and Product Price columns." });
+    res.locals.activity = { section: "Refills", action: `Uploaded the product list (${rows.length} products)` };
+    res.json(await importProducts(rows));
+  }));
+
+  // Every product, with where it is used, and what the admin should confirm.
+  app.get("/locstock/products", auth, guard, handle("LOCSTOCK PRODUCTS", async (req, res) => {
+    res.json(await productsPage());
+  }));
+
+  // "These two are the same product": keep one (its name), and the price to use.
+  app.post("/locstock/products/same", auth, guard, handle("LOCSTOCK SAME", async (req, res) => {
+    const from = Number(req.body?.from_id);
+    const into = Number(req.body?.into_id);
+    const result = await mergeItems(from, into);
+    if (result.error) return res.status(400).json(result);
+    const price = req.body?.price === "" || req.body?.price == null ? null : Number(req.body.price);
+    if (price != null && !Number.isNaN(price) && price >= 0) {
+      await db.query("UPDATE stock_items SET price = $2, price_from = 'page', price_ok = TRUE, price_options = '{}' WHERE id = $1", [into, price]);
+      itemCache.at = 0;
+    }
+    res.locals.activity = { section: "Refills", action: `Product List: merged two names into one product (#${into})` };
+    res.json({ success: true });
+  }));
+
+  app.post("/locstock/products/not-same", auth, guard, handle("LOCSTOCK NOT SAME", async (req, res) => {
+    const a = Number(req.body?.a_id);
+    const b = Number(req.body?.b_id);
+    if (!a || !b || a === b) return res.status(400).json({ error: "Choose two products" });
+    await db.query("INSERT INTO stock_item_not_same (a, b) VALUES ($1, $2), ($2, $1) ON CONFLICT DO NOTHING", [a, b]);
     res.json({ success: true });
   }));
 
