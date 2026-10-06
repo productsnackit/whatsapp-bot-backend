@@ -287,13 +287,17 @@ function readWarehouse(base64) {
       item: find(/item|product|sku|name/, /location|site|client|company/),
       qty: find(/closing|balance|stock|qty|quantity|count/),
       unit: find(/^unit|uom/),
+      expired: find(/expir|damage/),
     };
     if (col.item < 0 || col.qty < 0) continue;
     for (const row of sheet.slice(headerAt + 1)) {
       const item = String(row[col.item] || "").trim();
-      const qty = Number(String(row[col.qty] || "").replace(/[, ]/g, ""));
+      if (/^(grand\s*)?total$/i.test(item)) continue;
+      const qty = Number(String(row[col.qty] || "").replace(/[, ]/g, "")); // blank = none left
+      const expired = col.expired >= 0 ? Number(String(row[col.expired] || "").replace(/[, ]/g, "")) || 0 : 0;
       if (!item || Number.isNaN(qty)) continue;
-      out.push({ location: col.location >= 0 ? String(row[col.location] || "").trim() : sheetName, item, qty, unit: col.unit >= 0 ? String(row[col.unit] || "").trim() : "" });
+      // No location column: the location is chosen on upload, or read from the file / sheet name.
+      out.push({ location: col.location >= 0 ? String(row[col.location] || "").trim() : null, sheet: sheetName, item, qty, expired, unit: col.unit >= 0 ? String(row[col.unit] || "").trim() : "" });
     }
   }
   return out;
@@ -400,29 +404,57 @@ export function registerLocationStockRoutes(app, { auth }) {
   }));
 
   // Warehouse data: an Excel with location, item and quantity (a count: it sets the stock).
+  // A closing-stock sheet for one location (e.g. "Bitgo Closing Stock": Product, Quantity, Expired)
+  // or for many (with a Location column). Expired units aren't counted as stock; the same product
+  // on two rows adds up.
   app.post("/locstock/warehouse", auth, guard, handle("LOCSTOCK WAREHOUSE", async (req, res) => {
     const rows = readWarehouse(req.body?.file?.data);
-    if (!rows.length) return res.status(400).json({ error: "No rows found. The Excel needs columns for location, item and quantity." });
+    if (!rows.length) return res.status(400).json({ error: "No rows found. The Excel needs columns for the item (Product) and the quantity." });
     const list = await locations();
+    const chosen = Number(req.body?.location_id) || null;
+    if (chosen && !list.some((location) => location.id === chosen)) return res.status(400).json({ error: "Location not found" });
+    // A location named in the file name or sheet name ("Bitgo_Closing_Stock.xlsx" → Bitgo).
+    const named = (text) => {
+      const key = ` ${partyKey(String(text || "").replace(/\.[a-z0-9]+$/i, "").replace(/[_-]+/g, " "))} `;
+      return list.filter((location) => partyKey(location.name) && key.includes(` ${partyKey(location.name)} `)).sort((a, b) => b.name.length - a.name.length)[0]?.id || null;
+    };
+    const fromFile = named(req.body?.file?.name);
+    const cache = new Map();
+    const unmatched = new Set();
+    const totals = new Map(); // location|item → { qty, expired }
+    for (const row of rows) {
+      let locationId = null;
+      if (row.location) {
+        if (!cache.has(row.location)) cache.set(row.location, list.find((location) => partyKey(location.name) === partyKey(row.location))?.id || await locationForParty(row.location));
+        locationId = cache.get(row.location);
+        if (!locationId) { unmatched.add(row.location); continue; }
+      } else {
+        locationId = chosen || fromFile || named(row.sheet);
+        if (!locationId) return res.status(400).json({ error: "Which location is this stock for? Choose it and upload again.", need_location: true });
+      }
+      const itemId = await itemFor(row.item, row.unit);
+      if (!itemId) continue;
+      const key = `${locationId}|${itemId}`;
+      const total = totals.get(key) || { locationId, itemId, raw: row.item, qty: 0, expired: 0 };
+      total.qty += row.qty;
+      total.expired += Math.min(row.expired, row.qty);
+      totals.set(key, total);
+    }
     const at = new Date();
     const by = who(req.user);
-    const unmatched = new Set();
-    let saved = 0;
-    const cache = new Map();
-    for (const row of rows) {
-      let locationId = cache.get(row.location);
-      if (locationId === undefined) {
-        locationId = list.find((location) => partyKey(location.name) === partyKey(row.location))?.id || await locationForParty(row.location);
-        cache.set(row.location, locationId || null);
-      }
-      if (!locationId) { unmatched.add(row.location); continue; }
+    for (const total of totals.values()) {
       await db.query("INSERT INTO stock_moves (location_id, item_id, kind, qty, at, ref, raw_name, by) VALUES ($1, $2, 'count', $3, $4, $5, $6, $7)",
-        [locationId, await itemFor(row.item, row.unit), row.qty, at, `warehouse ${istDay(at)}`, row.item, by]);
-      saved += 1;
+        [total.locationId, total.itemId, Math.max(0, total.qty - total.expired), at, `warehouse ${istDay(at)}${total.expired ? ` (${total.expired} expired)` : ""}`, total.raw, by]);
     }
     onChange();
-    res.locals.activity = { section: "Refills", action: `Uploaded warehouse stock (${saved} rows)` };
-    res.json({ saved, rows: rows.length, locations: cache.size - unmatched.size, unmatched: [...unmatched] });
+    const places = [...new Set([...totals.values()].map((total) => total.locationId))];
+    const names = list.filter((location) => places.includes(location.id)).map((location) => location.name);
+    res.locals.activity = { section: "Refills", action: `Uploaded closing stock for ${names.join(", ") || "no location"} (${totals.size} items)` };
+    res.json({
+      saved: totals.size, rows: rows.length, locations: places.length, location_names: names, unmatched: [...unmatched],
+      units: [...totals.values()].reduce((sum, total) => sum + Math.max(0, total.qty - total.expired), 0),
+      expired: [...totals.values()].reduce((sum, total) => sum + total.expired, 0),
+    });
   }));
 
   // A DC uploaded on the page (PDF or photo).
