@@ -26,6 +26,7 @@ import { ensureImageRetention, cleanOldImages, registerImageRetentionRoutes } fr
 import { registerAnalyticsOverview } from "./analyticsOverview.js";
 import { registerMachineRoutes } from "./machines.js";
 import { ensureMachineStock, registerMachineStockRoutes } from "./machineStock.js";
+import { ensureLocationStock, registerLocationStockRoutes, handleStockDcWhatsApp } from "./locationStock.js";
 import { initSupplyAnalytics, registerSupplyAnalyticsRoutes } from "./supplyAnalytics.js";
 import { registerFindingsRoutes } from "./findingsRoutes.js";
 import { registerExpiryRoutes } from "./expiryRoutes.js";
@@ -3329,6 +3330,7 @@ registerSupplyReportRoutes(app, { auth });
 registerSupplyBuyerRoutes(app, { auth });
 registerMachineRoutes(app, { auth });
 registerMachineStockRoutes(app, { auth });
+registerLocationStockRoutes(app, { auth });
 registerSupplyAnalyticsRoutes(app, { auth });
 registerSupplyChallanRoutes(app, { auth });
 registerCapaOverdueRoutes(app, { auth });
@@ -4072,6 +4074,13 @@ app.post("/webhook", async (req, res) => {
     // Anyone who messages us can get normal messages for 24 hours; after that only templates.
     await noteInbound(msg.from);
 
+    // DCs (PDF or photo) from the DC numbers in Live Stock → Settings add stock at that location.
+    try {
+      if (await handleStockDcWhatsApp(msg)) return res.sendStatus(200);
+    } catch (err) {
+      console.log("STOCK DC ERROR:", err.message);
+    }
+
     // Employees answer their Call Log tasks here (Started / Done / Forward, and a note after).
     try {
       if (await handleCallLogWhatsApp(msg)) return res.sendStatus(200);
@@ -4804,6 +4813,7 @@ try {
   initSupplyAnalytics(db);
   // Live Stock: what is in each vending machine (Wendor sales + refill photos).
   await ensureMachineStock(db).catch((err) => console.error("LIVE STOCK SETUP ERROR:", err.message));
+  await ensureLocationStock(db, { onChanged: () => io.emit("stock-changed") }).catch((err) => console.error("LOCATION STOCK SETUP ERROR:", err.message));
   initSupplyWhatsApp(db, { onChanged: () => io.emit("supply-changed") });
   // The master sheet goes to the buyer (Admin Settings) when all companies have ordered or at the cutoff.
   await ensureSupplyBuyer(db, { onChanged: () => io.emit("supply-changed") }).catch((err) => console.error("SUPPLY BUYER SETUP ERROR:", err.message));

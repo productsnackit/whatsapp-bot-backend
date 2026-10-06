@@ -20,6 +20,7 @@
 ========================================================= */
 import XLSX from "xlsx";
 import { hasPage } from "./accessControl.js";
+import { matchSite } from "./siteMatcher.js";
 
 let db = null;
 const pad = (n) => String(n).padStart(2, "0");
@@ -129,6 +130,11 @@ export async function importReport({ base64, fileName, by }) {
       [wendorId, name]
     );
     ids.set(wendorId, saved[0].id);
+    // Linked to its location (Refill Audit locations) by name, unless someone set it by hand.
+    if (!saved[0].location_id) {
+      const site = await matchSite(name).catch(() => null);
+      if (site?.site_match === "site" && site.site_id) await db.query("UPDATE stock_machines SET location_id = $2, linked_by = 'auto' WHERE id = $1 AND location_id IS NULL", [saved[0].id, site.site_id]);
+    }
   }
   const dayList = [...days].sort();
   // These days in this report replace whatever was uploaded for them before (for these machines).
