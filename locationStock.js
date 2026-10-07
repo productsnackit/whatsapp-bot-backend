@@ -1015,6 +1015,35 @@ export function registerLocationStockRoutes(app, { auth }) {
     res.json({ items: list, similar: similar.sort((x, y) => y.score - x.score).slice(0, 60) });
   }));
 
+  // Admin only: delete a product nobody uses. One counted, in a DC or sold by the machines is
+  // refused (its stock history would go, and Wendor sales would bring it back): join it to the
+  // right product instead ("Same as…").
+  app.delete("/locstock/items/:id", auth, guard, handle("LOCSTOCK ITEM DELETE", async (req, res) => {
+    if (!(req.user?.isAdmin || req.user?.role === "admin")) return res.status(403).json({ error: "Only an admin can delete a product" });
+    const id = Number(req.params.id);
+    const { rows } = await db.query("SELECT id, name, key, aliases FROM stock_items WHERE id = $1", [id]);
+    const item = rows[0];
+    if (!item) return res.status(404).json({ error: "Product not found" });
+    const { rows: used } = await db.query(
+      `SELECT (SELECT COUNT(*) FROM stock_moves WHERE item_id = $1)::int AS moves,
+              (SELECT COUNT(*) FROM stock_dcs WHERE lines @> $2::jsonb)::int AS dcs`,
+      [id, JSON.stringify([{ item_id: id }])]
+    );
+    const keys = [item.key, ...(item.aliases || [])];
+    const { rows: sales } = await db.query("SELECT DISTINCT product FROM stock_sales WHERE day >= CURRENT_DATE - 120").catch(() => ({ rows: [] }));
+    const sold = sales.some((sale) => keys.includes(cleanName(sale.product)));
+    if (used[0].moves || used[0].dcs || sold) {
+      const where = [used[0].moves ? "closing stock / counts" : "", used[0].dcs ? "DCs" : "", sold ? "Wendor sales" : ""].filter(Boolean).join(", ");
+      return res.status(400).json({ error: `“${item.name}” is used in ${where}, so it can't be deleted. If it's the same as another product, use “Same as…” to join them.` });
+    }
+    await db.query("DELETE FROM stock_items WHERE id = $1", [id]);
+    await db.query("DELETE FROM stock_item_not_same WHERE a = $1 OR b = $1", [id]);
+    itemCache.at = 0;
+    changed();
+    res.locals.activity = { section: "Refills", action: `Deleted product ${item.name}` };
+    res.json({ success: true });
+  }));
+
   app.post("/locstock/items/merge", auth, guard, handle("LOCSTOCK MERGE", async (req, res) => {
     const result = await mergeItems(Number(req.body?.from_id), Number(req.body?.into_id));
     if (result.error) return res.status(400).json(result);
