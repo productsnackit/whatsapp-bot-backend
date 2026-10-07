@@ -1085,6 +1085,20 @@ export function registerLocationStockRoutes(app, { auth }) {
     res.json(rows);
   }));
 
+  // Admin only: delete a closing stock (its count leaves Live Stock; the one before it, if any,
+  // counts again).
+  app.delete("/locstock/closings/:id", auth, guard, handle("LOCSTOCK CLOSING DELETE", async (req, res) => {
+    if (!(req.user?.isAdmin || req.user?.role === "admin")) return res.status(403).json({ error: "Only an admin can delete a closing stock" });
+    const { rows } = await db.query("DELETE FROM stock_closings WHERE id = $1 RETURNING location_id, at, day::text AS day", [req.params.id]);
+    const closing = rows[0];
+    if (!closing) return res.status(404).json({ error: "Not found" });
+    await db.query("DELETE FROM stock_moves WHERE location_id = $1 AND kind = 'count' AND ref LIKE 'warehouse%' AND at = $2", [closing.location_id, closing.at]);
+    changed();
+    const { rows: place } = await db.query("SELECT name FROM audit_locations WHERE id = $1", [closing.location_id]);
+    res.locals.activity = { section: "Refills", action: `Deleted the closing stock of ${place[0]?.name || "a location"} on ${closing.day}` };
+    res.json({ success: true });
+  }));
+
   app.get("/locstock/closings/:id", auth, guard, handle("LOCSTOCK CLOSING ONE", async (req, res) => {
     const { rows } = await db.query("SELECT c.*, c.day::text AS day, l.name AS location_name FROM stock_closings c LEFT JOIN audit_locations l ON l.id = c.location_id WHERE c.id = $1", [req.params.id]);
     if (!rows[0]) return res.status(404).json({ error: "Not found" });
