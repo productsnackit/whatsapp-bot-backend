@@ -827,7 +827,9 @@ async function stockFor(locationIds = null) {
 }
 
 export function registerLocationStockRoutes(app, { auth }) {
-  const guard = (req, res, next) => (hasPage(req.user, "refills") ? next() : res.status(403).json({ error: "No access to Live Stock" }));
+  // Which of Live Stock / Closing Stock / Product List a path needs is checked for every request
+  // (accessControl.js → canUsePath); here: at least one of them.
+  const guard = (req, res, next) => (["live_stock", "closing_stock", "product_list"].some((page) => hasPage(req.user, page)) ? next() : res.status(403).json({ error: "No access to Live Stock" }));
   const who = (user) => (user?.role === "admin" ? "Admin" : user?.name || user?.username || "Staff");
   const handle = (label, fn) => async (req, res) => {
     try { await fn(req, res); } catch (err) { console.log(`${label} ERROR:`, err.message); res.status(500).json({ error: err.message?.length < 160 ? err.message : "Server error" }); }

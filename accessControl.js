@@ -16,6 +16,9 @@ export const PAGES = {
   audit: "Refill Audit",
   findings: "Internal Audit",
   refills: "Refill Schedule",
+  live_stock: "Live Stock",
+  closing_stock: "Closing Stock",
+  product_list: "Product List",
   supply: "Fruits & Direct Supply",
   analytics: "Refund Analytics",
   activity: "Activity log",
@@ -29,7 +32,7 @@ export const ROLE_PRESETS = {
   admin: { label: "Admin", pages: ALL_PAGES, readOnly: false },
   support: { label: "Support agent", pages: ["tickets", "feedback", "products", "findings"], readOnly: false },
   quality: { label: "Quality auditor", pages: ["audit", "refills", "findings"], readOnly: false },
-  operations: { label: "Operations", pages: ["audit", "refills", "supply", "findings"], readOnly: false },
+  operations: { label: "Operations", pages: ["audit", "refills", "live_stock", "closing_stock", "product_list", "supply", "findings"], readOnly: false },
   staff: { label: "Staff", pages: ["findings"], readOnly: false },
   viewer: { label: "Viewer (read only)", pages: ALL_PAGES.filter((page) => !["settings", "activity"].includes(page)), readOnly: true },
 };
@@ -119,6 +122,14 @@ const PATH_RULES = [
   [/^\/findings(\/|$)/, ["findings"]],
   [/^\/expiry(\/|$)/, ["expiry"]],
   [/^\/refills(\/|$)/, ["refills"]],
+  // Stock: Live Stock (machines, DCs, uploads), Closing Stock (counting at a location: it also
+  // reads the locations and their expected stock), Product List (products and prices).
+  [/^\/stock(\/|$)/, ["live_stock"]],
+  [/^\/locstock\/(closings|catalog)(\/|$)/, ["closing_stock", "live_stock"]],
+  [/^\/locstock\/(overview|locations\/\d+)$/, (method) => (method === "GET" ? ["live_stock", "closing_stock"] : ["live_stock"])],
+  [/^\/locstock\/warehouse$/, ["live_stock", "closing_stock"]],
+  [/^\/locstock\/(products|items)(\/|$)/, ["product_list"]],
+  [/^\/locstock(\/|$)/, ["live_stock"]],
   [/^\/supply(\/|$)/, ["supply"]],
   [/^\/analytics\//, ["analytics", "operations", "tickets"]],
   [/^\/(operations|machines|inventory|host-sites|brands|skus|leads)(\/|$)/, ["operations"]],

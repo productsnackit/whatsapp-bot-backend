@@ -393,7 +393,7 @@ function historyOf(data, machine, stock) {
 }
 
 export function registerMachineStockRoutes(app, { auth }) {
-  const guard = (req, res, next) => (hasPage(req.user, "refills") ? next() : res.status(403).json({ error: "No access to Live Stock" }));
+  const guard = (req, res, next) => (hasPage(req.user, "live_stock") ? next() : res.status(403).json({ error: "No access to Live Stock" }));
   const who = (user) => (user?.role === "admin" ? "Admin" : user?.name || user?.username || "Staff");
   const handle = (label, fn) => async (req, res) => {
     try { await fn(req, res); } catch (err) { console.log(`${label} ERROR:`, err.message); res.status(err.message?.length < 160 ? 400 : 500).json({ error: err.message || "Server error" }); }
