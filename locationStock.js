@@ -90,6 +90,19 @@ export async function ensureLocationStock(database, { onChanged } = {}) {
 
 /* ---------- Items: one list for warehouse, DC and Wendor names ---------- */
 let itemCache = { at: 0, rows: [] };
+// Product names for reports: a Wendor name → its Product List name (same cleaned name or a
+// remembered spelling), else the Wendor name tidied.
+export async function productNamer() {
+  const list = await items();
+  const byKey = new Map();
+  for (const item of list) { byKey.set(item.key, item.name); for (const alias of item.aliases || []) if (!byKey.has(alias)) byKey.set(alias, item.name); }
+  const memo = new Map();
+  return (raw) => {
+    if (!memo.has(raw)) memo.set(raw, byKey.get(cleanName(raw)) || String(raw || "").replace(/\s+/g, " ").trim());
+    return memo.get(raw);
+  };
+}
+
 async function items() {
   if (Date.now() - itemCache.at < 30000) return itemCache.rows;
   const { rows } = await db.query(

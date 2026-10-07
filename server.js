@@ -27,6 +27,7 @@ import { registerAnalyticsOverview } from "./analyticsOverview.js";
 import { registerMachineRoutes } from "./machines.js";
 import { ensureMachineStock, registerMachineStockRoutes } from "./machineStock.js";
 import { ensureLocationStock, registerLocationStockRoutes, handleStockDcWhatsApp } from "./locationStock.js";
+import { ensureSalesData, registerSalesDataRoutes } from "./salesData.js";
 import { initSupplyAnalytics, registerSupplyAnalyticsRoutes } from "./supplyAnalytics.js";
 import { registerFindingsRoutes } from "./findingsRoutes.js";
 import { registerExpiryRoutes } from "./expiryRoutes.js";
@@ -3331,6 +3332,7 @@ registerSupplyBuyerRoutes(app, { auth });
 registerMachineRoutes(app, { auth });
 registerMachineStockRoutes(app, { auth });
 registerLocationStockRoutes(app, { auth });
+registerSalesDataRoutes(app, { auth });
 registerSupplyAnalyticsRoutes(app, { auth });
 registerSupplyChallanRoutes(app, { auth });
 registerCapaOverdueRoutes(app, { auth });
@@ -4814,6 +4816,7 @@ try {
   // Live Stock: what is in each vending machine (Wendor sales + refill photos).
   await ensureMachineStock(db).catch((err) => console.error("LIVE STOCK SETUP ERROR:", err.message));
   await ensureLocationStock(db, { onChanged: () => io.emit("stock-changed") }).catch((err) => console.error("LOCATION STOCK SETUP ERROR:", err.message));
+  ensureSalesData(db);
   initSupplyWhatsApp(db, { onChanged: () => io.emit("supply-changed") });
   // The master sheet goes to the buyer (Admin Settings) when all companies have ordered or at the cutoff.
   await ensureSupplyBuyer(db, { onChanged: () => io.emit("supply-changed") }).catch((err) => console.error("SUPPLY BUYER SETUP ERROR:", err.message));
