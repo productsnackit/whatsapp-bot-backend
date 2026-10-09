@@ -120,10 +120,16 @@ function whenOf(date, time) {
 }
 
 /* ---------- Reading a VendVitor transactions CSV ----------
-   "SNo","Date","Mode","TxnID","Selection","Name","Amount","Remarks" — one row per item, the slot in
-   Selection, no product name and no machine ID (that is in the file name: vv00017_2026-09-01_To_…csv).
-   REFUND rows are leftover balance paid back (paid ₹30, bought ₹20), not sales. One payment (TxnID)
-   can buy several items. */
+   Two exports, one row per item, the slot in Selection, product names (almost always) empty:
+   • one machine: "SNo","Date","Mode","TxnID","Selection","Name","Amount","Remarks" — no machine ID
+     (it is in the file name: vv00017_2026-09-01_To_…csv); date "01/Sep/2026 00:10:59";
+   • all machines: "Timestamp","Device ID","Location","Transaction Type","Amount","Selection",
+     "Payment Method","Transaction ID","Product Name","Status","Refund Reason"; date
+     "30 Sep 2026 at 11:59:55 PM".
+   REFUND rows are money paid back (leftover balance, a vend that failed…), not sales. One payment
+   (TxnID) can buy several items. Cash sales have no TxnID.
+   The two number slots differently: the all-machines export counts from 0 (200 there = slot 301 on
+   the machine, 1 = 102), so a sale is known again by its payment and amount, not its slot. */
 const MONTHS = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12 };
 function csvRows(text) {
   const rows = [];
@@ -141,40 +147,55 @@ function csvRows(text) {
   return rows;
 }
 function readVendVitor(base64, fileName) {
-  const text = Buffer.from(String(base64).replace(/^data:[^,]+,/, ""), "base64").toString("utf8").replace(/^\uFEFF/, "");
+  const text = Buffer.from(String(base64).replace(/^data:[^,]+,/, ""), "base64").toString("utf8").replace(/^﻿/, "");
   const grid = csvRows(text);
-  const headerAt = grid.findIndex((row) => row.some((cell) => /^txn\s*id$/i.test(cell.trim())) && row.some((cell) => /^selection$/i.test(cell.trim())));
+  const label = (cell) => String(cell || "").trim().toLowerCase().replace(/\s+/g, " ");
+  const headerAt = grid.findIndex((row) => row.some((cell) => ["txnid", "transaction id"].includes(label(cell))) && row.some((cell) => label(cell) === "selection"));
   if (headerAt < 0) return null;
-  const machineId = (String(fileName || "").match(/\b([a-z]{2}\d{5})(?=[_\s.-]|$)/i) || [])[1]?.toLowerCase();
-  if (!machineId) throw new Error("VendVitor report: the machine ID isn't in the file name. Keep VendVitor's file name (like vv00017_2026-09-01_To_2026-09-30.csv).");
-  const header = grid[headerAt].map((cell) => cell.trim().toLowerCase());
-  const col = (label) => header.indexOf(label);
-  const at = { date: col("date"), txn: col("txnid"), slot: col("selection"), name: col("name"), amount: col("amount") };
-  const listed = MACHINE_LIST.find((machine) => machine[1].toLowerCase() === machineId);
+  const header = grid[headerAt].map(label);
+  const col = (...labels) => header.findIndex((cell) => labels.includes(cell));
+  const at = { date: col("date", "timestamp"), device: col("device id"), txn: col("txnid", "transaction id"), slot: col("selection"), name: col("name", "product name"), amount: col("amount"), type: col("transaction type", "mode"), status: col("status") };
+  const fileMachine = (String(fileName || "").match(/\b([a-z]{2}\d{5})(?=[_\s.-]|$)/i) || [])[1]?.toLowerCase();
+  if (at.device < 0 && !fileMachine) throw new Error("VendVitor report: the machine ID isn't in the file name. Keep VendVitor's file name (like vv00017_2026-09-01_To_2026-09-30.csv).");
+  const cell = (row, index) => (index >= 0 ? String(row[index] || "").trim() : "");
   const vends = [];
   const days = new Set();
-  const perTxnSlot = new Map();
+  const machines = new Map();
+  const perLine = new Map();
   let skipped = 0, rowCount = 0;
   for (const row of grid.slice(headerAt + 1)) {
-    if (!row.some((cell) => cell.trim())) continue;
+    if (!row.some((value) => value.trim())) continue;
     rowCount += 1;
-    const slot = String(row[at.slot] || "").trim();
-    // 01/Sep/2026 00:10:59 (India time)
-    const d = String(row[at.date] || "").trim().match(/^(\d{1,2})[/-]([a-z]{3}|\d{1,2})[/-](\d{4})\s+(\d{1,2}):(\d{2})/i);
-    const month = d ? (MONTHS[d[2].toLowerCase()] || Number(d[2])) : 0;
-    if (!d || !month || !slot || /^refund$/i.test(slot)) { skipped += 1; continue; }
+    // A few machines send paid sales with no slot: still sold, under slot "?".
+    const slot = cell(row, at.slot) || "?";
+    const machineId = (cell(row, at.device) || fileMachine || "").toLowerCase();
+    // 01/Sep/2026 00:10:59 · 30 Sep 2026 at 11:59:55 PM (India time)
+    const d = cell(row, at.date).match(/^(\d{1,2})[/\- ]([a-z]{3,9}|\d{1,2})[/\- ](\d{4})(?:\s+at)?\s+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*([ap]\.?m\.?)?/i);
+    const month = d ? (MONTHS[d[2].slice(0, 3).toLowerCase()] || Number(d[2])) : 0;
+    const refund = /refund/i.test(`${slot} ${cell(row, at.type)} ${cell(row, at.status)}`) || /fail/i.test(cell(row, at.status));
+    if (!d || !month || !machineId || refund) { skipped += 1; continue; }
+    let hour = Number(d[4]);
+    if (d[7]) hour = (hour % 12) + (/p/i.test(d[7]) ? 12 : 0);
     const day = `${d[3]}-${pad(month)}-${pad(d[1])}`;
     days.add(day);
-    // TxnID comes as ="2026…" so Excel keeps all its digits.
-    const txn = String(row[at.txn] || "").replace(/[="\s]/g, "");
-    // The same slot twice in one payment = two items: numbered so each is its own line.
-    const n = (perTxnSlot.get(`${txn}#${slot}`) || 0) + 1;
-    perTxnSlot.set(`${txn}#${slot}`, n);
-    const name = String(row[at.name] || "").replace(/\s+/g, " ").trim();
-    const line = txn ? `vv:${machineId}:${txn}#${slot}#${n}` : null;
-    vends.push({ day, bucket: Number(d[4]) * 6 + Math.floor(Number(d[5]) / 10), order: line, line, first_old: false, wendor: machineId, position: slot, product: name || slotProduct(slot), qty: 1, amount: Number(row[at.amount]) || 0 });
+    if (!machines.has(machineId)) machines.set(machineId, MACHINE_LIST.find((machine) => machine[1].toLowerCase() === machineId)?.[0] || machineId);
+    // TxnID comes as ="2026…" so Excel keeps all its digits. A cash sale has none: its moment is used.
+    const txn = cell(row, at.txn).replace(/[="\s]/g, "");
+    const ref = txn || `cash ${day} ${pad(hour)}:${d[5]}:${d[6] || "00"}`;
+    // Two items at the same price in one payment: numbered so each is its own line.
+    const amount = Number(cell(row, at.amount)) || 0;
+    const n = (perLine.get(`${machineId}#${ref}#${amount}`) || 0) + 1;
+    perLine.set(`${machineId}#${ref}#${amount}`, n);
+    const name = cell(row, at.name).replace(/\s+/g, " ");
+    const line = `vv:${machineId}:${ref}#${amount}#${n}`;
+    // Saved before 9 Oct 2026 by slot ("vv:vv00017:<txn>#301#1", one-machine numbering).
+    const labelSlot = at.device >= 0 && /^\d+$/.test(slot) ? String(Number(slot) + 101) : slot;
+    const m = (perLine.get(`old#${machineId}#${ref}#${labelSlot}`) || 0) + 1;
+    perLine.set(`old#${machineId}#${ref}#${labelSlot}`, m);
+    const legacy = txn ? `vv:${machineId}:${txn}#${labelSlot}#${m}` : null;
+    vends.push({ day, bucket: hour * 6 + Math.floor(Number(d[5]) / 10), order: line, line, legacy, first_old: false, wendor: machineId, position: slot, product: name || slotProduct(slot), qty: 1, amount });
   }
-  return { rows: rowCount, vends, days, skipped, machines: new Map([[machineId, listed?.[0] || machineId]]), vendor: "vendvitor" };
+  return { rows: rowCount, vends, days, skipped, machines, vendor: "vendvitor" };
 }
 
 // Wendor report rows → completed vends.
@@ -239,7 +260,7 @@ export async function importReport({ base64, fileName, by }) {
   // remembered, so overlapping reports (or a day uploaded half-way and again later) add only
   // the new orders. Days saved before orders were remembered count as complete.
   const known = new Set();
-  const keys = [...new Set(vends.flatMap((vend) => (vend.order ? [vend.line, vend.order] : [])))];
+  const keys = [...new Set(vends.flatMap((vend) => (vend.order ? [vend.line, vend.order, ...(vend.legacy ? [vend.legacy] : [])] : [])))];
   for (let start = 0; start < keys.length; start += 10000) {
     const { rows: found } = await db.query("SELECT order_id FROM stock_orders WHERE order_id = ANY($1)", [keys.slice(start, start + 10000)]);
     for (const row of found) known.add(row.order_id);
@@ -254,7 +275,7 @@ export async function importReport({ base64, fileName, by }) {
   const hasDay = new Set(haveDays.map((row) => `${row.machine_id}|${row.day}`));
   const fresh = vends.filter((vend) => {
     const machineDay = `${ids.get(vend.wendor)}|${vend.day}`;
-    if (vend.order) return !known.has(vend.line) && !(vend.first_old && known.has(vend.order)) && !oldDay.has(machineDay);
+    if (vend.order) return !known.has(vend.line) && !(vend.legacy && known.has(vend.legacy)) && !(vend.first_old && known.has(vend.order)) && !oldDay.has(machineDay);
     return !hasDay.has(machineDay); // no order ID: only a day not saved yet
   });
   const already = vends.length - fresh.length;
