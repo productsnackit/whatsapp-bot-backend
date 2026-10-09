@@ -30,6 +30,13 @@ let onChange = () => {};
 let version = 0;
 const results = new Map();
 export function stockChanged() { version += 1; results.clear(); }
+
+// A sale whose product isn't known (VendVitor reports give only the slot) is saved as "slot:301".
+// It counts in the location's totals (units, value, sales) but not against any product.
+const SLOT = "slot:";
+export const slotProduct = (position) => `${SLOT}${position}`;
+export const slotOfSale = (product) => (String(product || "").startsWith(SLOT) ? String(product).slice(SLOT.length) : null);
+export const saleName = (product) => (slotOfSale(product) != null ? `Slot ${slotOfSale(product)} (no product name)` : product);
 const changed = () => { stockChanged(); onChange(); };
 async function remembered(key, fn, ttl = 10 * 60000) {
   const hit = results.get(key);
@@ -98,7 +105,7 @@ export async function productNamer() {
   for (const item of list) { byKey.set(item.key, item.name); for (const alias of item.aliases || []) if (!byKey.has(alias)) byKey.set(alias, item.name); }
   const memo = new Map();
   return (raw) => {
-    if (!memo.has(raw)) memo.set(raw, byKey.get(cleanName(raw)) || String(raw || "").replace(/\s+/g, " ").trim());
+    if (!memo.has(raw)) memo.set(raw, slotOfSale(raw) != null ? saleName(raw) : byKey.get(cleanName(raw)) || String(raw || "").replace(/\s+/g, " ").trim());
     return memo.get(raw);
   };
 }
@@ -719,12 +726,15 @@ async function stockFor(locationIds = null) {
   const tracked = new Set(moves.rows.map((move) => move.location_id));
   const machineIds = machines.rows.filter((machine) => tracked.has(machine.location_id)).map((machine) => machine.id);
   const firstDay = moves.rows[0]?.at ? addDays(istDay(moves.rows[0].at), -1) : istDay();
-  const { rows: sales } = machineIds.length ? await db.query(
+  const { rows: allSales } = machineIds.length ? await db.query(
     `SELECT day::text AS day, bucket, machine_id, product, SUM(qty)::int AS qty, SUM(amount)::float AS amount FROM stock_sales
      WHERE machine_id = ANY($1) AND day >= LEAST($2::date, COALESCE((SELECT MAX(day) FROM stock_sales WHERE machine_id = ANY($1)), $2::date) - 8)
      GROUP BY day, bucket, machine_id, product ORDER BY day, bucket`,
     [machineIds, firstDay]
   ).catch(() => ({ rows: [] })) : { rows: [] };
+  // Sales without a product name (VendVitor slots) only count in the location's totals.
+  const sales = allSales.filter((sale) => slotOfSale(sale.product) == null);
+  const unnamedSales = allSales.filter((sale) => slotOfSale(sale.product) != null);
   // Wendor product names → items (same cleaned name or remembered spelling; unknown names become items).
   const byKey = new Map();
   for (const item of itemRows) { byKey.set(item.key, item.id); for (const alias of item.aliases || []) byKey.set(alias, item.id); }
@@ -754,7 +764,7 @@ async function stockFor(locationIds = null) {
   };
   const machineLocation = new Map(machines.rows.map((machine) => [machine.id, machine.location_id]));
   const saleAt = (sale) => new Date(`${sale.day}T${String(Math.floor(sale.bucket / 6)).padStart(2, "0")}:${String((sale.bucket % 6) * 10).padStart(2, "0")}:00+05:30`);
-  const lastSaleDay = sales.length ? sales[sales.length - 1].day : null;
+  const lastSaleDay = allSales.length ? allSales[allSales.length - 1].day : null;
 
   // Grouped once by location (and by product inside it), not searched again for every product.
   const movesBy = new Map();
@@ -765,6 +775,13 @@ async function stockFor(locationIds = null) {
     sale.at = saleAt(sale);
     if (!salesBy.has(place)) salesBy.set(place, []);
     salesBy.get(place).push(sale);
+  }
+  const unnamedBy = new Map();
+  for (const sale of unnamedSales) {
+    const place = machineLocation.get(sale.machine_id);
+    sale.at = saleAt(sale);
+    if (!unnamedBy.has(place)) unnamedBy.set(place, []);
+    unnamedBy.get(place).push(sale);
   }
   const groupBy = (rows) => { const out = new Map(); for (const row of rows) { if (!out.has(row.item_id)) out.set(row.item_id, []); out.get(row.item_id).push(row); } return out; };
 
@@ -780,7 +797,8 @@ async function stockFor(locationIds = null) {
     const closings = locMoves.filter((move) => move.kind === "count" && String(move.ref || "").startsWith("warehouse"));
     const closingAt = closings.length ? new Date(closings[closings.length - 1].at) : null;
     const itemIds = [...new Set([...locMoves.map((move) => move.item_id), ...locSales.filter((sale) => !firstMove || sale.at >= firstMove).map((sale) => sale.item_id)])];
-    const salesDays = [...new Set(locSales.map((sale) => sale.day))].sort();
+    const locUnnamed = unnamedBy.get(location.id) || [];
+    const salesDays = [...new Set([...locSales, ...locUnnamed].map((sale) => sale.day))].sort();
     const recentDays = salesDays.filter((day) => day > addDays(salesDays[salesDays.length - 1] || istDay(), -7));
     const recentSet = new Set(recentDays);
     const rows = itemIds.map((itemId) => {
@@ -818,18 +836,30 @@ async function stockFor(locationIds = null) {
         dc_value: price != null ? Math.round(dcIn * price) : null,
       };
     }).sort((a, b) => (a.status === "out") - (b.status === "out") || a.name.localeCompare(b.name));
+    // Sold from slots with no product name, since the latest closing stock (or the first count / DC).
+    const unnamedFrom = closingAt || firstMove;
+    const unnamedSold = unnamedFrom ? locUnnamed.filter((sale) => sale.at >= unnamedFrom) : [];
+    const unnamed = {
+      units: unnamedSold.reduce((sum, sale) => sum + sale.qty, 0),
+      value: Math.round(unnamedSold.reduce((sum, sale) => sum + (Number(sale.amount) || 0), 0)),
+      slots: new Set(unnamedSold.map((sale) => `${sale.machine_id}:${slotOfSale(sale.product)}`)).size,
+      per_day: recentDays.length ? Math.round((locUnnamed.filter((sale) => recentSet.has(sale.day)).reduce((sum, sale) => sum + sale.qty, 0) / recentDays.length) * 10) / 10 : 0,
+    };
+    const itemUnits = rows.reduce((sum, row) => sum + row.available, 0);
+    const itemValue = rows.reduce((sum, row) => sum + (row.value || 0), 0);
     const locDcs = [...new Set(locMoves.filter((move) => move.kind === "dc").map((move) => move.ref))];
     const lastCountAt = locMoves.filter((move) => move.kind === "count").map((move) => move.at).pop() || null;
     result.set(location.id, {
       id: location.id, name: location.name, machines: machines.rows.filter((machine) => machine.location_id === location.id).map((machine) => machine.name),
       items: rows,
       totals: {
-        items: rows.filter((row) => row.available > 0).length, units: round(rows.reduce((sum, row) => sum + row.available, 0)),
+        items: rows.filter((row) => row.available > 0).length, units: round(Math.max(0, itemUnits - unnamed.units)),
         out: rows.filter((row) => row.status === "out").length, low: rows.filter((row) => row.status === "low").length,
-        short: rows.filter((row) => row.short > 0).length, per_day: Math.round(rows.reduce((sum, row) => sum + row.per_day, 0) * 10) / 10,
+        short: rows.filter((row) => row.short > 0).length, per_day: Math.round((rows.reduce((sum, row) => sum + row.per_day, 0) + unnamed.per_day) * 10) / 10,
         dcs: locDcs.length,
-        value: rows.reduce((sum, row) => sum + (row.value || 0), 0),
-        sold_value: rows.reduce((sum, row) => sum + row.sold_value, 0),
+        value: Math.max(0, itemValue - unnamed.value),
+        sold_value: rows.reduce((sum, row) => sum + row.sold_value, 0) + unnamed.value,
+        unnamed, // VendVitor sales (slot only): taken off units and value, not off any product
         dc_value: rows.reduce((sum, row) => sum + (row.dc_value || 0), 0),
         no_price: rows.filter((row) => row.available > 0 && row.price == null).length,
       },

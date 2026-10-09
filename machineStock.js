@@ -22,7 +22,8 @@
 import XLSX from "xlsx";
 import { hasPage } from "./accessControl.js";
 import { matchSite } from "./siteMatcher.js";
-import { stockChanged } from "./locationStock.js";
+import { stockChanged, slotProduct, saleName } from "./locationStock.js";
+import { MACHINE_LIST } from "./machineList.js";
 
 let db = null;
 const pad = (n) => String(n).padStart(2, "0");
@@ -45,7 +46,8 @@ export async function ensureMachineStock(database) {
     );
     ALTER TABLE stock_machines
       ADD COLUMN IF NOT EXISTS refill_days SMALLINT[],
-      ADD COLUMN IF NOT EXISTS refill_time TEXT;
+      ADD COLUMN IF NOT EXISTS refill_time TEXT,
+      ADD COLUMN IF NOT EXISTS vendor TEXT NOT NULL DEFAULT 'wendor';
     CREATE TABLE IF NOT EXISTS stock_slots (
       machine_id INTEGER NOT NULL REFERENCES stock_machines(id) ON DELETE CASCADE,
       position TEXT NOT NULL, capacity INTEGER, capacity_by TEXT,
@@ -117,9 +119,66 @@ function whenOf(date, time) {
   return { day, bucket: hour * 6 + Math.floor(minute / 10) };
 }
 
-export async function importReport({ base64, fileName, by }) {
-  const rows = readReport(base64);
-  if (!rows.length) throw new Error("This doesn't look like a Wendor transactions report (no Machine ID / Position columns).");
+/* ---------- Reading a VendVitor transactions CSV ----------
+   "SNo","Date","Mode","TxnID","Selection","Name","Amount","Remarks" — one row per item, the slot in
+   Selection, no product name and no machine ID (that is in the file name: vv00017_2026-09-01_To_…csv).
+   REFUND rows are leftover balance paid back (paid ₹30, bought ₹20), not sales. One payment (TxnID)
+   can buy several items. */
+const MONTHS = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12 };
+function csvRows(text) {
+  const rows = [];
+  let row = [], cell = "", quoted = false;
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (quoted) {
+      if (char === '"' && text[index + 1] === '"') { cell += '"'; index += 1; } else if (char === '"') quoted = false; else cell += char;
+    } else if (char === '"') quoted = true;
+    else if (char === ",") { row.push(cell); cell = ""; }
+    else if (char === "\n" || char === "\r") { if (char === "\r" && text[index + 1] === "\n") index += 1; row.push(cell); rows.push(row); row = []; cell = ""; }
+    else cell += char;
+  }
+  if (cell || row.length) { row.push(cell); rows.push(row); }
+  return rows;
+}
+function readVendVitor(base64, fileName) {
+  const text = Buffer.from(String(base64).replace(/^data:[^,]+,/, ""), "base64").toString("utf8").replace(/^\uFEFF/, "");
+  const grid = csvRows(text);
+  const headerAt = grid.findIndex((row) => row.some((cell) => /^txn\s*id$/i.test(cell.trim())) && row.some((cell) => /^selection$/i.test(cell.trim())));
+  if (headerAt < 0) return null;
+  const machineId = (String(fileName || "").match(/\b([a-z]{2}\d{5})(?=[_\s.-]|$)/i) || [])[1]?.toLowerCase();
+  if (!machineId) throw new Error("VendVitor report: the machine ID isn't in the file name. Keep VendVitor's file name (like vv00017_2026-09-01_To_2026-09-30.csv).");
+  const header = grid[headerAt].map((cell) => cell.trim().toLowerCase());
+  const col = (label) => header.indexOf(label);
+  const at = { date: col("date"), txn: col("txnid"), slot: col("selection"), name: col("name"), amount: col("amount") };
+  const listed = MACHINE_LIST.find((machine) => machine[1].toLowerCase() === machineId);
+  const vends = [];
+  const days = new Set();
+  const perTxnSlot = new Map();
+  let skipped = 0, rowCount = 0;
+  for (const row of grid.slice(headerAt + 1)) {
+    if (!row.some((cell) => cell.trim())) continue;
+    rowCount += 1;
+    const slot = String(row[at.slot] || "").trim();
+    // 01/Sep/2026 00:10:59 (India time)
+    const d = String(row[at.date] || "").trim().match(/^(\d{1,2})[/-]([a-z]{3}|\d{1,2})[/-](\d{4})\s+(\d{1,2}):(\d{2})/i);
+    const month = d ? (MONTHS[d[2].toLowerCase()] || Number(d[2])) : 0;
+    if (!d || !month || !slot || /^refund$/i.test(slot)) { skipped += 1; continue; }
+    const day = `${d[3]}-${pad(month)}-${pad(d[1])}`;
+    days.add(day);
+    // TxnID comes as ="2026…" so Excel keeps all its digits.
+    const txn = String(row[at.txn] || "").replace(/[="\s]/g, "");
+    // The same slot twice in one payment = two items: numbered so each is its own line.
+    const n = (perTxnSlot.get(`${txn}#${slot}`) || 0) + 1;
+    perTxnSlot.set(`${txn}#${slot}`, n);
+    const name = String(row[at.name] || "").replace(/\s+/g, " ").trim();
+    const line = txn ? `vv:${machineId}:${txn}#${slot}#${n}` : null;
+    vends.push({ day, bucket: Number(d[4]) * 6 + Math.floor(Number(d[5]) / 10), order: line, line, first_old: false, wendor: machineId, position: slot, product: name || slotProduct(slot), qty: 1, amount: Number(row[at.amount]) || 0 });
+  }
+  return { rows: rowCount, vends, days, skipped, machines: new Map([[machineId, listed?.[0] || machineId]]), vendor: "vendvitor" };
+}
+
+// Wendor report rows → completed vends.
+function wendorVends(rows) {
   // Every completed vend in the file (failed, started, not started took nothing out).
   const seen = new Set();
   const days = new Set();
@@ -148,13 +207,24 @@ export async function importReport({ base64, fileName, by }) {
     if (firstOld) seen.add(`old:${row.order}`);
     vends.push({ ...when, order: row.order || null, line, first_old: firstOld, wendor: row.machineId, position: row.position, product: row.product.replace(/\s+/g, " "), qty: Math.max(1, Math.round(Number(row.qty) || 1)), amount: Number(row.amount) || 0 });
   }
+  return { rows: rows.length, vends, days, skipped, machines, vendor: "wendor" };
+}
+
+export async function importReport({ base64, fileName, by }) {
+  let report = /\.csv$/i.test(fileName || "") ? readVendVitor(base64, fileName) : null;
+  if (!report) {
+    const rows = readReport(base64);
+    if (!rows.length) throw new Error("This doesn't look like a Wendor transactions report (Machine ID / Position columns) or a VendVitor report (TxnID / Selection columns).");
+    report = wendorVends(rows);
+  }
+  const { vends, days, machines, skipped, vendor } = report;
   if (!days.size) throw new Error("No dated rows found in the report.");
   const ids = new Map();
   for (const [wendorId, name] of machines) {
     const { rows: saved } = await db.query(
-      `INSERT INTO stock_machines (wendor_id, name) VALUES ($1, $2)
-       ON CONFLICT (wendor_id) DO UPDATE SET name = EXCLUDED.name RETURNING id, location_id`,
-      [wendorId, name]
+      `INSERT INTO stock_machines (wendor_id, name, vendor) VALUES ($1, $2, $3)
+       ON CONFLICT (wendor_id) DO UPDATE SET name = EXCLUDED.name, vendor = EXCLUDED.vendor RETURNING id, location_id`,
+      [wendorId, name, vendor]
     );
     ids.set(wendorId, saved[0].id);
     // Linked to its location (Refill Audit locations) by name, unless someone set it by hand.
@@ -231,9 +301,9 @@ export async function importReport({ base64, fileName, by }) {
   const newDays = [...new Set(fresh.map((vend) => vend.day))].sort();
   const { rows: upload } = await db.query(
     "INSERT INTO stock_uploads (file_name, day_from, day_to, rows, sold, skipped, machines, uploaded_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id, file_name, day_from::text, day_to::text, rows, sold, skipped, machines, uploaded_by, uploaded_at",
-    [fileName || null, dayList[0], dayList[dayList.length - 1], rows.length, sold, skipped, [...machines.values()], by]
+    [fileName || null, dayList[0], dayList[dayList.length - 1], report.rows, sold, skipped, [...machines.values()], by]
   );
-  return { ...upload[0], days: dayList.length, already, new_days: newDays };
+  return { ...upload[0], days: dayList.length, already, new_days: newDays, vendor };
 }
 
 /* ---------- Working out the stock ---------- */
@@ -333,8 +403,8 @@ function stockOf(data, machine, today = istDay()) {
     const status = inMachine == null ? "unknown" : inMachine === 0 ? "empty" : (perDay && inMachine / perDay < LOW_DAYS) || inMachine <= 2 ? "low" : "ok";
     return {
       position,
-      product: lastSale?.product || null, // last product sold from this slot (products in a slot change)
-      products: [...new Set(slotSales.filter((sale) => recentDays.includes(sale.day)).map((sale) => sale.product))],
+      product: lastSale ? saleName(lastSale.product) : null, // last product sold from this slot (products in a slot change)
+      products: [...new Set(slotSales.filter((sale) => recentDays.includes(sale.day)).map((sale) => saleName(sale.product)))],
       capacity, capacity_set: slot.capacity != null, capacity_estimated: slot.capacity == null && capacity != null,
       start, sold_since: soldSince, in_machine: inMachine,
       oversold: raw != null && raw < 0 ? -raw : 0, // sold more than the slot size: the size is probably too small
@@ -353,7 +423,7 @@ function stockOf(data, machine, today = istDay()) {
   if (fromDay && yesterday) for (let day = fromDay; day <= yesterday; day = addDays(day, 1)) if (!dataDays.includes(day)) missing.push(day);
   const known = slots.filter((slot) => slot.in_machine != null);
   return {
-    id: machine.id, wendor_id: machine.wendor_id, name: machine.name, active: machine.active,
+    id: machine.id, wendor_id: machine.wendor_id, vendor: machine.vendor || "wendor", name: machine.name, active: machine.active,
     location_id: machine.location_id, location_name: machine.location_name,
     refill_days: machine.refill_days || null, refill_time: machine.refill_time || null,
     next_refill: nextRefill(machine), skips: data.marks.filter((mark) => mark.machine_id === machine.id && mark.kind === "skip").slice(-10).reverse().map((mark) => ({ id: mark.id, day: istDay(mark.at), by: mark.by })),
@@ -387,7 +457,7 @@ function historyOf(data, machine, stock) {
       sold: ofDay.reduce((sum, sale) => sum + sale.qty, 0),
       value: Math.round(ofDay.reduce((sum, sale) => sum + Number(sale.amount), 0)),
       refills: stock.all_refills.filter((refill) => istDay(refill.at) === day).length,
-      top: Object.entries(ofDay.reduce((map, sale) => ({ ...map, [sale.product]: (map[sale.product] || 0) + sale.qty }), {})).sort((a, b) => b[1] - a[1]).slice(0, 3),
+      top: Object.entries(ofDay.reduce((map, sale) => ({ ...map, [saleName(sale.product)]: (map[saleName(sale.product)] || 0) + sale.qty }), {})).sort((a, b) => b[1] - a[1]).slice(0, 3),
     };
   }).reverse();
 }
