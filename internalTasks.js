@@ -65,7 +65,7 @@ function toTask(chat, message, now = Date.now()) {
   };
 }
 
-function allTasks() {
+export function allTasks() {
   const now = Date.now();
   const tasks = [];
   for (const chat of global.internalChats || []) {

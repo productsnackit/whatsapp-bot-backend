@@ -22,6 +22,7 @@ import { accessFor, canUsePath, hasPage, hashPassword, verifyPassword, generateP
 import { ensureActivityLog, activityMiddleware, registerActivityRoutes, logActivity } from "./activityLog.js";
 import { ensureRefillTables, registerRefillRoutes, refillTick } from "./refillSchedule.js";
 import { registerTaskRoutes, taskReminderTick } from "./internalTasks.js";
+import { registerMyHomeRoutes } from "./myHome.js";
 import { ensureImageRetention, cleanOldImages, registerImageRetentionRoutes } from "./imageRetention.js";
 import { registerAnalyticsOverview } from "./analyticsOverview.js";
 import { registerMachineRoutes } from "./machines.js";
@@ -3347,6 +3348,7 @@ registerTicketWatchRoutes(app, { auth });
 registerTicketCleanupRoutes(app, { auth, db, onChanged: () => ticketsChanged() });
 registerSiteRoutes(app, { auth });
 registerRefillRoutes(app, { auth });
+registerMyHomeRoutes(app, { db, auth, getUserKey: getInternalUserKey, canSeeChat: canSeeInternalChat });
 registerTaskRoutes(app, {
   auth,
   getUserKey: getInternalUserKey,
