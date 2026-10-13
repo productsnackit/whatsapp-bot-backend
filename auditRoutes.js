@@ -156,7 +156,8 @@ export function registerAuditRoutes(app, { db, auth, uploadImage }) {
       FROM audit_refillers r LEFT JOIN audit_locations l ON l.refiller_id = r.id
       GROUP BY r.id ORDER BY COUNT(l.id) DESC, r.name
     `);
-    res.json(result.rows);
+    // The app PIN is never sent back, only whether one is set.
+    res.json(result.rows.map(({ app_pin, ...row }) => ({ ...row, has_pin: Boolean(app_pin) })));
   }));
 
   const refillerFields = ["name", "phone", "shift", "workload", "support"];
@@ -181,7 +182,8 @@ export function registerAuditRoutes(app, { db, auth, uploadImage }) {
       [...fields.map((key) => (key === "name" ? String(req.body.name).trim() : req.body[key])), req.params.id]
     );
     if (!result.rows.length) return res.status(404).json({ error: "Refiller not found" });
-    res.json(result.rows[0]);
+    const { app_pin, ...refiller } = result.rows[0];
+    res.json({ ...refiller, has_pin: Boolean(app_pin) });
   }));
 
   app.delete("/audit/refillers/:id", auth, guard, adminOnly, handle("AUDIT REFILLER DELETE", async (req, res) => {

@@ -736,6 +736,18 @@ async function completeTask(refiller, locationId) {
   return updated.rows[0];
 }
 
+// The refiller app (refillerApp.js): photos taken in the app, then the site, exactly like
+// photos sent on WhatsApp and the site picked from the list.
+export async function completeRefillFromApp(refiller, locationId, urls) {
+  await db.query(
+    `INSERT INTO refill_photo_batches (refiller_phone, photos, started_at, list_sent) VALUES ($1, $2::jsonb, NOW(), TRUE)
+     ON CONFLICT (refiller_phone) DO UPDATE SET photos = EXCLUDED.photos, started_at = NOW(), list_sent = TRUE`,
+    [refiller.phone, JSON.stringify(urls.map((url) => ({ url, at: new Date().toISOString(), from: "app" })))]
+  );
+  return completeTask(refiller, locationId);
+}
+export { refillerSites };
+
 async function todaySummary(refiller) {
   const today = istDate();
   const { rows } = await db.query(

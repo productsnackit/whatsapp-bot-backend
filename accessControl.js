@@ -140,6 +140,8 @@ const PATH_RULES = [
 
 // Returns true if the person may call this API path.
 export function canUsePath(user, method, path) {
+  // Refillers only have their own app (refillerApp.js).
+  if (user?.role === "refiller") return path.startsWith("/refiller/") || path === "/logout";
   if (user?.isAdmin) return true;
   if (path.startsWith("/internal/") || path === "/me" || path.startsWith("/me/")) return true;
   for (const [pattern, pages] of PATH_RULES) {

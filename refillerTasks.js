@@ -291,6 +291,13 @@ async function answerTask(db, refiller, ticket, resolved) {
   }
 }
 
+// The refiller app (refillerApp.js): the same answers as the WhatsApp buttons.
+export async function answerCapaFromApp(db, refiller, ticket, answer, note = "") {
+  if (answer === "fixed") return answerTask(db, refiller, ticket, true);
+  if (!ticket.escalated_at) await escalateTask(db, refiller, ticket);
+  if (note.trim()) await saveEscalationNote(db, refiller, ticket, note.trim());
+}
+
 // An escalation contact (e.g. Xavier) tapping "Yes, resolved" / "Not yet" on a task sent to them.
 async function handleContactReply(db, msg) {
   const buttonId = msg?.interactive?.button_reply?.id || msg?.button?.payload || "";

@@ -23,6 +23,8 @@ import { ensureActivityLog, activityMiddleware, registerActivityRoutes, logActiv
 import { ensureRefillTables, registerRefillRoutes, refillTick } from "./refillSchedule.js";
 import { registerTaskRoutes, taskReminderTick } from "./internalTasks.js";
 import { registerMyHomeRoutes } from "./myHome.js";
+import { ensureRefillerApp, registerRefillerAppRoutes, refillerLogin, looksLikePhone, refillerByPhone, refillerSession } from "./refillerApp.js";
+import { registerOtpRoutes } from "./otpLogin.js";
 import { ensureImageRetention, cleanOldImages, registerImageRetentionRoutes } from "./imageRetention.js";
 import { registerAnalyticsOverview } from "./analyticsOverview.js";
 import { registerMachineRoutes } from "./machines.js";
@@ -2531,6 +2533,8 @@ function sessionUser(token) {
     return null;
   }
   if (session.owner) return OWNER_USER;
+  // A refiller (refillerApp.js): only their own simple app.
+  if (session.refillerId) return { role: "refiller", refillerId: session.refillerId, name: session.name, phone: session.phone, pages: [], readOnly: false, isAdmin: false };
   const employee = global.internalUsers.find((user) => String(user.id) === String(session.userId));
   if (!employee) return null; // deleted people are logged out
   const { password, ...profile } = employee;
@@ -2597,6 +2601,16 @@ app.post("/login", async (req, res) => {
       employee.lastLoginAt = new Date().toISOString();
       await logActivity({ user: { ...employee, userId: employee.id, ...accessFor(employee) }, req, section: "Account", action: "Logged in" });
       return res.json(loginPayload(employee, token));
+    }
+
+    // Refillers log in with their phone number and app PIN.
+    if (looksLikePhone(username)) {
+      const refiller = await refillerLogin(username, password);
+      if (refiller?.error) return res.status(401).json({ error: refiller.error });
+      if (refiller) {
+        await logActivity({ user: { role: "refiller", name: refiller.name }, req, section: "Account", action: "Refiller logged in to the app", actorName: refiller.name });
+        return res.json(refiller);
+      }
     }
 
     await logActivity({ user: null, req, section: "Account", action: `Failed login for "${username.slice(0, 60)}"`, actorName: username.slice(0, 60) || "Unknown" });
@@ -3348,6 +3362,35 @@ registerTicketWatchRoutes(app, { auth });
 registerTicketCleanupRoutes(app, { auth, db, onChanged: () => ticketsChanged() });
 registerSiteRoutes(app, { auth });
 registerRefillRoutes(app, { auth });
+// Log in with a code on WhatsApp instead of a password (owner: ADMIN_PHONE; employees; refillers).
+registerOtpRoutes(app, {
+  findAccount: async (phone) => {
+    const ownerPhone = String(process.env.ADMIN_PHONE || "").replace(/\D/g, "");
+    if (ownerPhone && (ownerPhone.length === 10 ? `91${ownerPhone}` : ownerPhone) === phone) return { kind: "owner" };
+    const employee = global.internalUsers.find((user) => user.phone && user.phone === phone);
+    if (employee) return { kind: "employee", employee };
+    const refiller = await refillerByPhone(phone);
+    return refiller ? { kind: "refiller", refiller } : null;
+  },
+  startSession: async (account, req) => {
+    const token = newSessionToken();
+    if (account.kind === "owner") {
+      global.internalSessions.set(token, { owner: true, username: ADMIN_USER, createdAt: Date.now() });
+      await logActivity({ user: OWNER_USER, req, section: "Account", action: "Logged in with a WhatsApp code" });
+      return loginPayload(OWNER_USER, token);
+    }
+    if (account.kind === "employee") {
+      const { employee } = account;
+      global.internalSessions.set(token, { userId: employee.id, username: employee.username, name: employee.name, department: employee.department, createdAt: Date.now() });
+      employee.lastLoginAt = new Date().toISOString();
+      await logActivity({ user: { ...employee, userId: employee.id, ...accessFor(employee) }, req, section: "Account", action: "Logged in with a WhatsApp code" });
+      return loginPayload(employee, token);
+    }
+    await logActivity({ user: { role: "refiller", name: account.refiller.name }, req, section: "Account", action: "Refiller logged in with a WhatsApp code", actorName: account.refiller.name });
+    return refillerSession(account.refiller);
+  },
+});
+registerRefillerAppRoutes(app, { auth, adminGuard: (req, res, next) => (hasPage(req.user, "audit") ? next() : res.status(403).json({ error: "Only Refill Audit can set refiller PINs" })) });
 registerMyHomeRoutes(app, { db, auth, getUserKey: getInternalUserKey, canSeeChat: canSeeInternalChat });
 registerTaskRoutes(app, {
   auth,
@@ -4801,6 +4844,7 @@ try {
 // Refill schedule: builds visits from schedules and sends reminders every minute.
 try {
   await ensureRefillTables(db, { sendPush: (userKeys, payload) => sendPushToUsers(db, userKeys, payload) });
+  await ensureRefillerApp(db).catch((err) => console.error("REFILLER APP SETUP ERROR:", err.message));
   setInterval(refillTick, 60 * 1000);
   setInterval(taskReminderTick, 5 * 60 * 1000);
   setTimeout(refillTick, 15 * 1000);
