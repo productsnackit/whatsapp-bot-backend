@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Invoice Dashboard</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
 <style>
 :root{--bg:#f5f6f8;--card:#fff;--ink:#1d2330;--muted:#6b7280;--line:#e3e6eb;--accent:#1f6feb;--warn:#b45309;--flag:#fff7ed}
 @media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--bg:#0f1115;--card:#171a21;--ink:#e6e8ee;--muted:#9aa3b2;--line:#2a2f3a;--accent:#6ea8ff;--warn:#f59e0b;--flag:#2a2214}}
@@ -55,6 +56,7 @@ button.del:hover{color:#c00000;border-color:#c00000}
 /* ===== invoice sheet: fixed colours, matches the original PDF ===== */
 #sheet{display:none;background:#fff;color:#000;width:100%;max-width:820px;margin:0 auto;padding:22px 26px;border-radius:4px;font-family:"Courier New",Courier,monospace;font-size:12px;font-weight:bold}
 #sheet.show{display:block}
+.sheet-pdf{display:block;background:#fff;color:#000;width:100%;max-width:none;box-sizing:border-box;margin:0;padding:0;font-family:"Courier New",Courier,monospace;font-size:12px;font-weight:bold}
 #sheet .sans{font-family:Arial,Helvetica,sans-serif}
 .top{display:flex;justify-content:space-between;align-items:flex-start;gap:16px}
 .logo{width:170px;min-height:64px}
@@ -250,8 +252,10 @@ NEW DELHI, SOUTH EAST DELHI</textarea></label>
 
   <div class="row">
     <button id="preview">Generate invoice</button>
-    <button class="ghost" id="printBtn" disabled>Print / Save as PDF</button>
+    <button id="downloadBtn" disabled>⬇ Download PDF</button>
+    <button class="ghost" id="printBtn" disabled>Print</button>
   </div>
+  <p class="note" id="fileNote"></p>
   <p class="hint" id="formWarn"></p>
 </section>
 
@@ -746,6 +750,14 @@ function renderInvoice() {
 
   $('sheet').classList.add('show');
   $('printBtn').disabled = false;
+  $('downloadBtn').disabled = false;
+  $('fileNote').textContent = 'File name: ' + pdfName();
+}
+
+// Client name + invoice number, letters and digits only: INKSTECHNOLOGYSERVICESDMCCIS0000008.pdf
+function pdfName() {
+  const base = `${$('cliName').value}${$('invNo').value}`.replace(/[^A-Za-z0-9]/g, '').toUpperCase();
+  return (base || 'INVOICE') + '.pdf';
 }
 
 function refreshIfShown() {
@@ -758,7 +770,46 @@ $('preview').onclick = () => {
   renderInvoice();
   $('sheet').scrollIntoView({ behavior: 'smooth', block: 'start' });
 };
-$('printBtn').onclick = () => window.print();
+$('downloadBtn').onclick = async () => {
+  if (!checkForm()) return;
+  renderInvoice();
+  if (!window.html2pdf) { $('formWarn').textContent = 'The PDF maker did not load (no internet?). Use Print and choose "Save as PDF".'; return; }
+  const btn = $('downloadBtn');
+  btn.disabled = true; btn.textContent = 'Making PDF…';
+  // A copy at the page's left edge, A4 width (the one on screen is centred and may be scrolled).
+  const sheet = $('sheet').cloneNode(true);
+  sheet.removeAttribute('id');
+  sheet.className = 'sheet-pdf';
+  try {
+    await html2pdf().set({
+      margin: [8, 8, 8, 8], filename: pdfName(),
+      image: { type: 'jpeg', quality: 0.98 },
+      html2canvas: { scale: 2, backgroundColor: '#ffffff', useCORS: true, scrollX: 0, scrollY: 0 },
+      jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' },
+      pagebreak: { mode: ['css', 'legacy'], avoid: ['tr', '.words', '.eoe'] }
+    }).from(sheet).save();
+    $('formWarn').textContent = '';
+  } catch (e) {
+    $('formWarn').textContent = 'Could not make the PDF: ' + (e && e.message ? e.message : e) + '. Use Print and choose "Save as PDF".';
+  } finally {
+    btn.disabled = false; btn.textContent = '⬇ Download PDF';
+  }
+};
+// Print: the browser's "Save as PDF" suggests the same file name.
+$('printBtn').onclick = () => {
+  if (!checkForm()) return;
+  renderInvoice();
+  const name = pdfName().replace(/\.pdf$/, '');
+  const titles = [document.title];
+  document.title = name;
+  try { if (window.parent !== window) { titles.push(window.parent.document.title); window.parent.document.title = name; } } catch (e) { /* not allowed */ }
+  window.focus();
+  window.print();
+  setTimeout(() => {
+    document.title = titles[0];
+    try { if (titles[1] !== undefined) window.parent.document.title = titles[1]; } catch (e) { /* not allowed */ }
+  }, 1000);
+};
 
 // keep the invoice live when fields are edited after generating it
 document.addEventListener('input', refreshIfShown);
