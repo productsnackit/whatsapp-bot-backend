@@ -5,6 +5,9 @@
     Everyone can view, log and follow up; only admin can delete.
 ========================================================= */
 import { sendPushToUsers } from "./pushNotifications.js";
+import { storeDashboardFile } from "./ticketChat.js";
+
+const MAX_ATTACHMENTS = 10;
 
 export const FINDING_RISKS = ["Critical", "Major", "Minor", "Observation"];
 export const FINDING_STATUSES = ["Open", "In Progress", "Under Review", "Closed"];
@@ -30,6 +33,12 @@ async function ensureFindingsTable(db) {
       created_at TIMESTAMPTZ DEFAULT NOW(),
       updated_at TIMESTAMPTZ DEFAULT NOW()
     )
+  `);
+  // Which locations (Refill Audit locations) it's about, and files attached (photos, PDFs, sheets).
+  await db.query(`
+    ALTER TABLE audit_findings
+      ADD COLUMN IF NOT EXISTS locations TEXT[] NOT NULL DEFAULT '{}',
+      ADD COLUMN IF NOT EXISTS attachments JSONB NOT NULL DEFAULT '[]'::jsonb
   `);
 }
 
@@ -101,6 +110,9 @@ function readFinding(body, { partial }) {
     if (required.includes(key) && !value) return { error: `${key.replace("_", " ")} is required` };
     values[key] = value || null;
   }
+  if (body.locations !== undefined) {
+    values.locations = [...new Set((Array.isArray(body.locations) ? body.locations : []).map((name) => String(name || "").trim().slice(0, 120)).filter(Boolean))].slice(0, 30);
+  }
   if (values.risk && !FINDING_RISKS.includes(values.risk)) return { error: "Invalid risk level" };
   if (values.status && !FINDING_STATUSES.includes(values.status)) return { error: "Invalid status" };
   for (const key of ["observed_on", "due_date"]) {
@@ -136,10 +148,10 @@ export function registerFindingsRoutes(app, { db, auth }) {
     if (error) return res.status(400).json({ error });
     const by = userName(req.user);
     const inserted = await db.query(
-      `INSERT INTO audit_findings (department, observed_on, title, description, risk, status, root_cause, action_plan, assignee_id, assignee_name, due_date, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id`,
+      `INSERT INTO audit_findings (department, observed_on, title, description, risk, status, root_cause, action_plan, assignee_id, assignee_name, due_date, created_by, locations)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id`,
       [values.department, values.observed_on, values.title, values.description, values.risk, values.status || "Open",
-        values.root_cause, values.action_plan, values.assignee_id, values.assignee_name, values.due_date, by]
+        values.root_cause, values.action_plan, values.assignee_id, values.assignee_name, values.due_date, by, values.locations || []]
     );
     const finding = toApi((await db.query(
       "UPDATE audit_findings SET ref = 'FND-' || LPAD(id::text, 5, '0') WHERE id = $1 RETURNING *",
@@ -242,6 +254,43 @@ export function registerFindingsRoutes(app, { db, auth }) {
       [JSON.stringify([entry]), status, req.params.id]
     );
     if (!result.rows.length) return res.status(404).json({ error: "Finding not found" });
+    res.json(toApi(result.rows[0]));
+  }));
+
+  // The locations to choose from: the Refill Audit locations.
+  app.get("/findings/locations", auth, handle("FINDING LOCATIONS", async (req, res) => {
+    const { rows } = await db.query("SELECT name FROM audit_locations ORDER BY name").catch(() => ({ rows: [] }));
+    res.json(rows.map((row) => row.name));
+  }));
+
+  // Attach a file ({ name, type, data: base64 }, up to 15 MB): photos, PDFs, Excel, Word…
+  app.post("/findings/:id/attachments", auth, handle("FINDING ATTACH", async (req, res) => {
+    const { rows } = await db.query("SELECT jsonb_array_length(attachments) AS count FROM audit_findings WHERE id = $1", [req.params.id]);
+    if (!rows[0]) return res.status(404).json({ error: "Finding not found" });
+    if (rows[0].count >= MAX_ATTACHMENTS) return res.status(400).json({ error: `Up to ${MAX_ATTACHMENTS} files per finding` });
+    let stored;
+    try {
+      stored = await storeDashboardFile(req.body?.file);
+    } catch (err) {
+      return res.status(400).json({ error: err.message || "Could not store the file" });
+    }
+    const entry = { url: stored.url, name: stored.name, kind: stored.kind, mime: stored.mime, size: stored.size, by: userName(req.user), at: new Date().toISOString() };
+    const result = await db.query("UPDATE audit_findings SET attachments = attachments || $1::jsonb, updated_at = NOW() WHERE id = $2 RETURNING *", [JSON.stringify([entry]), req.params.id]);
+    res.locals.activity = { section: "Internal Audit", action: `Attached "${stored.name}" to ${result.rows[0].ref}` };
+    res.json(toApi(result.rows[0]));
+  }));
+
+  // Remove an attached file: whoever attached it, or an admin.
+  app.delete("/findings/:id/attachments/:index", auth, handle("FINDING ATTACH DELETE", async (req, res) => {
+    const { rows } = await db.query("SELECT attachments FROM audit_findings WHERE id = $1", [req.params.id]);
+    if (!rows[0]) return res.status(404).json({ error: "Finding not found" });
+    const list = rows[0].attachments || [];
+    const index = Number(req.params.index);
+    const file = list[index];
+    if (!file || (req.query.url && file.url !== req.query.url)) return res.status(404).json({ error: "That file is no longer there. Refresh the page." });
+    if (!req.user?.isAdmin && file.by !== userName(req.user)) return res.status(403).json({ error: "Only the person who attached it or an admin can remove it" });
+    list.splice(index, 1);
+    const result = await db.query("UPDATE audit_findings SET attachments = $1::jsonb, updated_at = NOW() WHERE id = $2 RETURNING *", [JSON.stringify(list), req.params.id]);
     res.json(toApi(result.rows[0]));
   }));
 
