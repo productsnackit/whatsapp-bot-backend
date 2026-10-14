@@ -196,6 +196,12 @@ Email : info@tripnine.in URL : WWW.TRIPNINE.IN</textarea></label>
   </div>
 
   <h3>Bill to (client)</h3>
+  <div class="row" style="margin:0 0 10px">
+    <label style="min-width:260px;flex:1">Choose client <select id="clientPick"></select></label>
+    <button class="ghost" id="clientSave" type="button">Save as client</button>
+    <button class="ghost" id="clientDelete" type="button" hidden>Delete this saved client</button>
+  </div>
+  <p class="note" style="margin-top:-4px">Choosing a client fills its name, address, PAN, GSTIN and place of supply. Change anything and press "Save as client" to keep it (saved in this browser).</p>
   <div class="grid">
     <label>Client name <input id="cliName" value="SOMISH SOLUTIONS LIMITED"></label>
     <label>PAN <input id="cliPan" value="AANCS8910R"></label>
@@ -282,6 +288,63 @@ function setImage(k, dataUrl) {
   });
   $(c).onclick = () => { $(f).value = ''; setImage(k, null); };
 });
+
+/* ---------- clients: pick one and its details fill in ---------- */
+const CLIENT_FIELDS = ['cliName', 'cliPan', 'cliGstin', 'cliAddr', 'placeSupply', 'placeCode'];
+const BUILT_IN_CLIENTS = [
+  { cliName: 'SOMISH SOLUTIONS LIMITED', cliPan: 'AANCS8910R', cliGstin: '07AANCS8910R1ZF',
+    cliAddr: 'FIRST FLOOR, E 47/3\nOKHLA INDUSTRIAL AREA, PHASE II\nNEW DELHI, SOUTH EAST DELHI', placeSupply: 'DELHI', placeCode: '07' },
+  { cliName: 'INKS TECHNOLOGY SERVICES DMCC', cliPan: '', cliGstin: '',
+    cliAddr: 'UNIT NO: 1JLT -NOOK-002 ONE JLT\nPLOT NO: DMCC-EZ1-1AB\nJUMEIRAH LAKES TOWERS DUBAI UAE', placeSupply: 'OTHER COUNTRY', placeCode: '96' }
+];
+function savedClients() {
+  try { return JSON.parse(localStorage.getItem('inv_clients') || '[]'); } catch (e) { return []; }
+}
+function allClients() {
+  const saved = savedClients();
+  // A saved client with a built-in name replaces the built-in one.
+  return [...BUILT_IN_CLIENTS.filter(c => !saved.some(s => s.cliName.toUpperCase() === c.cliName.toUpperCase())), ...saved.map(c => ({ ...c, saved: true }))];
+}
+function renderClientPick(selectedName) {
+  const list = allClients();
+  $('clientPick').innerHTML = '<option value="">— type the details below —</option>' +
+    list.map((c, i) => `<option value="${i}">${esc(c.cliName)}${c.saved ? ' (saved)' : ''}</option>`).join('');
+  const i = list.findIndex(c => c.cliName === selectedName);
+  $('clientPick').value = i >= 0 ? String(i) : '';
+  $('clientDelete').hidden = !(i >= 0 && list[i].saved);
+}
+function useClient(client) {
+  CLIENT_FIELDS.forEach(f => { $(f).value = client[f] ?? ''; });
+  try { localStorage.setItem('inv_client_last', client.cliName); } catch (e) { /* storage blocked */ }
+  refreshIfShown();
+}
+$('clientPick').addEventListener('change', () => {
+  const list = allClients();
+  const client = list[Number($('clientPick').value)];
+  $('clientDelete').hidden = !(client && client.saved);
+  if (client) useClient(client);
+});
+$('clientSave').onclick = () => {
+  const client = Object.fromEntries(CLIENT_FIELDS.map(f => [f, $(f).value.trim()]));
+  if (!client.cliName) { $('formWarn').textContent = 'Type the client name before saving the client.'; return; }
+  const saved = savedClients().filter(c => c.cliName.toUpperCase() !== client.cliName.toUpperCase());
+  try { localStorage.setItem('inv_clients', JSON.stringify([...saved, client])); localStorage.setItem('inv_client_last', client.cliName); } catch (e) { $('formWarn').textContent = 'This browser blocks saving, so the client could not be saved.'; return; }
+  renderClientPick(client.cliName);
+  $('formWarn').textContent = '';
+};
+$('clientDelete').onclick = () => {
+  const client = allClients()[Number($('clientPick').value)];
+  if (!client || !client.saved || !confirm(`Delete the saved client "${client.cliName}"?`)) return;
+  try { localStorage.setItem('inv_clients', JSON.stringify(savedClients().filter(c => c.cliName !== client.cliName))); } catch (e) { /* storage blocked */ }
+  renderClientPick('');
+};
+function loadClients() {
+  let last = '';
+  try { last = localStorage.getItem('inv_client_last') || ''; } catch (e) { /* storage blocked */ }
+  const client = allClients().find(c => c.cliName === last);
+  if (client) useClient(client);
+  renderClientPick(client ? client.cliName : $('cliName').value);
+}
 
 /* ---------- Excel reading ---------- */
 const FIELDS = {
@@ -630,6 +693,7 @@ document.addEventListener('input', refreshIfShown);
 document.addEventListener('change', e => { if (e.target.matches('input[type=checkbox]')) refreshIfShown(); });
 
 loadImages();
+loadClients();
 </script>
 </body>
 </html>
