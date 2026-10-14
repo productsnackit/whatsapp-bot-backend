@@ -36,6 +36,12 @@ td.num,th.num{text-align:right;white-space:nowrap}
 tr.flagged td{background:var(--flag)}
 tr.off td{opacity:.45}
 .flag{color:var(--warn);font-size:12px}
+table.list td.ed{padding:3px 4px}
+table.list td.ed input,table.list td.ed textarea{padding:5px 6px;font-size:13px;min-width:90px;background:var(--card)}
+table.list td.ed textarea{min-height:34px;min-width:180px;resize:vertical}
+table.list td.ed input.amt{text-align:right;min-width:110px}
+button.del{background:transparent;color:var(--muted);border:1px solid var(--line);padding:4px 8px;font-size:13px}
+button.del:hover{color:#c00000;border-color:#c00000}
 .summary{display:flex;flex-wrap:wrap;gap:14px;margin-top:12px;color:var(--muted)}
 .summary b{color:var(--ink)}
 .row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:12px}
@@ -117,6 +123,7 @@ table.inv tr.sumrow td.lab{text-align:right;color:#000}
     <input type="file" id="file" accept=".xlsx,.xls,.csv" style="width:auto;margin-left:6px">
   </div>
   <p class="note" id="fileName"></p>
+  <button class="ghost" id="typeRows" type="button">No Excel? Type the rows yourself</button>
 </section>
 
 <!-- 2. Rows -->
@@ -134,12 +141,14 @@ table.inv tr.sumrow td.lab{text-align:right;color:#000}
     <button class="ghost" id="allOn">Select all</button>
     <button class="ghost" id="allOff">Clear all</button>
     <button class="ghost" id="reparse">Re-read with mapping</button>
+    <button class="ghost" id="addRow" type="button">+ Add row</button>
     <span class="note" id="rowCount"></span>
   </div>
+  <p class="note">Every box can be edited: type over the PNR, passenger, sector, date or amount. Press Enter in Passenger or Sector for a new line (e.g. hotel name, PNR, dates). "Re-read with mapping" reads the Excel again and loses the edits.</p>
   <div class="table-wrap" style="margin-top:10px">
     <table class="list">
       <thead><tr>
-        <th>Use</th><th>#</th><th>PNR / Ticket</th><th>Passenger</th><th>Sector / summary</th><th>Travel date</th><th class="num">Amount (INR)</th>
+        <th>Use</th><th>#</th><th>PNR / Ticket</th><th>Passenger</th><th>Sector / summary</th><th>Travel date</th><th class="num">Amount (INR)</th><th></th>
       </tr></thead>
       <tbody id="rows"></tbody>
     </table>
@@ -396,7 +405,7 @@ function buildRows(map) {
     if (!dateOk) flags.push('travel date unclear');
     if (!/^[A-Z0-9]{5,8}$/i.test(pnr)) flags.push('PNR format looks unusual');
     if (status && !/success/i.test(status)) flags.push('status: ' + status);
-    return { include: true, pnr, pax, sector, date, amount: Number.isFinite(amt) ? amt : 0, flags };
+    return { include: true, pnr, pax, sector, date, status, amount: Number.isFinite(amt) ? amt : 0, flags };
   }).filter(r => r.pnr || r.pax || r.amount);
 }
 
@@ -434,24 +443,76 @@ function reparse() {
 }
 
 /* ---------- rows UI ---------- */
+// A row typed over by hand is checked again (the Excel's booking status still counts).
+function recheck(r) {
+  const flags = [];
+  if (!Number.isFinite(Number(r.amount))) flags.push('amount is not a number');
+  if (!r.date) flags.push('travel date empty');
+  if (r.pnr && !/^[A-Z0-9]{5,8}$/i.test(r.pnr) && !/^\d{1,3}\.?$/.test(r.pnr)) flags.push('PNR format looks unusual');
+  if (r.status && !/success/i.test(r.status)) flags.push('status: ' + r.status);
+  r.flags = flags;
+}
+
 function renderRows() {
+  const box = (i, k, v, kind) => kind === 'area'
+    ? `<td class="ed"><textarea data-i="${i}" data-k="${k}" rows="${Math.max(1, String(v).split('\n').length)}">${esc(v)}</textarea></td>`
+    : `<td class="ed"><input data-i="${i}" data-k="${k}" ${kind === 'num' ? 'type="number" step="0.01" class="amt"' : 'type="text"'} value="${esc(v)}"></td>`;
   $('rows').innerHTML = S.rows.map((r, i) => `
-    <tr class="${r.flags.length ? 'flagged' : ''} ${r.include ? '' : 'off'}">
+    <tr id="row-${i}" class="${r.flags.length ? 'flagged' : ''} ${r.include ? '' : 'off'}">
       <td><input type="checkbox" data-i="${i}" ${r.include ? 'checked' : ''}></td>
       <td>${i + 1}</td>
-      <td>${esc(r.pnr)}</td>
-      <td>${esc(r.pax)}</td>
-      <td>${esc(r.sector)}</td>
-      <td>${esc(r.date)}</td>
-      <td class="num">${money(r.amount)}</td>
+      ${box(i, 'pnr', r.pnr)}
+      ${box(i, 'pax', r.pax, 'area')}
+      ${box(i, 'sector', r.sector, 'area')}
+      ${box(i, 'date', r.date)}
+      ${box(i, 'amount', r.amount === 0 ? '' : r.amount, 'num')}
+      <td><button class="del" type="button" data-del="${i}" title="Remove this row">✕</button></td>
     </tr>
-    ${r.flags.length ? `<tr class="flagged"><td></td><td colspan="6"><span class="flag">⚠ ${r.flags.map(esc).join(' · ')}</span></td></tr>` : ''}
+    <tr id="flag-${i}" class="flagged" ${r.flags.length ? '' : 'hidden'}><td></td><td colspan="7"><span class="flag">⚠ ${r.flags.map(esc).join(' · ')}</span></td></tr>
   `).join('');
-  $('rowCount').textContent = `${S.rows.length} rows found`;
+  document.querySelectorAll('#rows textarea').forEach(fitBox);
+  $('rowCount').textContent = `${S.rows.length} rows`;
   const flagged = S.rows.filter(r => r.flags.length).length;
-  $('warnBox').textContent = flagged ? `${flagged} row(s) need a look (highlighted). Untick anything that should not be on the invoice.` : '';
+  $('warnBox').textContent = flagged ? `${flagged} row(s) need a look (highlighted). Fix them above, or untick anything that should not be on the invoice.` : '';
   updateTotals();
 }
+
+// Passenger / sector boxes grow to show all their lines.
+function fitBox(el) { el.style.height = 'auto'; el.style.height = (el.scrollHeight + 2) + 'px'; }
+
+// Typing in a box: saved at once (totals and the invoice follow); checked again when you leave it.
+document.addEventListener('input', e => {
+  const k = e.target.dataset && e.target.dataset.k;
+  if (!k || !e.target.closest('#rows')) return;
+  const r = S.rows[+e.target.dataset.i];
+  r[k] = k === 'amount' ? (e.target.value === '' ? 0 : Number(e.target.value)) : e.target.value;
+  if (e.target.tagName === 'TEXTAREA') fitBox(e.target);
+  updateTotals();
+});
+document.addEventListener('focusout', e => {
+  if (!(e.target.dataset && e.target.dataset.k && e.target.closest('#rows'))) return;
+  const r = S.rows[+e.target.dataset.i];
+  if (typeof r.pnr === 'string') r.pnr = r.pnr.trim();
+  const before = r.flags.join('|');
+  recheck(r);
+  // Only that row's warning changes (the table isn't redrawn, so typing carries on undisturbed).
+  if (before === r.flags.join('|')) return;
+  const i = +e.target.dataset.i;
+  $('row-' + i).classList.toggle('flagged', r.flags.length > 0);
+  $('flag-' + i).hidden = !r.flags.length;
+  $('flag-' + i).querySelector('.flag').textContent = '⚠ ' + r.flags.join(' · ');
+  const flagged = S.rows.filter(x => x.flags.length).length;
+  $('warnBox').textContent = flagged ? `${flagged} row(s) need a look (highlighted). Fix them above, or untick anything that should not be on the invoice.` : '';
+});
+document.addEventListener('click', e => {
+  const del = e.target.closest && e.target.closest('#rows button[data-del]');
+  if (!del) return;
+  const r = S.rows[+del.dataset.del];
+  if (!confirm(`Remove row ${+del.dataset.del + 1}${r.pnr ? ` (${r.pnr})` : ''} from this invoice?`)) return;
+  S.rows.splice(+del.dataset.del, 1);
+  renderRows();
+  refreshIfShown();
+});
 
 function updateTotals() {
   const sel = S.rows.filter(r => r.include);
@@ -470,7 +531,18 @@ document.addEventListener('change', e => {
 });
 $('allOn').onclick = () => { S.rows.forEach(r => r.include = true); renderRows(); refreshIfShown(); };
 $('allOff').onclick = () => { S.rows.forEach(r => r.include = false); renderRows(); refreshIfShown(); };
-$('reparse').onclick = () => { reparse(); refreshIfShown(); };
+$('reparse').onclick = () => {
+  if (S.rows.length && !confirm('Read the Excel again? Any changes typed in the rows will be lost.')) return;
+  reparse(); refreshIfShown();
+};
+$('typeRows').onclick = () => $('addRow').click();
+$('addRow').onclick = () => {
+  S.rows.push({ include: true, pnr: '', pax: '', sector: '', date: '', status: '', amount: 0, flags: [] });
+  $('rowsSec').hidden = false;
+  renderRows();
+  const last = document.querySelector(`#rows [data-i="${S.rows.length - 1}"][data-k="pnr"]`);
+  if (last) last.focus();
+};
 Object.keys(FIELDS).forEach(id => $(id).addEventListener('change', () => { reparse(); refreshIfShown(); }));
 
 $('file').addEventListener('change', e => e.target.files[0] && loadFile(e.target.files[0]));
@@ -561,16 +633,16 @@ function renderInvoice() {
   const itemRows = c.included.map((r, i) => `
     <tr>
       <td class="col-no k">${esc(r.pnr)}</td>
-      <td class="col-pax">${esc(r.pax)}</td>
+      <td class="col-pax">${txt(r.pax)}</td>
       <td class="col-sec"></td>
       <td class="num">${money(r.amount)}</td>
       <td class="num"></td>
       <td class="num">${money(r.amount)}</td>
     </tr>
-    <tr class="pink">
+    ${r.sector || r.date ? `<tr class="pink">
       <td></td>
-      <td colspan="5">${esc(r.sector)}${r.date ? ' &nbsp;' + esc(r.date) : ''}</td>
-    </tr>`).join('');
+      <td colspan="5">${txt(r.sector)}${r.date ? ' &nbsp;' + esc(r.date) : ''}</td>
+    </tr>` : ''}`).join('');
 
   const salesRow = `
     <tr class="sumrow">
