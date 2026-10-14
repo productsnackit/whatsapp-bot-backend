@@ -1,0 +1,635 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Invoice Dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<style>
+:root{--bg:#f5f6f8;--card:#fff;--ink:#1d2330;--muted:#6b7280;--line:#e3e6eb;--accent:#1f6feb;--warn:#b45309;--flag:#fff7ed}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--bg:#0f1115;--card:#171a21;--ink:#e6e8ee;--muted:#9aa3b2;--line:#2a2f3a;--accent:#6ea8ff;--warn:#f59e0b;--flag:#2a2214}}
+:root[data-theme="dark"]{--bg:#0f1115;--card:#171a21;--ink:#e6e8ee;--muted:#9aa3b2;--line:#2a2f3a;--accent:#6ea8ff;--warn:#f59e0b;--flag:#2a2214}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+header{padding:18px 16px;border-bottom:1px solid var(--line);background:var(--card)}
+header h1{margin:0;font-size:18px}
+header p{margin:4px 0 0;color:var(--muted)}
+main{max-width:1100px;margin:0 auto;padding:16px;display:grid;gap:16px}
+section{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px}
+section h2{margin:0 0 12px;font-size:15px}
+section h3{margin:16px 0 8px;font-size:13px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px 14px}
+label{display:grid;gap:4px;font-size:12px;color:var(--muted)}
+input,select,textarea{font:inherit;color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:7px 9px;width:100%}
+input[type=checkbox]{width:auto}
+textarea{min-height:64px;resize:vertical}
+button{font:inherit;border:0;border-radius:6px;padding:9px 14px;background:var(--accent);color:#fff;cursor:pointer}
+button.ghost{background:transparent;color:var(--accent);border:1px solid var(--line)}
+button:disabled{opacity:.5;cursor:not-allowed}
+.drop{border:2px dashed var(--line);border-radius:10px;padding:22px;text-align:center;color:var(--muted)}
+.drop.over{border-color:var(--accent)}
+.table-wrap{overflow-x:auto;border:1px solid var(--line);border-radius:8px}
+table.list{width:100%;border-collapse:collapse;font-size:13px}
+table.list th,table.list td{padding:7px 8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+table.list th{background:var(--bg);font-weight:600;color:var(--muted);white-space:nowrap}
+td.num,th.num{text-align:right;white-space:nowrap}
+tr.flagged td{background:var(--flag)}
+tr.off td{opacity:.45}
+.flag{color:var(--warn);font-size:12px}
+.summary{display:flex;flex-wrap:wrap;gap:14px;margin-top:12px;color:var(--muted)}
+.summary b{color:var(--ink)}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:12px}
+.note{color:var(--muted);font-size:12px}
+.hint{color:var(--warn);font-size:13px}
+.mapping{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:8px 12px;margin-bottom:10px}
+.imgbox{border:1px solid var(--line);border-radius:8px;padding:10px;display:grid;gap:8px;align-content:start}
+.imgbox img{max-height:70px;max-width:100%;object-fit:contain;background:#fff;border-radius:4px;padding:4px}
+.imgbox .chk{display:flex;gap:6px;align-items:center;color:var(--ink);font-size:13px}
+
+/* ===== invoice sheet: fixed colours, matches the original PDF ===== */
+#sheet{display:none;background:#fff;color:#000;width:100%;max-width:820px;margin:0 auto;padding:22px 26px;border-radius:4px;font-family:"Courier New",Courier,monospace;font-size:12px;font-weight:bold}
+#sheet.show{display:block}
+#sheet .sans{font-family:Arial,Helvetica,sans-serif}
+.top{display:flex;justify-content:space-between;align-items:flex-start;gap:16px}
+.logo{width:170px;min-height:64px}
+.logo img{max-width:170px;max-height:90px;object-fit:contain}
+.co{text-align:right;color:#8b0000;font-family:Arial,Helvetica,sans-serif;font-weight:normal;font-size:11px;line-height:1.35}
+.co .name{font-size:22px;font-weight:bold;letter-spacing:.5px}
+.gst-line{margin-top:10px;text-align:right;color:#8b0000;font-family:Arial,Helvetica,sans-serif;font-size:11px}
+.copy-row{display:flex;justify-content:space-between;align-items:flex-end;margin-top:10px}
+.copy{color:#7b2fbf;font-family:Arial,Helvetica,sans-serif;font-size:12px;font-style:italic;font-weight:bold}
+.inv-title{font-family:Arial,Helvetica,sans-serif;font-size:22px;font-weight:bold;color:#000}
+.addr{margin-top:6px;line-height:1.45}
+.meta{display:flex;justify-content:space-between;gap:12px;margin-top:6px}
+.meta .left,.meta .right{line-height:1.5;white-space:pre-line}
+.meta .lab{color:#1f1fbf}
+.meta .val{color:#1f1fbf}
+.narr{display:flex;justify-content:space-between;margin-top:6px;color:#1f1fbf;font-weight:bold}
+table.inv{width:100%;border-collapse:collapse;margin-top:8px;border:1px solid #000}
+table.inv th{background:#d3d3d3;border:1px solid #000;padding:4px 5px;text-align:left;font-weight:bold;color:#000}
+table.inv td{padding:4px 5px;vertical-align:top;font-weight:bold;color:#1f1fbf}
+table.inv td.k{color:#000}
+table.inv td.num,table.inv th.num{text-align:right;white-space:nowrap}
+table.inv td.col-no{width:12%}
+table.inv td.col-pax{width:34%}
+table.inv td.col-sec{width:17%}
+table.inv tr.pink td{background:#ffccff;color:#1f1fbf}
+table.inv tr.green td{background:#ccffcc;color:#000}
+table.inv td.hl{background:#ffff00;color:#000}
+table.inv tr.sumrow td{border:0;padding:2px 5px}
+table.inv tr.sumrow td.lab{text-align:right;color:#000}
+.words{background:#ccffcc;border:1px solid #000;border-top:0;padding:5px 6px;color:#000;font-weight:bold;display:flex;justify-content:space-between;gap:10px}
+.eoe{margin-top:8px;display:flex;justify-content:space-between;align-items:flex-start}
+.bank{line-height:1.55;margin-top:6px}
+.bank .lab{background:#ffff00;padding:0 4px;color:#000}
+.bank .val{color:#1f1fbf}
+.sign{text-align:right;font-family:Arial,Helvetica,sans-serif;font-weight:normal;color:#8b0000;position:relative}
+.sign .forco{font-weight:bold}
+.sign .stampimg{max-width:150px;max-height:150px;object-fit:contain;display:block;margin-left:auto;margin-top:4px}
+.terms{margin-top:14px;font-family:Arial,Helvetica,sans-serif;font-weight:normal;font-size:10px;line-height:1.5;color:#000}
+.terms u{color:#c00000;font-weight:bold}
+.terms .lab{color:#c00000;font-weight:bold}
+.hl-y{background:#ffff00;color:#000}
+
+@media print{
+  body{background:#fff}
+  .no-print,header{display:none!important}
+  main{padding:0;max-width:none}
+  section{border:0;padding:0}
+  #sheet{display:block!important;padding:0;border-radius:0;max-width:none}
+  @page{size:A4;margin:10mm}
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>Invoice Dashboard</h1>
+  <p>Upload the booking Excel, choose the rows, fill the details, and generate the invoice in the same format as your previous PDF.</p>
+</header>
+
+<main>
+
+<!-- 1. Upload -->
+<section class="no-print">
+  <h2>1. Upload booking Excel</h2>
+  <div class="drop" id="drop">
+    Drag an .xlsx / .csv file here, or
+    <input type="file" id="file" accept=".xlsx,.xls,.csv" style="width:auto;margin-left:6px">
+  </div>
+  <p class="note" id="fileName"></p>
+</section>
+
+<!-- 2. Rows -->
+<section class="no-print" id="rowsSec" hidden>
+  <h2>2. Check the rows</h2>
+  <div class="mapping">
+    <label>Ticket / PNR column <select id="mapPnr"></select></label>
+    <label>Passenger column <select id="mapPax"></select></label>
+    <label>Sector / summary column <select id="mapSector"></select></label>
+    <label>Amount column <select id="mapAmount"></select></label>
+    <label>Travel date column <select id="mapDate"></select></label>
+    <label>Booking status column <select id="mapStatus"></select></label>
+  </div>
+  <div class="row">
+    <button class="ghost" id="allOn">Select all</button>
+    <button class="ghost" id="allOff">Clear all</button>
+    <button class="ghost" id="reparse">Re-read with mapping</button>
+    <span class="note" id="rowCount"></span>
+  </div>
+  <div class="table-wrap" style="margin-top:10px">
+    <table class="list">
+      <thead><tr>
+        <th>Use</th><th>#</th><th>PNR / Ticket</th><th>Passenger</th><th>Sector / summary</th><th>Travel date</th><th class="num">Amount (INR)</th>
+      </tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+  <div class="summary">
+    <span>Selected rows: <b id="selCount">0</b></span>
+    <span>Selected total: <b id="selTotal">0.00</b></span>
+  </div>
+  <p class="hint" id="warnBox"></p>
+</section>
+
+<!-- 3. Details -->
+<section class="no-print">
+  <h2>3. Invoice details</h2>
+
+  <h3>Logo &amp; stamp (stamp includes signature)</h3>
+  <div class="grid">
+    <div class="imgbox">
+      <label class="chk"><input type="checkbox" id="showLogo" checked> Show logo</label>
+      <img id="logoPrev" alt="" hidden>
+      <input type="file" id="logoFile" accept="image/*">
+      <button class="ghost" id="logoClear" type="button">Remove logo</button>
+    </div>
+    <div class="imgbox">
+      <label class="chk"><input type="checkbox" id="showStamp" checked> Show stamp with signature</label>
+      <img id="stampPrev" alt="" hidden>
+      <input type="file" id="stampFile" accept="image/*">
+      <button class="ghost" id="stampClear" type="button">Remove stamp</button>
+    </div>
+  </div>
+  <p class="note">Images are kept in this browser only, so you don't need to upload them again next time. PNG with a transparent background looks best.</p>
+
+  <h3>Invoice</h3>
+  <div class="grid">
+    <label>Copy label <input id="copyLabel" value="Original For Recipient"></label>
+    <label>Invoice no. <input id="invNo" placeholder="e.g. IS/0000009"></label>
+    <label>Invoice date <input id="invDate" type="date"></label>
+    <label>Due date <input id="dueDate" type="date"></label>
+    <label>Reference <input id="ref"></label>
+    <label>SAC code <input id="sac"></label>
+    <label>Narration <input id="narr"></label>
+    <label>Airline / account <input id="airline" value="HOTEL INCOME A/C"></label>
+  </div>
+
+  <h3>Bill from (supplier)</h3>
+  <div class="grid">
+    <label>Company name (header) <input id="supName" value="TRIPNINE"></label>
+    <label>Legal name <input id="supLegal" value="AVYAN ENTERPRISES"></label>
+    <label>GSTIN <input id="supGstin" value="29AFPPN6097Q1Z3"></label>
+    <label>Address <textarea id="supAddr">2280, GROUND FLOOR, 16 CROSS, 21ST A MAIN ROAD, SECTOR 1,
+HSR LAYOUT, BENGALURU. 560-102.</textarea></label>
+    <label>Tel / Email / URL <textarea id="supContact">Tel : 9980552200,9980550603
+Email : info@tripnine.in URL : WWW.TRIPNINE.IN</textarea></label>
+  </div>
+
+  <h3>Bill to (client)</h3>
+  <div class="grid">
+    <label>Client name <input id="cliName" value="SOMISH SOLUTIONS LIMITED"></label>
+    <label>PAN <input id="cliPan" value="AANCS8910R"></label>
+    <label>GSTIN <input id="cliGstin" value="07AANCS8910R1ZF"></label>
+    <label>Address <textarea id="cliAddr">FIRST FLOOR, E 47/3
+OKHLA INDUSTRIAL AREA, PHASE II
+NEW DELHI, SOUTH EAST DELHI</textarea></label>
+    <label>Place of supply <input id="placeSupply" value="DELHI"></label>
+    <label>State code (2-digit) <input id="placeCode" value="07" maxlength="2"></label>
+  </div>
+
+  <h3>Service charge &amp; tax</h3>
+  <div class="grid">
+    <label>Taxable fare (INR) <input id="taxFare" type="number" step="0.01" value="0"></label>
+    <label>Taxable service charge (INR) <input id="taxSvc" type="number" step="0.01" value="0"></label>
+    <label>GST rate (%) <input id="gstRate" type="number" step="0.01" value="18"></label>
+    <label>Sales A/C adjustment (INR) <input id="salesAdj" type="number" step="0.01" value="0"></label>
+    <label>Tax adjustment on fare (INR) <input id="taxAdj" type="number" step="0.01" value="0"></label>
+  </div>
+  <h3>Amounts shown on the invoice (type to override)</h3>
+  <div class="grid">
+    <label>Service charges – SALES A/C (INR) <input id="ovSales" type="number" step="0.01" placeholder="auto"></label>
+    <label>GST 1 – on taxable fare (INR) <input id="ovGst1" type="number" step="0.01" placeholder="auto"></label>
+    <label>GST 2 – on service charge (INR) <input id="ovGst2" type="number" step="0.01" placeholder="auto"></label>
+  </div>
+  <p class="note">Leave a box empty to use the calculated amount, or type the exact amount you want printed on that line. Typed amounts replace the calculation, so the total updates to match.</p>
+  <p class="note">Tax is IGST when the supplier and place-of-supply state codes differ, otherwise CGST + SGST. The adjustment boxes are for rounding only. Your previous PDF used +0.84 on the sales line and +0.16 on the fare IGST. Enter those to match it exactly, or leave them at 0 for the correct arithmetic.</p>
+
+  <h3>Bank details</h3>
+  <div class="grid">
+    <label>Bank name <input id="bankName" value="HDFC BANK"></label>
+    <label>Bank address / account name <input id="bankAcName" value="AVYAN ENTERPRISES"></label>
+    <label>SWIFT code <input id="bankSwift" value="HDFCINBBXXX"></label>
+    <label>IFSC code <input id="bankIfsc" value="HDFC0001756"></label>
+    <label>A/c. no. <input id="bankAc" value="50200074556962"></label>
+  </div>
+
+  <div class="row">
+    <button id="preview">Generate invoice</button>
+    <button class="ghost" id="printBtn" disabled>Print / Save as PDF</button>
+  </div>
+  <p class="hint" id="formWarn"></p>
+</section>
+
+<!-- 4. Output -->
+<div id="sheet"></div>
+
+</main>
+
+<script>
+/* ---------- state ---------- */
+const S = { headers: [], raw: [], rows: [], fileName: '' };
+const IMG = { logo: null, stamp: null };
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const money = n => Number(n || 0).toLocaleString('en-IN', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+const num = id => Number($(id).value) || 0;
+
+/* ---------- saved images (per browser; wrapped in try/catch) ---------- */
+function loadImages() {
+  try { localStorage.removeItem('inv_sig'); } catch (e) { /* signature upload was removed */ }
+  ['logo', 'stamp'].forEach(k => {
+    try { IMG[k] = localStorage.getItem('inv_' + k); } catch (e) { IMG[k] = null; }
+    showPreview(k);
+  });
+}
+function showPreview(k) {
+  const img = $(k === 'logo' ? 'logoPrev' : 'stampPrev');
+  if (IMG[k]) { img.src = IMG[k]; img.hidden = false; } else { img.removeAttribute('src'); img.hidden = true; }
+}
+function setImage(k, dataUrl) {
+  IMG[k] = dataUrl;
+  try { dataUrl ? localStorage.setItem('inv_' + k, dataUrl) : localStorage.removeItem('inv_' + k); } catch (e) { /* storage blocked: keep in memory only */ }
+  showPreview(k);
+  refreshIfShown();
+}
+[['logo', 'logoFile', 'logoClear'], ['stamp', 'stampFile', 'stampClear']].forEach(([k, f, c]) => {
+  $(f).addEventListener('change', e => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const r = new FileReader();
+    r.onload = ev => setImage(k, ev.target.result);
+    r.readAsDataURL(file);
+  });
+  $(c).onclick = () => { $(f).value = ''; setImage(k, null); };
+});
+
+/* ---------- Excel reading ---------- */
+const FIELDS = {
+  mapPnr:    { key: 'pnr',    pats: [/pnr/i, /ticket/i, /booking ref/i] },
+  mapPax:    { key: 'pax',    pats: [/passenger/i, /pax/i, /name/i] },
+  mapSector: { key: 'sector', pats: [/summary/i, /sector/i, /route/i, /flight/i, /description/i] },
+  mapAmount: { key: 'amount', pats: [/total amount/i, /amount/i, /total/i, /fare/i] },
+  mapDate:   { key: 'date',   pats: [/travel date/i, /travel/i, /departure/i] },
+  mapStatus: { key: 'status', pats: [/booking status/i, /^status$/i] }
+};
+
+function guessColumn(pats) {
+  for (const p of pats) {
+    const i = S.headers.findIndex(h => p.test(h));
+    if (i >= 0) return i;
+  }
+  return -1;
+}
+
+function fmtDate(d, utc) {
+  const day = String(utc ? d.getUTCDate() : d.getDate()).padStart(2, '0');
+  const mon = String((utc ? d.getUTCMonth() : d.getMonth()) + 1).padStart(2, '0');
+  const yr = utc ? d.getUTCFullYear() : d.getFullYear();
+  return `${day}/${mon}/${yr}`;
+}
+
+function buildRows(map) {
+  const get = (r, idx) => (idx >= 0 ? r[idx] : '');
+  return S.raw.map(r => {
+    const flags = [];
+    const pnr = String(get(r, map.pnr)).trim();
+    const pax = String(get(r, map.pax)).trim();
+    const sector = String(get(r, map.sector)).trim();
+    const amtRaw = get(r, map.amount);
+    const amt = typeof amtRaw === 'number' ? amtRaw : Number(String(amtRaw).replace(/[,\s₹]/g, ''));
+    const dRaw = get(r, map.date);
+    let date = '', dateOk = true;
+    if (typeof dRaw === 'number' && dRaw > 20000) {
+      date = fmtDate(new Date(Math.round((dRaw - 25569) * 864e5)), true); // Excel serial date
+    } else if (String(dRaw).trim() === '') {
+      dateOk = false;
+    } else {
+      const t = Date.parse(String(dRaw));
+      if (isNaN(t)) { date = String(dRaw); dateOk = false; }
+      else date = fmtDate(new Date(t), false);
+    }
+    const status = String(get(r, map.status)).trim();
+    if (!Number.isFinite(amt)) flags.push('amount is not a number');
+    if (!dateOk) flags.push('travel date unclear');
+    if (!/^[A-Z0-9]{5,8}$/i.test(pnr)) flags.push('PNR format looks unusual');
+    if (status && !/success/i.test(status)) flags.push('status: ' + status);
+    return { include: true, pnr, pax, sector, date, amount: Number.isFinite(amt) ? amt : 0, flags };
+  }).filter(r => r.pnr || r.pax || r.amount);
+}
+
+function readMapping() {
+  const map = {};
+  for (const [sel, f] of Object.entries(FIELDS)) map[f.key] = Number($(sel).value);
+  return map;
+}
+
+function loadFile(file) {
+  const reader = new FileReader();
+  reader.onload = e => {
+    const wb = XLSX.read(new Uint8Array(e.target.result), { type: 'array' });
+    const ws = wb.Sheets[wb.SheetNames[0]];
+    const aoa = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '', raw: true });
+    S.headers = (aoa[0] || []).map(h => String(h).trim());
+    S.raw = aoa.slice(1).filter(r => r.some(c => String(c).trim() !== ''));
+    S.fileName = file.name;
+    $('fileName').textContent = `Loaded ${file.name}: ${S.raw.length} data rows, sheet "${wb.SheetNames[0]}".`;
+    for (const [sel, f] of Object.entries(FIELDS)) {
+      const el = $(sel);
+      el.innerHTML = '<option value="-1">— none —</option>' +
+        S.headers.map((h, i) => `<option value="${i}">${esc(h || 'Column ' + (i + 1))}</option>`).join('');
+      el.value = String(guessColumn(f.pats));
+    }
+    $('rowsSec').hidden = false;
+    reparse();
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+function reparse() {
+  S.rows = buildRows(readMapping());
+  renderRows();
+}
+
+/* ---------- rows UI ---------- */
+function renderRows() {
+  $('rows').innerHTML = S.rows.map((r, i) => `
+    <tr class="${r.flags.length ? 'flagged' : ''} ${r.include ? '' : 'off'}">
+      <td><input type="checkbox" data-i="${i}" ${r.include ? 'checked' : ''}></td>
+      <td>${i + 1}</td>
+      <td>${esc(r.pnr)}</td>
+      <td>${esc(r.pax)}</td>
+      <td>${esc(r.sector)}</td>
+      <td>${esc(r.date)}</td>
+      <td class="num">${money(r.amount)}</td>
+    </tr>
+    ${r.flags.length ? `<tr class="flagged"><td></td><td colspan="6"><span class="flag">⚠ ${r.flags.map(esc).join(' · ')}</span></td></tr>` : ''}
+  `).join('');
+  $('rowCount').textContent = `${S.rows.length} rows found`;
+  const flagged = S.rows.filter(r => r.flags.length).length;
+  $('warnBox').textContent = flagged ? `${flagged} row(s) need a look (highlighted). Untick anything that should not be on the invoice.` : '';
+  updateTotals();
+}
+
+function updateTotals() {
+  const sel = S.rows.filter(r => r.include);
+  $('selCount').textContent = sel.length;
+  $('selTotal').textContent = money(sel.reduce((a, r) => a + r.amount, 0));
+}
+
+document.addEventListener('change', e => {
+  if (e.target.matches('#rows input[type=checkbox]')) {
+    const r = S.rows[+e.target.dataset.i];
+    r.include = e.target.checked;
+    e.target.closest('tr').classList.toggle('off', !r.include);
+    updateTotals();
+    refreshIfShown();
+  }
+});
+$('allOn').onclick = () => { S.rows.forEach(r => r.include = true); renderRows(); refreshIfShown(); };
+$('allOff').onclick = () => { S.rows.forEach(r => r.include = false); renderRows(); refreshIfShown(); };
+$('reparse').onclick = () => { reparse(); refreshIfShown(); };
+Object.keys(FIELDS).forEach(id => $(id).addEventListener('change', () => { reparse(); refreshIfShown(); }));
+
+$('file').addEventListener('change', e => e.target.files[0] && loadFile(e.target.files[0]));
+const drop = $('drop');
+['dragenter', 'dragover'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('over'); }));
+['dragleave', 'drop'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('over'); }));
+drop.addEventListener('drop', e => e.dataTransfer.files[0] && loadFile(e.dataTransfer.files[0]));
+
+/* ---------- money in words (Indian numbering) ---------- */
+function inWords(n) {
+  const ones = ['', 'One', 'Two', 'Three', 'Four', 'Five', 'Six', 'Seven', 'Eight', 'Nine', 'Ten', 'Eleven', 'Twelve',
+    'Thirteen', 'Fourteen', 'Fifteen', 'Sixteen', 'Seventeen', 'Eighteen', 'Nineteen'];
+  const tens = ['', '', 'Twenty', 'Thirty', 'Forty', 'Fifty', 'Sixty', 'Seventy', 'Eighty', 'Ninety'];
+  const two = x => x < 20 ? ones[x] : tens[Math.floor(x / 10)] + (x % 10 ? ' ' + ones[x % 10] : '');
+  const three = x => { const h = Math.floor(x / 100), r = x % 100; return (h ? ones[h] + ' Hundred' + (r ? ' ' : '') : '') + (r ? two(r) : ''); };
+  const big = x => {
+    if (x === 0) return 'Zero';
+    const parts = [];
+    const cr = Math.floor(x / 1e7); x %= 1e7;
+    const lk = Math.floor(x / 1e5); x %= 1e5;
+    const th = Math.floor(x / 1000); x %= 1000;
+    if (cr) parts.push(big(cr) + ' Crore');
+    if (lk) parts.push(two(lk) + ' Lakh');
+    if (th) parts.push(two(th) + ' Thousand');
+    if (x) parts.push(three(x));
+    return parts.join(' ');
+  };
+  const cents = Math.round(n * 100);
+  const rupees = Math.floor(cents / 100), paise = cents % 100;
+  return 'INR ' + big(rupees) + (paise ? ' And Paise ' + two(paise) : '') + ' Only';
+}
+
+/* ---------- calculation ---------- */
+function calc() {
+  const included = S.rows.filter(r => r.include);
+  const subtotal = included.reduce((a, r) => a + r.amount, 0);
+  const fare = num('taxFare'), svc = num('taxSvc'), rate = num('gstRate') / 100;
+  const typed = id => $(id).value.trim() === '' ? null : Number($(id).value);
+  const salesAc = typed('ovSales') ?? (fare + svc + num('salesAdj'));
+  const supState = $('supGstin').value.trim().slice(0, 2);
+  const placeState = $('placeCode').value.trim();
+  const interstate = supState !== placeState;
+  const pct = $('gstRate').value;
+
+  // each taxable component gets its own tax lines, like the PDF
+  const comps = [
+    { name: 'Taxable Fare', base: fare, calc: fare * rate + num('taxAdj'), typed: typed('ovGst1') },
+    { name: 'Taxable Service Charge', base: svc, calc: svc * rate, typed: typed('ovGst2') }
+  ].filter(c => c.base || c.typed !== null);
+  const lines = [];
+  comps.forEach(c => {
+    const tax = c.typed ?? c.calc;
+    if (interstate) {
+      lines.push({ note: `(${c.name} = ${money(c.base)})`, label: `IGST @ ${Number(pct).toFixed(2)}%`, amt: tax });
+    } else {
+      lines.push({ note: `(${c.name} = ${money(c.base)})`, label: `CGST @ ${(pct / 2).toFixed(2)}%`, amt: tax / 2 });
+      lines.push({ note: '', label: `SGST @ ${(pct / 2).toFixed(2)}%`, amt: tax / 2 });
+    }
+  });
+  const taxTotal = lines.reduce((a, t) => a + t.amt, 0);
+  const grand = Math.round((subtotal + salesAc + taxTotal) * 100) / 100;
+  return { included, subtotal, salesAc, lines, grand, interstate };
+}
+
+function supplyStateName(code) {
+  const map = { '01':'Jammu & Kashmir','02':'Himachal Pradesh','03':'Punjab','04':'Chandigarh','05':'Uttarakhand','06':'Haryana','07':'Delhi','08':'Rajasthan','09':'Uttar Pradesh','10':'Bihar','11':'Sikkim','12':'Arunachal Pradesh','13':'Nagaland','14':'Manipur','15':'Mizoram','16':'Tripura','17':'Meghalaya','18':'Assam','19':'West Bengal','20':'Jharkhand','21':'Odisha','22':'Chhattisgarh','23':'Madhya Pradesh','24':'Gujarat','27':'Maharashtra','29':'Karnataka','30':'Goa','32':'Kerala','33':'Tamil Nadu','36':'Telangana','37':'Andhra Pradesh' };
+  return map[code] || '';
+}
+
+const txt = s => esc(s).replace(/\n/g, '<br>');
+const dmy = iso => { if (!iso) return ''; const [y, m, d] = iso.split('-'); return `${d}/${m}/${y}`; };
+
+function checkForm() {
+  const missing = [];
+  if (!$('invNo').value.trim()) missing.push('invoice no.');
+  if (!$('invDate').value) missing.push('invoice date');
+  if (!$('cliName').value.trim()) missing.push('client name');
+  if (!S.rows.some(r => r.include)) missing.push('at least one row');
+  $('formWarn').textContent = missing.length ? 'Still needed: ' + missing.join(', ') : '';
+  return missing.length === 0;
+}
+
+/* ---------- invoice render (mirrors the previous PDF layout) ---------- */
+function renderInvoice() {
+  const c = calc();
+  const pad = $('supGstin').value.trim();
+
+  const itemRows = c.included.map((r, i) => `
+    <tr>
+      <td class="col-no k">${esc(r.pnr)}</td>
+      <td class="col-pax">${esc(r.pax)}</td>
+      <td class="col-sec"></td>
+      <td class="num">${money(r.amount)}</td>
+      <td class="num"></td>
+      <td class="num">${money(r.amount)}</td>
+    </tr>
+    <tr class="pink">
+      <td></td>
+      <td colspan="5">${esc(r.sector)}${r.date ? ' &nbsp;' + esc(r.date) : ''}</td>
+    </tr>`).join('');
+
+  const salesRow = `
+    <tr class="sumrow">
+      <td colspan="3" class="lab">Add : SALES A/C (INT - SERV. CHRGS #1)</td>
+      <td colspan="2"></td>
+      <td class="num k">${money(c.salesAc)}</td>
+    </tr>`;
+
+  const taxRows = c.lines.map(t => `
+    <tr class="sumrow">
+      <td colspan="3" class="lab">${t.note ? `<span class="hl hl-y">${esc(t.note)}</span> ` : ''}Add : ${esc(t.label)}</td>
+      <td colspan="2"></td>
+      <td class="num k">${money(t.amt)}</td>
+    </tr>`).join('');
+
+  const logoHtml = IMG.logo && $('showLogo').checked ? `<img src="${IMG.logo}" alt="logo">` : '';
+  const stampHtml = IMG.stamp && $('showStamp').checked ? `<img class="stampimg" src="${IMG.stamp}" alt="stamp">` : '';
+
+  $('sheet').innerHTML = `
+    <div class="top">
+      <div class="logo">${logoHtml}</div>
+      <div class="co">
+        <div class="name">${esc($('supName').value)}</div>
+        ${txt($('supLegal').value ? $('supLegal').value + '\n' + $('supAddr').value : $('supAddr').value)}<br>
+        ${txt($('supContact').value)}
+      </div>
+    </div>
+    <div class="gst-line">GSTIN : ${esc(pad)} (${esc(supplyStateName(pad.slice(0, 2)) ? pad.slice(0, 2) + ' ' + supplyStateName(pad.slice(0, 2)).toUpperCase() : pad.slice(0, 2))})</div>
+
+    <div class="copy-row">
+      <div class="copy">${esc($('copyLabel').value)}</div>
+      <div class="inv-title">INVOICE</div>
+      <div style="width:150px"></div>
+    </div>
+
+    <div class="meta">
+      <div class="left">
+        <span class="lab">To :</span> <span class="val">${esc($('cliName').value)}</span><br>
+        <span class="lab">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</span> <span class="val">${txt($('cliAddr').value)}</span><br>
+        <span class="lab">PAN :</span> <span class="val">${esc($('cliPan').value)}</span><br>
+        <span class="lab">GST :</span> <span class="val">${esc($('cliGstin').value)}</span> <span class="lab">State :</span> <span class="val">${esc($('placeCode').value)}</span><br>
+        <span class="lab">Place Of Supply :</span> <span class="val">${esc($('placeSupply').value)}</span>
+      </div>
+      <div class="right">
+        <span class="lab">Inv. No. :</span> <span class="val">${esc($('invNo').value)}</span><br>
+        <span class="lab">Inv. Date :</span> <span class="val">${dmy($('invDate').value)}</span><br>
+        <span class="lab">Due Date :</span> <span class="val">${dmy($('dueDate').value)}</span><br>
+        <span class="lab">Reference :</span> <span class="val">${esc($('ref').value)}</span><br>
+        <span class="lab">SAC Code :</span> <span class="val">${esc($('sac').value)}</span>
+      </div>
+    </div>
+    <div class="narr">
+      <span>Narr : ${esc($('narr').value)}</span>
+      <span>Airline : ${esc($('airline').value)} &nbsp;&nbsp; Page : 1</span>
+    </div>
+
+    <table class="inv">
+      <thead><tr>
+        <th class="col-no">Ticket No.</th><th class="col-pax">Pax Name</th><th class="col-sec">Sector</th>
+        <th class="num">Basic Fare</th><th class="num">Taxes</th><th class="num">Total Fare (INR)</th>
+      </tr></thead>
+      <tbody>
+        ${itemRows || '<tr><td colspan="6">No rows selected</td></tr>'}
+        <tr class="green">
+          <td colspan="3" style="text-align:right">Sub-Total</td>
+          <td class="num">${money(c.subtotal)}</td><td></td>
+          <td class="num">${money(c.subtotal)}</td>
+        </tr>
+        ${salesRow}
+        ${taxRows}
+      </tbody>
+    </table>
+    <div class="words">
+      <span>${esc(inWords(c.grand))}</span>
+      <span>${money(c.grand)}</span>
+    </div>
+
+    <div class="eoe">
+      <div class="bank">
+        <span class="lab">Bank Details</span> &nbsp; <span class="lab" style="background:none">E.&amp;O.E.</span><br>
+        <span class="val">Bank Name : ${esc($('bankName').value)}</span><br>
+        <span class="val">Bank Addr : ${esc($('bankAcName').value)}</span><br>
+        <span class="val">SWIFT Code : ${esc($('bankSwift').value)}</span><br>
+        <span class="val">IFSC Code : ${esc($('bankIfsc').value)}</span><br>
+        <span class="val">A/c. No. : ${esc($('bankAc').value)}</span>
+      </div>
+      <div class="sign">
+        <div class="forco">For ${esc($('supName').value)}</div>
+        ${stampHtml}
+      </div>
+    </div>
+
+    <div class="terms">
+      <u>Terms &amp; Conditions :</u><br>
+      CASH : Payment to be made to the cashier &amp; printed Official Receipt must be obtained.<br>
+      CHEQUE : All cheques / demand drafts in payment of bills must be crossed 'A/c Payee Only'<br>
+      &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;and drawn in favour of '${esc($('bankAcName').value)}'.<br>
+      LATE PAYMENT : Interest @ 24% per annum will be charged on all outstanding bills after due date.<br>
+      <span class="lab">VERY IMP. :</span> Kindly check all details carefully to avoid un-necessary complications.
+    </div>`;
+
+  $('sheet').classList.add('show');
+  $('printBtn').disabled = false;
+}
+
+function refreshIfShown() {
+  if ($('sheet').classList.contains('show')) renderInvoice();
+}
+
+$('preview').onclick = () => {
+  if (!S.rows.length) { $('formWarn').textContent = 'Upload an Excel file first.'; return; }
+  if (!checkForm()) return;
+  renderInvoice();
+  $('sheet').scrollIntoView({ behavior: 'smooth', block: 'start' });
+};
+$('printBtn').onclick = () => window.print();
+
+// keep the invoice live when fields are edited after generating it
+document.addEventListener('input', refreshIfShown);
+document.addEventListener('change', e => { if (e.target.matches('input[type=checkbox]')) refreshIfShown(); });
+
+loadImages();
+</script>
+</body>
+</html>

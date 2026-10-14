@@ -22,6 +22,7 @@ export const PAGES = {
   sales_data: "Sale Data",
   supply: "Fruits & Direct Supply",
   analytics: "Refund Analytics",
+  invoices: "Invoices (TRIPNINE)",
   activity: "Activity log",
   settings: "Bot settings",
 };
@@ -35,7 +36,7 @@ export const ROLE_PRESETS = {
   quality: { label: "Quality auditor", pages: ["audit", "refills", "findings"], readOnly: false },
   operations: { label: "Operations", pages: ["audit", "refills", "live_stock", "closing_stock", "product_list", "sales_data", "supply", "findings"], readOnly: false },
   staff: { label: "Staff", pages: ["findings"], readOnly: false },
-  viewer: { label: "Viewer (read only)", pages: ALL_PAGES.filter((page) => !["settings", "activity"].includes(page)), readOnly: true },
+  viewer: { label: "Viewer (read only)", pages: ALL_PAGES.filter((page) => !["settings", "activity", "invoices"].includes(page)), readOnly: true },
 };
 
 // What people had before roles existed, so nobody loses access on the first deploy.
@@ -136,6 +137,7 @@ const PATH_RULES = [
   [/^\/analytics\//, ["analytics", "operations", "tickets"]],
   [/^\/(operations|machines|inventory|host-sites|brands|skus|leads)(\/|$)/, ["operations"]],
   [/^\/activity(\/|$)/, ["activity"]],
+  [/^\/invoicing(\/|$)/, ["invoices"]],
 ];
 
 // Returns true if the person may call this API path.

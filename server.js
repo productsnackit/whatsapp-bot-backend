@@ -1,3 +1,4 @@
+import fs from "fs";
 import "dotenv/config";
 
 /* ================= IMPORTS ================= */
@@ -3362,6 +3363,9 @@ registerTicketWatchRoutes(app, { auth });
 registerTicketCleanupRoutes(app, { auth, db, onChanged: () => ticketsChanged() });
 registerSiteRoutes(app, { auth });
 registerRefillRoutes(app, { auth });
+// Invoices page (invoiceDashboard.html): the invoice maker, only for people with "Invoices".
+const INVOICE_PAGE = fs.readFileSync(new URL("./invoiceDashboard.html", import.meta.url), "utf8");
+app.get("/invoicing/page", auth, (req, res) => res.json({ html: INVOICE_PAGE }));
 // Log in with a code on WhatsApp instead of a password (owner: ADMIN_PHONE; employees; refillers).
 registerOtpRoutes(app, {
   findAccount: async (phone) => {
