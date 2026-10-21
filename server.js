@@ -71,6 +71,30 @@ const io = new Server(httpServer, {
   },
 });
 
+/* Quiet hours: Neon bills every hour the database is awake, and it only sleeps after 5 quiet
+   minutes. From 12 am to 7 am (India time) the automatic checks (ticket auto-close, refill
+   reminders, overdue alerts, the buyer's list, photo clean-up) pause, unless someone is using
+   the system: any request (a WhatsApp message, a login, the dashboard) wakes them for 15
+   minutes. What only becomes due at night alerts at 7 am. QUIET_HOURS="0-7" on Render changes it
+   ("off" = never pause). */
+const QUIET = (() => {
+  const value = String(process.env.QUIET_HOURS || "0-7").trim().toLowerCase();
+  const match = value.match(/^(\d{1,2})-(\d{1,2})$/);
+  return value === "off" || !match ? null : { from: Number(match[1]) % 24, to: Number(match[2]) % 24 };
+})();
+let lastActivityAt = Date.now();
+app.use((req, res, next) => {
+  // "/" is only the health check, and "/me" is the dashboard asking who is logged in.
+  if (req.path !== "/" && req.path !== "/me") lastActivityAt = Date.now();
+  next();
+});
+function isQuietNow() {
+  if (!QUIET || Date.now() - lastActivityAt < 15 * 60000) return false;
+  const hour = new Date(Date.now() + 330 * 60000).getUTCHours();
+  return QUIET.from <= QUIET.to ? hour >= QUIET.from && hour < QUIET.to : hour >= QUIET.from || hour < QUIET.to;
+}
+const unlessQuiet = (fn) => () => (isQuietNow() ? undefined : fn());
+
 // Replies are gzipped: the tickets list is several times smaller over the network.
 app.use(compression());
 app.use(cors());
@@ -4820,14 +4844,13 @@ const PORT = process.env.PORT || 3000;
 
 loadBotSettingsFromDb();
 
-setInterval(() => {
-  autoCloseInactiveTickets();
-}, 60 * 1000);
+setInterval(unlessQuiet(() => autoCloseInactiveTickets()), 60 * 1000);
 
-setInterval(() => {
-  recalculateInventoryAlerts();
-  emitRenewalWarnings();
-}, 15 * 60 * 1000);
+// The Operations pages (low-stock queue, renewals) are hidden (SHOW_OPERATIONS in App.jsx), so
+// their 15-minute alerts are off: they only kept the database awake. Turn back on with them.
+if (process.env.OPERATIONS_ALERTS === "on") {
+  setInterval(unlessQuiet(() => { recalculateInventoryAlerts(); emitRenewalWarnings(); }), 15 * 60 * 1000);
+}
 
 try {
   await loadInternalState(db);
@@ -4849,8 +4872,8 @@ try {
 try {
   await ensureRefillTables(db, { sendPush: (userKeys, payload) => sendPushToUsers(db, userKeys, payload) });
   await ensureRefillerApp(db).catch((err) => console.error("REFILLER APP SETUP ERROR:", err.message));
-  setInterval(refillTick, 60 * 1000);
-  setInterval(taskReminderTick, 5 * 60 * 1000);
+  setInterval(unlessQuiet(refillTick), 60 * 1000);
+  setInterval(unlessQuiet(taskReminderTick), 5 * 60 * 1000);
   setTimeout(refillTick, 15 * 1000);
   setTimeout(() => readMissedScreenshots(), 60 * 1000);
   // Old photos are deleted from Cloudinary to stay within the free plan (see imageRetention.js).
@@ -4872,14 +4895,14 @@ try {
   await ensureSupplyBuyer(db, { onChanged: () => io.emit("supply-changed") }).catch((err) => console.error("SUPPLY BUYER SETUP ERROR:", err.message));
   // Delivery challans (one per company) when the buyer taps Out for delivery.
   await ensureSupplyChallan(db, { getBuyer: buyerContact, onChanged: () => io.emit("supply-changed") }).catch((err) => console.error("SUPPLY CHALLAN SETUP ERROR:", err.message));
-  setInterval(supplyBuyerTick, 2 * 60 * 1000);
+  setInterval(unlessQuiet(supplyBuyerTick), 2 * 60 * 1000);
   setTimeout(supplyBuyerTick, 60 * 1000);
   // CAPA tasks open for 24 hours: WhatsApp alert to Monish (Admin Settings), then a 10 am daily reminder.
   await ensureCapaOverdue(db).catch((err) => console.error("CAPA OVERDUE SETUP ERROR:", err.message));
-  setInterval(capaOverdueTick, 5 * 60 * 1000);
+  setInterval(unlessQuiet(capaOverdueTick), 5 * 60 * 1000);
   setTimeout(capaOverdueTick, 90 * 1000);
   setTimeout(cleanOldImages, 5 * 60 * 1000);
-  setInterval(cleanOldImages, 6 * 60 * 60 * 1000);
+  setInterval(unlessQuiet(cleanOldImages), 6 * 60 * 60 * 1000);
 } catch (err) {
   console.error("REFILL SCHEDULE SETUP ERROR:", err.message);
 }
@@ -4900,7 +4923,7 @@ try {
     // Everyone who can open Tickets gets the phone notification.
     pushToTeam: (payload) => sendPushToUsers(db, ["admin", ...global.internalUsers.filter((user) => hasPage(accessFor(user), "tickets")).map((user) => user.username)], payload),
   });
-  setInterval(alertOverdueTickets, 5 * 60 * 1000);
+  setInterval(unlessQuiet(alertOverdueTickets), 5 * 60 * 1000);
   setTimeout(alertOverdueTickets, 2 * 60 * 1000);
   setTimeout(() => fingerprintMissedScreenshots(async (url) => Buffer.from((await axios.get(url, { responseType: "arraybuffer", timeout: 20000 })).data)), 3 * 60 * 1000);
 } catch (err) {
