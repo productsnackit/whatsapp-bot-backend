@@ -62,15 +62,18 @@ export function registerMyHomeRoutes(app, { db, auth, getUserKey, canSeeChat }) 
         }
         // Internal Audit actions they own.
         const findings = await db.query(
-          `SELECT id, ref, department, title, risk, status, action_plan, due_date, created_by, created_at, follow_ups
+          `SELECT id, ref, department, title, description, risk, status, action_plan, due_date, created_by, created_at, follow_ups, locations, attachments
            FROM audit_findings WHERE assignee_id = $1 AND status <> 'Closed' ORDER BY due_date LIMIT 200`, [userId]
         ).catch(() => ({ rows: [] }));
         for (const finding of findings.rows) {
           const due = plainDate(finding.due_date);
           const last = Array.isArray(finding.follow_ups) && finding.follow_ups.length ? finding.follow_ups[finding.follow_ups.length - 1] : null;
           work.push({
-            type: "audit", id: finding.id, ref: finding.ref, title: short(finding.title), action: short(finding.action_plan, 160), from: finding.created_by,
-            where: finding.department, status: finding.status, risk: finding.risk, due, overdue: Boolean(due && due < today), due_soon: due === today,
+            // The details and what to do (one box now; older findings also have a separate action plan).
+            type: "audit", id: finding.id, ref: finding.ref, title: short(finding.title),
+            action: short([finding.description, finding.action_plan && finding.action_plan !== finding.description ? `To do: ${finding.action_plan}` : ""].filter(Boolean).join(" · "), 400),
+            from: finding.created_by, files: Array.isArray(finding.attachments) ? finding.attachments.length : 0,
+            where: [finding.department, ...(finding.locations || [])].join(" · "), status: finding.status, risk: finding.risk, due, overdue: Boolean(due && due < today), due_soon: due === today,
             urgent: finding.risk === "Critical", last_note: last ? short(last.note || last.text || "", 100) : null,
             at: finding.created_at, open: { view: "findings", id: finding.id },
           });

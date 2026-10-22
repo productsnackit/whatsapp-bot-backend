@@ -33,7 +33,7 @@ import { ensureMachineStock, registerMachineStockRoutes } from "./machineStock.j
 import { ensureLocationStock, registerLocationStockRoutes, handleStockDcWhatsApp } from "./locationStock.js";
 import { ensureSalesData, registerSalesDataRoutes } from "./salesData.js";
 import { initSupplyAnalytics, registerSupplyAnalyticsRoutes } from "./supplyAnalytics.js";
-import { registerFindingsRoutes } from "./findingsRoutes.js";
+import { registerFindingsRoutes, handleFindingWhatsApp } from "./findingsRoutes.js";
 import { registerExpiryRoutes } from "./expiryRoutes.js";
 import { ensureUpiScanColumns, scanUpiScreenshot, registerUpiScanRoutes, readUpiImage, readMissedScreenshots } from "./upiScanner.js";
 import { ensureWhatsAppOutbox, applyOutboxStatuses, noteInbound, refillerWindowOpen } from "./whatsappOutbox.js";
@@ -4154,6 +4154,13 @@ app.post("/webhook", async (req, res) => {
       if (await handleStockDcWhatsApp(msg)) return res.sendStatus(200);
     } catch (err) {
       console.log("STOCK DC ERROR:", err.message);
+    }
+
+    // Action owners answer their Internal Audit tasks here (Started / Done).
+    try {
+      if (await handleFindingWhatsApp(msg)) return res.sendStatus(200);
+    } catch (err) {
+      console.log("FINDING MESSAGE ERROR:", err.message);
     }
 
     // Employees answer their Call Log tasks here (Started / Done / Forward, and a note after).

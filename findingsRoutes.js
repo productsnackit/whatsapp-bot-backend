@@ -5,7 +5,9 @@
     Everyone can view, log and follow up; only admin can delete.
 ========================================================= */
 import { sendPushToUsers } from "./pushNotifications.js";
-import { storeDashboardFile } from "./ticketChat.js";
+import { storeDashboardFile, sendStoredFile } from "./ticketChat.js";
+import { sendWhatsAppButtons, sendWhatsAppPayload } from "./whatsapp.js";
+import { sendWithFallback, noteInbound, onDeliveryUpdate } from "./whatsappOutbox.js";
 
 const MAX_ATTACHMENTS = 10;
 
@@ -40,7 +42,12 @@ async function ensureFindingsTable(db) {
       ADD COLUMN IF NOT EXISTS locations TEXT[] NOT NULL DEFAULT '{}',
       ADD COLUMN IF NOT EXISTS attachments JSONB NOT NULL DEFAULT '[]'::jsonb,
       ADD COLUMN IF NOT EXISTS closed_at TIMESTAMPTZ,
-      ADD COLUMN IF NOT EXISTS closed_by TEXT
+      ADD COLUMN IF NOT EXISTS closed_by TEXT,
+      ADD COLUMN IF NOT EXISTS whatsapp_status TEXT,
+      ADD COLUMN IF NOT EXISTS whatsapp_error TEXT,
+      ADD COLUMN IF NOT EXISTS whatsapp_sent_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS whatsapp_delivery TEXT,
+      ADD COLUMN IF NOT EXISTS files_sent_at TIMESTAMPTZ
   `);
   // When it was closed and by whom (for how long it took). Findings closed before this was kept:
   // from their last "Closed" follow-up, else when they were last changed.
@@ -95,6 +102,121 @@ function notifyAssignee(db, finding, byName, reassigned) {
   });
 }
 
+/* ---------- The task on the action owner's WhatsApp ----------
+   When a finding is given to someone, it goes to their WhatsApp (Employees & Access → WhatsApp
+   number) with all its details and two buttons: "Started" (→ In Progress) and "Done" (→ Under
+   Review, for the person who raised it to verify and close). Files go right after it. If they
+   haven't written to us in 24 hours, the approved Call Log template (FINDING_TEMPLATE_NAME,
+   default CALL_TEMPLATE_NAME or "call_log_task": {{1}} ref, {{2}} the task, {{3}} raised by,
+   {{4}} due, three quick-reply buttons) is used instead, and the files follow their first tap. */
+const fndPhone = (phone) => { const digits = String(phone || "").replace(/\D/g, ""); return digits.length === 10 ? `91${digits}` : digits; };
+const oneLine = (text, max = 900) => String(text || "").replace(/\s+/g, " ").trim().slice(0, max);
+const dueLabel = (date) => (date ? new Date(`${plainDate(date)}T00:00:00Z`).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric", timeZone: "UTC" }) : "no due date");
+const findingButtons = (id) => [{ id: `FND_START:${id}`, title: "Started" }, { id: `FND_DONE:${id}`, title: "Done" }];
+function findingDetails(finding) {
+  return [finding.description, finding.action_plan && finding.action_plan !== finding.description ? `To do: ${finding.action_plan}` : ""].filter(Boolean).join("\n");
+}
+function findingText(finding, byName, reassigned) {
+  const files = (finding.attachments || []).length;
+  return [
+    reassigned ? `↪️ *Audit task ${finding.ref} is now yours*` : `📋 *New audit task ${finding.ref}*`,
+    "",
+    `*${finding.title}*`,
+    findingDetails(finding).slice(0, 600),
+    "",
+    (finding.locations || []).length ? `📍 ${finding.locations.join(", ")}` : "",
+    `⚠️ ${finding.risk} · ${finding.department}`,
+    `⏰ Due: ${dueLabel(finding.due_date)}`,
+    `👤 Raised by ${byName || finding.created_by || "the team"}`,
+    files ? `📎 ${files} file${files === 1 ? "" : "s"} (sent below)` : "",
+    "",
+    "Tap *Started* when you begin and *Done* when it's finished.",
+  ].filter((line, index, all) => line !== "" || (all[index - 1] !== "" && index > 0)).join("\n").slice(0, 1024);
+}
+function findingTemplate(finding, byName) {
+  const name = process.env.FINDING_TEMPLATE_NAME || process.env.CALL_TEMPLATE_NAME || "call_log_task";
+  if (name === "off") return null;
+  const files = (finding.attachments || []).length;
+  const summary = [`Audit: ${finding.title}`, findingDetails(finding), (finding.locations || []).length && `Location: ${finding.locations.join(", ")}`, `Risk: ${finding.risk}`,
+    files && `📎 ${files} file${files === 1 ? "" : "s"}: tap a button to receive ${files === 1 ? "it" : "them"}`].filter(Boolean).join(" · ");
+  return {
+    name, lang: process.env.FINDING_TEMPLATE_LANG || process.env.CALL_TEMPLATE_LANG || "en",
+    params: [finding.ref, oneLine(summary), oneLine(byName || finding.created_by || "the team", 60), dueLabel(finding.due_date)],
+    buttons: [`FND_START:${finding.id}`, `FND_DONE:${finding.id}`, `FND_INFO:${finding.id}`],
+  };
+}
+async function sendFindingFiles(finding, to) {
+  for (const file of finding.attachments || []) await sendStoredFile(to, file, `${finding.ref}: ${file.name}`).catch(() => {});
+}
+export async function sendFindingToOwner(db, findingId, { byName = null, reassigned = false } = {}) {
+  const finding = (await db.query("SELECT * FROM audit_findings WHERE id = $1", [findingId])).rows[0];
+  if (!finding) return { ok: false };
+  const owner = employeeById(finding.assignee_id);
+  const to = fndPhone(owner?.phone);
+  const save = (status, error) => db.query("UPDATE audit_findings SET whatsapp_status = $2, whatsapp_error = $3, whatsapp_delivery = NULL, whatsapp_sent_at = CASE WHEN $2 = 'SENT' THEN NOW() ELSE whatsapp_sent_at END WHERE id = $1", [findingId, status, error]);
+  if (!to) {
+    await save("NO_PHONE", `${owner?.name || "The action owner"} has no WhatsApp number. Add it in Employees & Access, then tap Send again.`);
+    return { ok: false };
+  }
+  const result = await sendWithFallback({
+    kind: "finding", refIds: [finding.id], to,
+    send: () => sendWhatsAppButtons(to, findingText(finding, byName, reassigned), findingButtons(finding.id)),
+    template: findingTemplate(finding, byName),
+    noWindowError: `Not delivered: ${owner.name} hasn't messaged the Snackit WhatsApp number in the last 24 hours and the WhatsApp template isn't set up.`,
+  });
+  if (result.ok && !result.viaTemplate) await sendFindingFiles(finding, to);
+  await save(result.ok ? "SENT" : "FAILED", result.ok ? null : result.error || "Could not send");
+  return result;
+}
+
+// The action owner tapping Started / Done (or the third template button) on WhatsApp.
+let replyDb = null;
+let replyChanged = null;
+const textTo = (to, body) => sendWhatsAppPayload({ messaging_product: "whatsapp", to, type: "text", text: { body: String(body).slice(0, 4096) } });
+export async function handleFindingWhatsApp(msg) {
+  const choice = msg?.interactive?.button_reply?.id || msg?.button?.payload || "";
+  const match = choice.match(/^FND_(START|DONE|INFO):(\d+)$/);
+  if (!replyDb || !match) return false;
+  const phone = fndPhone(msg.from);
+  await noteInbound(phone).catch(() => {});
+  const [, action, id] = match;
+  const finding = (await replyDb.query("SELECT * FROM audit_findings WHERE id = $1", [id])).rows[0];
+  if (!finding) { await textTo(phone, "This audit task no longer exists."); return true; }
+  const owner = employeeById(finding.assignee_id);
+  if (fndPhone(owner?.phone) !== phone) { await textTo(phone, `${finding.ref} is now with ${finding.assignee_name || "someone else"}, so it wasn't changed.`); return true; }
+  // Came as a template (24-hour window was closed): the files go now that they've tapped.
+  if ((finding.attachments || []).length && finding.whatsapp_sent_at && (!finding.files_sent_at || finding.files_sent_at < finding.whatsapp_sent_at)) {
+    await sendFindingFiles(finding, phone);
+    await replyDb.query("UPDATE audit_findings SET files_sent_at = NOW() WHERE id = $1", [id]).catch(() => {});
+  }
+  if (finding.status === "Closed") { await textTo(phone, `${finding.ref} is already closed. Thank you!`); return true; }
+  // The template's third button (Call Log's "Forward"): audit tasks aren't forwarded; the details again.
+  if (action === "INFO") {
+    await textTo(phone, `Audit tasks can't be passed on from WhatsApp. If it should be someone else's, ask ${finding.created_by || "the person who raised it"}. Here it is again:`);
+    await sendWhatsAppButtons(phone, findingText(finding, finding.created_by, false), findingButtons(finding.id));
+    return true;
+  }
+  const next = action === "START" ? "In Progress" : "Under Review";
+  if (action === "START" && finding.status !== "Open") { await textTo(phone, `${finding.ref} is already ${finding.status.toLowerCase()}.`); return true; }
+  const entry = {
+    date: new Date(Date.now() + 330 * 60000).toISOString().slice(0, 10), status: next,
+    notes: action === "START" ? "Started (from WhatsApp)." : "Done: waiting for verification (from WhatsApp).",
+    auditor: owner.name, recordedBy: `${owner.name} (WhatsApp)`, recordedAt: new Date().toISOString(),
+  };
+  await replyDb.query("UPDATE audit_findings SET follow_ups = follow_ups || $1::jsonb, status = $2, updated_at = NOW() WHERE id = $3", [JSON.stringify([entry]), next, id]);
+  await textTo(phone, action === "START"
+    ? `👍 ${finding.ref} marked as *In Progress*. Tap *Done* when it's finished.`
+    : `✅ Thank you! ${finding.ref} is marked *Done* and goes to ${finding.created_by || "the person who raised it"} to verify and close.`);
+  // The person who raised it is told on their phone.
+  const raiser = finding.created_by === "Admin" ? "admin" : (global.internalUsers || []).find((user) => user.name === finding.created_by)?.username;
+  if (raiser) sendPushToUsers(replyDb, [raiser], {
+    title: action === "START" ? `${owner.name} started ${finding.ref}` : `✅ ${owner.name} finished ${finding.ref}: please verify`,
+    body: finding.title.slice(0, 150), view: "findings",
+  }).catch(() => {});
+  replyChanged?.();
+  return true;
+}
+
 // Validates the editable fields; returns { values } or { error }.
 function readFinding(body, { partial }) {
   const values = {};
@@ -111,14 +233,16 @@ function readFinding(body, { partial }) {
     assignee_id: text("assignee_id", 40),
     due_date: text("due_date", 10),
   };
-  const required = ["department", "observed_on", "title", "description", "risk", "action_plan", "assignee_id", "due_date"];
+  // The form has one box, "Details & what needs to be done" (description); a separate action
+  // plan is only on older findings.
+  const required = ["department", "observed_on", "title", "description", "risk", "assignee_id", "due_date"];
   for (const [key, value] of Object.entries(fields)) {
     if (value === undefined) {
       if (!partial && required.includes(key)) return { error: `${key.replace("_", " ")} is required` };
       continue;
     }
     if (required.includes(key) && !value) return { error: `${key.replace("_", " ")} is required` };
-    values[key] = value || null;
+    values[key] = value || (key === "action_plan" ? "" : null);
   }
   if (body.locations !== undefined) {
     values.locations = [...new Set((Array.isArray(body.locations) ? body.locations : []).map((name) => String(name || "").trim().slice(0, 120)).filter(Boolean))].slice(0, 30);
@@ -137,7 +261,15 @@ function readFinding(body, { partial }) {
 }
 
 export function registerFindingsRoutes(app, { db, auth, onChanged }) {
+  replyDb = db;
+  replyChanged = onChanged;
   ensureFindingsTable(db).catch((err) => console.log("FINDINGS TABLE ERROR:", err.message));
+  // WhatsApp's later report: delivered / read, or failed (e.g. outside the 24-hour window).
+  onDeliveryUpdate("finding", async ({ refIds, ok, status, error }) => {
+    if (!ok) await db.query("UPDATE audit_findings SET whatsapp_status = 'FAILED', whatsapp_error = $2, whatsapp_delivery = NULL WHERE id = ANY($1)", [refIds, error]);
+    else if (status === "delivered" || status === "read") await db.query("UPDATE audit_findings SET whatsapp_delivery = $2 WHERE id = ANY($1) AND (whatsapp_delivery IS NULL OR $2 = 'read')", [refIds, status]);
+    onChanged?.();
+  });
   // Open dashboards reload the register (and My Home) when a finding is logged or changed.
   app.use("/findings", (req, res, next) => {
     if (req.method !== "GET") res.on("finish", () => { if (res.statusCode < 400) onChanged?.(); });
@@ -166,7 +298,7 @@ export function registerFindingsRoutes(app, { db, auth, onChanged }) {
       `INSERT INTO audit_findings (department, observed_on, title, description, risk, status, root_cause, action_plan, assignee_id, assignee_name, due_date, created_by, locations)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id`,
       [values.department, values.observed_on, values.title, values.description, values.risk, values.status || "Open",
-        values.root_cause, values.action_plan, values.assignee_id, values.assignee_name, values.due_date, by, values.locations || []]
+        values.root_cause, values.action_plan || "", values.assignee_id, values.assignee_name, values.due_date, by, values.locations || []]
     );
     const finding = toApi((await db.query(
       `UPDATE audit_findings SET ref = 'FND-' || LPAD(id::text, 5, '0'),
@@ -175,7 +307,9 @@ export function registerFindingsRoutes(app, { db, auth, onChanged }) {
       [inserted.rows[0].id, by]
     )).rows[0]);
     notifyAssignee(db, finding, by, false);
-    res.status(201).json(finding);
+    // To their WhatsApp now, or once the files are attached (the page then calls /whatsapp).
+    if (!req.body?.files_pending) await sendFindingToOwner(db, finding.id, { byName: by }).catch((err) => console.log("FINDING WHATSAPP ERROR:", err.message));
+    res.status(201).json(toApi((await db.query("SELECT * FROM audit_findings WHERE id = $1", [finding.id])).rows[0]));
   }));
 
   // Import findings from CSV (the Export CSV format). Rows whose ref already exists are skipped.
@@ -250,7 +384,11 @@ export function registerFindingsRoutes(app, { db, auth, onChanged }) {
       [...keys.map((key) => values[key]), req.params.id, ...(values.status === "Closed" ? [userName(req.user)] : [])]
     );
     const finding = toApi(result.rows[0]);
-    if (values.assignee_id && values.assignee_id !== before.assignee_id) notifyAssignee(db, finding, userName(req.user), true);
+    if (values.assignee_id && values.assignee_id !== before.assignee_id) {
+      notifyAssignee(db, finding, userName(req.user), true);
+      if (!req.body?.files_pending) await sendFindingToOwner(db, finding.id, { byName: userName(req.user), reassigned: true }).catch((err) => console.log("FINDING WHATSAPP ERROR:", err.message));
+      return res.json(toApi((await db.query("SELECT * FROM audit_findings WHERE id = $1", [finding.id])).rows[0]));
+    }
     res.json(finding);
   }));
 
@@ -280,6 +418,14 @@ export function registerFindingsRoutes(app, { db, auth, onChanged }) {
     );
     if (!result.rows.length) return res.status(404).json({ error: "Finding not found" });
     res.json(toApi(result.rows[0]));
+  }));
+
+  // Send (or send again) the task to the action owner's WhatsApp.
+  app.post("/findings/:id/whatsapp", auth, handle("FINDING WHATSAPP", async (req, res) => {
+    const result = await sendFindingToOwner(db, Number(req.params.id), { byName: userName(req.user), reassigned: Boolean(req.body?.reassigned) });
+    const finding = (await db.query("SELECT * FROM audit_findings WHERE id = $1", [req.params.id])).rows[0];
+    if (!finding) return res.status(404).json({ error: "Finding not found" });
+    res.json({ ...toApi(finding), sent: Boolean(result?.ok) });
   }));
 
   // The locations to choose from: the Refill Audit locations.
