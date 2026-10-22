@@ -26,6 +26,7 @@ import { registerTaskRoutes, taskReminderTick } from "./internalTasks.js";
 import { registerMyHomeRoutes } from "./myHome.js";
 import { ensureRefillerApp, registerRefillerAppRoutes, refillerLogin, looksLikePhone, refillerByPhone, refillerSession } from "./refillerApp.js";
 import { registerOtpRoutes } from "./otpLogin.js";
+import { ensureSavedInvoices, registerSavedInvoiceRoutes, cleanOldInvoices } from "./savedInvoices.js";
 import { ensureImageRetention, cleanOldImages, registerImageRetentionRoutes } from "./imageRetention.js";
 import { registerAnalyticsOverview } from "./analyticsOverview.js";
 import { registerMachineRoutes } from "./machines.js";
@@ -3390,6 +3391,7 @@ registerRefillRoutes(app, { auth });
 // Invoices page (invoiceDashboard.html): the invoice maker, only for people with "Invoices".
 const INVOICE_PAGE = fs.readFileSync(new URL("./invoiceDashboard.html", import.meta.url), "utf8");
 app.get("/invoicing/page", auth, (req, res) => res.json({ html: INVOICE_PAGE }));
+registerSavedInvoiceRoutes(app, { auth });
 // Log in with a code on WhatsApp instead of a password (owner: ADMIN_PHONE; employees; refillers).
 registerOtpRoutes(app, {
   findAccount: async (phone) => {
@@ -4910,6 +4912,10 @@ try {
   setTimeout(capaOverdueTick, 90 * 1000);
   setTimeout(cleanOldImages, 5 * 60 * 1000);
   setInterval(unlessQuiet(cleanOldImages), 6 * 60 * 60 * 1000);
+  // Saved invoices older than Admin Settings → "Saved invoices" (0 = keep forever).
+  await ensureSavedInvoices(db).catch((err) => console.error("SAVED INVOICES SETUP ERROR:", err.message));
+  setTimeout(() => cleanOldInvoices().catch(() => {}), 6 * 60 * 1000);
+  setInterval(unlessQuiet(() => cleanOldInvoices().catch((err) => console.log("INVOICE CLEAN-UP ERROR:", err.message))), 6 * 60 * 60 * 1000);
 } catch (err) {
   console.error("REFILL SCHEDULE SETUP ERROR:", err.message);
 }

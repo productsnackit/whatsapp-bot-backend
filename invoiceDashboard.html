@@ -99,6 +99,15 @@ table.inv tr.sumrow td.lab{text-align:right;color:#000}
 .terms u{color:#c00000;font-weight:bold}
 .terms .lab{color:#c00000;font-weight:bold}
 .hl-y{background:#ffff00;color:#000}
+.saved-tools{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:10px}
+.saved-tools input{max-width:320px}
+.saved-tools select{max-width:200px}
+.saved-day h3{margin:14px 0 6px}
+.saved-row td.act{white-space:nowrap;text-align:right}
+.saved-row td.act button{padding:5px 10px;font-size:12px;margin-left:4px}
+.saved-row td.act button.del{color:var(--muted)}
+.saved-empty{color:var(--muted);padding:10px 0}
+.saved-msg{font-size:12px;color:var(--muted);margin-top:8px}
 
 @media print{
   body{background:#fff}
@@ -117,6 +126,18 @@ table.inv tr.sumrow td.lab{text-align:right;color:#000}
 </header>
 
 <main>
+
+<!-- 0. Saved invoices -->
+<section class="no-print" id="savedSec" hidden>
+  <h2>Saved invoices <span class="note" id="savedCount"></span></h2>
+  <div class="saved-tools">
+    <input id="savedSearch" type="search" placeholder="Search client or invoice no.">
+    <select id="savedMonth"><option value="">All months</option></select>
+    <button class="ghost" id="savedRefresh" type="button">↻ Refresh</button>
+  </div>
+  <div id="savedList"></div>
+  <p class="saved-msg" id="savedMsg"></p>
+</section>
 
 <!-- 1. Upload -->
 <section class="no-print">
@@ -253,6 +274,7 @@ NEW DELHI, SOUTH EAST DELHI</textarea></label>
 
   <div class="row">
     <button id="preview">Generate invoice</button>
+    <button class="ghost" id="saveBtn" type="button">💾 Save invoice</button>
     <button id="downloadBtn" disabled>⬇ Download PDF</button>
     <button class="ghost" id="printBtn" disabled>Print</button>
   </div>
@@ -806,6 +828,7 @@ $('downloadBtn').onclick = async () => {
     }
     pdf.save(pdfName());
     $('formWarn').textContent = '';
+    saveInvoice(true);
   } catch (e) {
     $('formWarn').textContent = 'Could not make the PDF: ' + (e && e.message ? e.message : e) + '. Use Print and choose "Save as PDF".';
   } finally {
@@ -817,6 +840,7 @@ $('downloadBtn').onclick = async () => {
 $('printBtn').onclick = () => {
   if (!checkForm()) return;
   renderInvoice();
+  saveInvoice(true);
   const name = pdfName().replace(/\.pdf$/, '');
   const titles = [document.title];
   document.title = name;
@@ -835,6 +859,122 @@ document.addEventListener('change', e => { if (e.target.matches('input[type=chec
 
 loadImages();
 loadClients();
+
+/* ---------- saved invoices (kept on the server for everyone with Invoices) ---------- */
+const API_BASE = 'https://whatsapp-bot-backend-b3nb.onrender.com';
+function authToken() { try { return localStorage.getItem('token'); } catch (e) { return null; } }
+async function api(method, path, body) {
+  const r = await fetch(API_BASE + path, { method, headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + authToken() }, body: body ? JSON.stringify(body) : undefined });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || 'Error ' + r.status);
+  return j;
+}
+const SKIP_FIELDS = ['file', 'logoFile', 'stampFile', 'clientPick', 'savedSearch', 'savedMonth', 'mapPnr', 'mapPax', 'mapSector', 'mapAmount', 'mapDate', 'mapStatus'];
+function formFields() {
+  const out = {};
+  document.querySelectorAll('main input[id], main textarea[id], main select[id]').forEach(el => {
+    if (SKIP_FIELDS.includes(el.id) || el.type === 'file' || el.closest('#rows')) return;
+    out[el.id] = el.type === 'checkbox' ? el.checked : el.value;
+  });
+  return out;
+}
+let SAVED = [];
+const monthKey = d => (d || '').slice(0, 7);
+const monthLabel = k => k ? new Date(k + '-01T00:00:00').toLocaleDateString('en-IN', { month: 'long', year: 'numeric' }) : 'No date';
+const dayLabel = d => d ? new Date(d + 'T00:00:00').toLocaleDateString('en-IN', { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric' }) : 'No invoice date';
+const stamp = t => t ? new Date(t).toLocaleString('en-IN', { day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' }) : '';
+
+async function loadSaved() {
+  if (!authToken()) return; // opened outside the dashboard: nothing to show
+  $('savedSec').hidden = false;
+  try {
+    const res = await api('GET', '/invoicing/saved');
+    SAVED = res.invoices || [];
+    $('savedMsg').textContent = res.retention_days ? `Saved invoices are deleted ${res.retention_days} days after they were last saved (Admin Settings).` : 'Saved invoices are kept until someone deletes them (Admin Settings can set auto-delete).';
+    const current = $('savedMonth').value;
+    const months = [...new Set(SAVED.map(i => monthKey(i.inv_date)))];
+    $('savedMonth').innerHTML = '<option value="">All months</option>' + months.map(k => `<option value="${esc(k)}">${esc(monthLabel(k))}</option>`).join('');
+    $('savedMonth').value = months.includes(current) ? current : '';
+    renderSaved();
+  } catch (e) {
+    $('savedList').innerHTML = `<p class="hint">Could not load saved invoices: ${esc(e.message)}</p>`;
+  }
+}
+function renderSaved() {
+  const q = $('savedSearch').value.trim().toLowerCase();
+  const m = $('savedMonth').value;
+  const list = SAVED.filter(i => (!m || monthKey(i.inv_date) === m) && (!q || `${i.inv_no} ${i.client}`.toLowerCase().includes(q)));
+  $('savedCount').textContent = SAVED.length ? `· ${list.length === SAVED.length ? SAVED.length : `${list.length} of ${SAVED.length}`}` : '';
+  if (!list.length) { $('savedList').innerHTML = `<p class="saved-empty">${SAVED.length ? 'No invoice matches.' : 'No saved invoices yet. They are saved when you download, print or press "Save invoice".'}</p>`; return; }
+  const days = new Map();
+  list.forEach(i => { const k = i.inv_date || ''; if (!days.has(k)) days.set(k, []); days.get(k).push(i); });
+  $('savedList').innerHTML = [...days.entries()].map(([day, items]) => `
+    <div class="saved-day">
+      <h3>${esc(dayLabel(day))} · ${items.length} invoice${items.length === 1 ? '' : 's'} · ₹${money(items.reduce((a, i) => a + (Number(i.total) || 0), 0))}</h3>
+      <div class="table-wrap"><table class="list">
+        <thead><tr><th>Invoice no.</th><th>Client</th><th class="num">Total (INR)</th><th>Saved</th><th></th></tr></thead>
+        <tbody>${items.map(i => `
+          <tr class="saved-row">
+            <td><b>${esc(i.inv_no)}</b></td>
+            <td>${esc(i.client)}</td>
+            <td class="num">${i.total == null ? '' : money(i.total)}</td>
+            <td class="note">${esc(i.updated_by || i.created_by || '')} · ${esc(stamp(i.updated_at))}</td>
+            <td class="act"><button type="button" data-open="${i.id}">Open</button><button type="button" class="ghost" data-dl="${i.id}">⬇ PDF</button><button type="button" class="ghost del" data-delsaved="${i.id}" title="Delete">✕</button></td>
+          </tr>`).join('')}</tbody>
+      </table></div>
+    </div>`).join('');
+}
+async function openSaved(id, thenDownload) {
+  try {
+    const inv = await api('GET', '/invoicing/saved/' + id);
+    const data = inv.data || {};
+    Object.entries(data.fields || {}).forEach(([k, v]) => { const el = $(k); if (!el) return; if (el.type === 'checkbox') el.checked = Boolean(v); else el.value = v ?? ''; });
+    S.rows = (data.rows || []).map(r => ({ include: r.include !== false, pnr: r.pnr || '', pax: r.pax || '', sector: r.sector || '', date: r.date || '', status: r.status || '', amount: Number(r.amount) || 0, flags: [] }));
+    S.rows.forEach(recheck);
+    $('rowsSec').hidden = false;
+    renderRows();
+    renderClientPick($('cliName').value);
+    renderInvoice();
+    $('formWarn').textContent = `Opened ${inv.inv_no}. Change anything and download or save again (same invoice number = it's updated).`;
+    if (thenDownload) $('downloadBtn').click();
+    else $('sheet').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } catch (e) {
+    $('formWarn').textContent = 'Could not open it: ' + e.message;
+  }
+}
+// Saved when downloading / printing, or with "Save invoice". The same invoice number updates it.
+async function saveInvoice(quiet) {
+  if (!authToken()) return false;
+  if (!checkForm()) return false;
+  try {
+    const saved = await api('POST', '/invoicing/saved', {
+      inv_no: $('invNo').value.trim(), client: $('cliName').value.trim(), inv_date: $('invDate').value, total: calc().grand,
+      data: { fields: formFields(), rows: S.rows.map(({ flags, ...r }) => r) }
+    });
+    if (!quiet) $('formWarn').textContent = `Saved ${saved.inv_no}.`;
+    loadSaved();
+    return true;
+  } catch (e) {
+    $('formWarn').textContent = 'Could not save the invoice: ' + e.message;
+    return false;
+  }
+}
+$('saveBtn').onclick = () => saveInvoice(false);
+$('savedSearch').addEventListener('input', renderSaved);
+$('savedMonth').addEventListener('change', renderSaved);
+$('savedRefresh').onclick = loadSaved;
+$('savedList').addEventListener('click', async e => {
+  const b = e.target.closest('button');
+  if (!b) return;
+  if (b.dataset.open) openSaved(b.dataset.open, false);
+  if (b.dataset.dl) openSaved(b.dataset.dl, true);
+  if (b.dataset.delsaved) {
+    const inv = SAVED.find(i => String(i.id) === b.dataset.delsaved);
+    if (!confirm(`Delete saved invoice ${inv ? inv.inv_no : ''}${inv && inv.client ? ` (${inv.client})` : ''}? This can't be undone.`)) return;
+    try { await api('DELETE', '/invoicing/saved/' + b.dataset.delsaved); loadSaved(); } catch (err) { $('savedMsg').textContent = 'Could not delete: ' + err.message; }
+  }
+});
+loadSaved();
 </script>
 </body>
 </html>
