@@ -3362,7 +3362,7 @@ registerAuditRoutes(app, { db, auth, uploadImage: (dataUrl) => uploadToCloudinar
 // When a refiller taps "Can't do it", everyone with Refill Audit gets a phone notification.
 setCapaEscalationPush((payload) => sendPushToUsers(db, ["admin", ...global.internalUsers.filter((user) => hasPage(accessFor(user), "audit")).map((user) => user.username)], payload));
 registerPushRoutes(app, { db, auth });
-registerFindingsRoutes(app, { db, auth });
+registerFindingsRoutes(app, { db, auth, onChanged: () => io.emit("findings-changed") });
 registerCallLogRoutes(app, { auth });
 registerDirectSupplyRoutes(app, { auth });
 registerSupplyBillingRoutes(app, { auth });

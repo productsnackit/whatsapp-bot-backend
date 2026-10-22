@@ -38,7 +38,17 @@ async function ensureFindingsTable(db) {
   await db.query(`
     ALTER TABLE audit_findings
       ADD COLUMN IF NOT EXISTS locations TEXT[] NOT NULL DEFAULT '{}',
-      ADD COLUMN IF NOT EXISTS attachments JSONB NOT NULL DEFAULT '[]'::jsonb
+      ADD COLUMN IF NOT EXISTS attachments JSONB NOT NULL DEFAULT '[]'::jsonb,
+      ADD COLUMN IF NOT EXISTS closed_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS closed_by TEXT
+  `);
+  // When it was closed and by whom (for how long it took). Findings closed before this was kept:
+  // from their last "Closed" follow-up, else when they were last changed.
+  await db.query(`
+    UPDATE audit_findings f SET
+      closed_at = COALESCE((SELECT NULLIF(e->>'recordedAt', '')::timestamptz FROM jsonb_array_elements(f.follow_ups) e WHERE e->>'status' = 'Closed' ORDER BY e->>'recordedAt' DESC NULLS LAST LIMIT 1), f.updated_at, NOW()),
+      closed_by = (SELECT COALESCE(e->>'recordedBy', e->>'auditor') FROM jsonb_array_elements(f.follow_ups) e WHERE e->>'status' = 'Closed' ORDER BY e->>'recordedAt' DESC NULLS LAST LIMIT 1)
+    WHERE f.status = 'Closed' AND f.closed_at IS NULL
   `);
 }
 
@@ -126,8 +136,13 @@ function readFinding(body, { partial }) {
   return { values };
 }
 
-export function registerFindingsRoutes(app, { db, auth }) {
+export function registerFindingsRoutes(app, { db, auth, onChanged }) {
   ensureFindingsTable(db).catch((err) => console.log("FINDINGS TABLE ERROR:", err.message));
+  // Open dashboards reload the register (and My Home) when a finding is logged or changed.
+  app.use("/findings", (req, res, next) => {
+    if (req.method !== "GET") res.on("finish", () => { if (res.statusCode < 400) onChanged?.(); });
+    next();
+  });
 
   const handle = (label, fn) => async (req, res) => {
     try {
@@ -154,8 +169,10 @@ export function registerFindingsRoutes(app, { db, auth }) {
         values.root_cause, values.action_plan, values.assignee_id, values.assignee_name, values.due_date, by, values.locations || []]
     );
     const finding = toApi((await db.query(
-      "UPDATE audit_findings SET ref = 'FND-' || LPAD(id::text, 5, '0') WHERE id = $1 RETURNING *",
-      [inserted.rows[0].id]
+      `UPDATE audit_findings SET ref = 'FND-' || LPAD(id::text, 5, '0'),
+         closed_at = CASE WHEN status = 'Closed' THEN NOW() END, closed_by = CASE WHEN status = 'Closed' THEN $2 END
+       WHERE id = $1 RETURNING *`,
+      [inserted.rows[0].id, by]
     )).rows[0]);
     notifyAssignee(db, finding, by, false);
     res.status(201).json(finding);
@@ -224,9 +241,13 @@ export function registerFindingsRoutes(app, { db, auth }) {
     if (!keys.length) return res.status(400).json({ error: "Nothing to update" });
     const before = (await db.query("SELECT assignee_id FROM audit_findings WHERE id = $1", [req.params.id])).rows[0];
     if (!before) return res.status(404).json({ error: "Finding not found" });
+    // Status changed on the edit form: closing records when and who, anything else clears it.
+    const closing = values.status === undefined ? "" : values.status === "Closed"
+      ? `, closed_at = CASE WHEN status = 'Closed' THEN closed_at ELSE NOW() END, closed_by = CASE WHEN status = 'Closed' THEN closed_by ELSE $${keys.length + 2} END`
+      : ", closed_at = NULL, closed_by = NULL";
     const result = await db.query(
-      `UPDATE audit_findings SET ${keys.map((key, i) => `${key} = $${i + 1}`).join(", ")}, updated_at = NOW() WHERE id = $${keys.length + 1} RETURNING *`,
-      [...keys.map((key) => values[key]), req.params.id]
+      `UPDATE audit_findings SET ${keys.map((key, i) => `${key} = $${i + 1}`).join(", ")}, updated_at = NOW()${closing} WHERE id = $${keys.length + 1} RETURNING *`,
+      [...keys.map((key) => values[key]), req.params.id, ...(values.status === "Closed" ? [userName(req.user)] : [])]
     );
     const finding = toApi(result.rows[0]);
     if (values.assignee_id && values.assignee_id !== before.assignee_id) notifyAssignee(db, finding, userName(req.user), true);
@@ -249,9 +270,13 @@ export function registerFindingsRoutes(app, { db, auth }) {
       recordedBy: userName(req.user),
       recordedAt: new Date().toISOString(),
     };
+    // Closing records when and who; re-opening clears it.
     const result = await db.query(
-      `UPDATE audit_findings SET follow_ups = follow_ups || $1::jsonb, status = $2, updated_at = NOW() WHERE id = $3 RETURNING *`,
-      [JSON.stringify([entry]), status, req.params.id]
+      `UPDATE audit_findings SET follow_ups = follow_ups || $1::jsonb, status = $2, updated_at = NOW(),
+         closed_at = CASE WHEN $2 = 'Closed' THEN COALESCE(CASE WHEN status = 'Closed' THEN closed_at END, NOW()) END,
+         closed_by = CASE WHEN $2 = 'Closed' THEN COALESCE(CASE WHEN status = 'Closed' THEN closed_by END, $4) END
+       WHERE id = $3 RETURNING *`,
+      [JSON.stringify([entry]), status, req.params.id, userName(req.user)]
     );
     if (!result.rows.length) return res.status(404).json({ error: "Finding not found" });
     res.json(toApi(result.rows[0]));
