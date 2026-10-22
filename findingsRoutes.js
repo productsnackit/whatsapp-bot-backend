@@ -47,7 +47,8 @@ async function ensureFindingsTable(db) {
       ADD COLUMN IF NOT EXISTS whatsapp_error TEXT,
       ADD COLUMN IF NOT EXISTS whatsapp_sent_at TIMESTAMPTZ,
       ADD COLUMN IF NOT EXISTS whatsapp_delivery TEXT,
-      ADD COLUMN IF NOT EXISTS files_sent_at TIMESTAMPTZ
+      ADD COLUMN IF NOT EXISTS files_sent_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS owner_department TEXT
   `);
   // When it was closed and by whom (for how long it took). Findings closed before this was kept:
   // from their last "Closed" follow-up, else when they were last changed.
@@ -148,7 +149,11 @@ function findingTemplate(finding, byName) {
 async function sendFindingFiles(finding, to) {
   for (const file of finding.attachments || []) await sendStoredFile(to, file, `${finding.ref}: ${file.name}`).catch(() => {});
 }
+// Audit tasks are handled on the dashboard (status buttons, Forward); WhatsApp only if
+// FINDING_WHATSAPP=on on Render.
+const findingWhatsAppOn = () => process.env.FINDING_WHATSAPP === "on";
 export async function sendFindingToOwner(db, findingId, { byName = null, reassigned = false } = {}) {
+  if (!findingWhatsAppOn()) return { ok: false, off: true };
   const finding = (await db.query("SELECT * FROM audit_findings WHERE id = $1", [findingId])).rows[0];
   if (!finding) return { ok: false };
   const owner = employeeById(finding.assignee_id);
@@ -376,9 +381,10 @@ export function registerFindingsRoutes(app, { db, auth, onChanged }) {
     const before = (await db.query("SELECT assignee_id FROM audit_findings WHERE id = $1", [req.params.id])).rows[0];
     if (!before) return res.status(404).json({ error: "Finding not found" });
     // Status changed on the edit form: closing records when and who, anything else clears it.
-    const closing = values.status === undefined ? "" : values.status === "Closed"
+    const toPerson = values.assignee_id ? ", owner_department = NULL" : ""; // given to a person: no longer a team task
+    const closing = toPerson + (values.status === undefined ? "" : values.status === "Closed"
       ? `, closed_at = CASE WHEN status = 'Closed' THEN closed_at ELSE NOW() END, closed_by = CASE WHEN status = 'Closed' THEN closed_by ELSE $${keys.length + 2} END`
-      : ", closed_at = NULL, closed_by = NULL";
+      : ", closed_at = NULL, closed_by = NULL");
     const result = await db.query(
       `UPDATE audit_findings SET ${keys.map((key, i) => `${key} = $${i + 1}`).join(", ")}, updated_at = NOW()${closing} WHERE id = $${keys.length + 1} RETURNING *`,
       [...keys.map((key) => values[key]), req.params.id, ...(values.status === "Closed" ? [userName(req.user)] : [])]
@@ -417,6 +423,79 @@ export function registerFindingsRoutes(app, { db, auth, onChanged }) {
       [JSON.stringify([entry]), status, req.params.id, userName(req.user)]
     );
     if (!result.rows.length) return res.status(404).json({ error: "Finding not found" });
+    // Started / resolved by someone else: the person who raised it is told on their phone.
+    const finding = result.rows[0];
+    const by = userName(req.user);
+    if (["In Progress", "Closed"].includes(status) && finding.created_by && finding.created_by !== by) {
+      const raiser = finding.created_by === "Admin" ? "admin" : (global.internalUsers || []).find((user) => user.name === finding.created_by)?.username;
+      if (raiser) sendPushToUsers(db, [raiser], {
+        title: status === "Closed" ? `✅ ${by} resolved ${finding.ref}` : `${by} started ${finding.ref}`,
+        body: `${finding.title}${notes && !/^(started|resolved)\.?$/i.test(notes) ? ` · ${notes}` : ""}`.slice(0, 180), view: "findings",
+      }).catch(() => {});
+    }
+    res.json(toApi(finding));
+  }));
+
+  /* Forward: the action owner (or whoever raised it, or an admin) passes the task to another
+     person, or to a department, where anyone in it can take it. Kept in the follow-up trail. */
+  const canPass = (finding, user) => user?.isAdmin || String(finding.assignee_id || "") === String(user?.userId || "")
+    || (finding.created_by && finding.created_by === userName(user))
+    || (!finding.assignee_id && finding.owner_department && finding.owner_department === user?.department);
+  const trail = (status, notes, user) => ({
+    date: new Date(Date.now() + 330 * 60000).toISOString().slice(0, 10), status, notes,
+    auditor: userName(user), recordedBy: userName(user), recordedAt: new Date().toISOString(),
+  });
+  app.post("/findings/:id/forward", auth, handle("FINDING FORWARD", async (req, res) => {
+    const finding = (await db.query("SELECT * FROM audit_findings WHERE id = $1", [req.params.id])).rows[0];
+    if (!finding) return res.status(404).json({ error: "Finding not found" });
+    if (finding.status === "Closed") return res.status(400).json({ error: "This task is closed. Re-open it first." });
+    if (!canPass(finding, req.user)) return res.status(403).json({ error: "Only the person it's assigned to, whoever raised it, or an admin can forward it" });
+    const note = String(req.body?.note || "").trim().slice(0, 1000);
+    const from = finding.assignee_name || (finding.owner_department ? `${finding.owner_department} team` : "nobody");
+    let result;
+    if (req.body?.department) {
+      const department = String(req.body.department).trim().slice(0, 80);
+      const members = (global.internalUsers || []).filter((user) => user.department === department);
+      if (!members.length) return res.status(400).json({ error: `Nobody is in ${department} yet` });
+      const entry = trail(finding.status, `Forwarded from ${from} to the ${department} team${note ? `: ${note}` : "."}`, req.user);
+      result = await db.query(
+        `UPDATE audit_findings SET assignee_id = NULL, assignee_name = NULL, owner_department = $2, follow_ups = follow_ups || $3::jsonb, updated_at = NOW() WHERE id = $1 RETURNING *`,
+        [finding.id, department, JSON.stringify([entry])]
+      );
+      sendPushToUsers(db, members.map((user) => user.username).filter(Boolean), {
+        title: `Audit task for the ${department} team · ${finding.ref}`, body: `${finding.title} (from ${userName(req.user)}). Open it and tap "Take it".`.slice(0, 180), view: "findings",
+      }).catch(() => {});
+      res.locals.activity = { section: "Internal Audit", action: `Forwarded ${finding.ref} to the ${department} team` };
+    } else {
+      const owner = employeeById(req.body?.assignee_id);
+      if (!owner) return res.status(400).json({ error: "Choose who to forward it to" });
+      if (String(owner.id) === String(finding.assignee_id)) return res.status(400).json({ error: `${owner.name} already has it` });
+      const entry = trail(finding.status, `Forwarded from ${from} to ${owner.name}${note ? `: ${note}` : "."}`, req.user);
+      result = await db.query(
+        `UPDATE audit_findings SET assignee_id = $2, assignee_name = $3, owner_department = NULL, follow_ups = follow_ups || $4::jsonb, updated_at = NOW() WHERE id = $1 RETURNING *`,
+        [finding.id, String(owner.id), owner.name, JSON.stringify([entry])]
+      );
+      notifyAssignee(db, toApi(result.rows[0]), userName(req.user), true);
+      res.locals.activity = { section: "Internal Audit", action: `Forwarded ${finding.ref} to ${owner.name}` };
+    }
+    res.json(toApi(result.rows[0]));
+  }));
+
+  // Someone in the department a task was forwarded to takes it: it becomes theirs.
+  app.post("/findings/:id/take", auth, handle("FINDING TAKE", async (req, res) => {
+    const finding = (await db.query("SELECT * FROM audit_findings WHERE id = $1", [req.params.id])).rows[0];
+    if (!finding) return res.status(404).json({ error: "Finding not found" });
+    if (finding.assignee_id) return res.status(400).json({ error: `${finding.assignee_name || "Someone"} has already taken it` });
+    if (!req.user?.userId) return res.status(400).json({ error: "Log in with your own account to take a task" });
+    if (!req.user?.isAdmin && finding.owner_department !== req.user?.department) return res.status(403).json({ error: `This task is for the ${finding.owner_department} team` });
+    const entry = trail(finding.status, `Taken by ${userName(req.user)} (${finding.owner_department} team).`, req.user);
+    const result = await db.query(
+      `UPDATE audit_findings SET assignee_id = $2, assignee_name = $3, owner_department = NULL, follow_ups = follow_ups || $4::jsonb, updated_at = NOW()
+       WHERE id = $1 AND assignee_id IS NULL RETURNING *`,
+      [finding.id, String(req.user.userId), userName(req.user), JSON.stringify([entry])]
+    );
+    if (!result.rows[0]) return res.status(409).json({ error: "Someone else took it just now" });
+    res.locals.activity = { section: "Internal Audit", action: `Took ${finding.ref} for the ${finding.owner_department} team` };
     res.json(toApi(result.rows[0]));
   }));
 
