@@ -23,6 +23,7 @@ export const PAGES = {
   supply: "Fruits & Direct Supply",
   analytics: "Refund Analytics",
   invoices: "Invoices (TRIPNINE)",
+  office_leads: "Office WhatsApp leads",
   activity: "Activity log",
   settings: "Bot settings",
 };
@@ -138,6 +139,7 @@ const PATH_RULES = [
   [/^\/(operations|machines|inventory|host-sites|brands|skus|leads)(\/|$)/, ["operations"]],
   [/^\/activity(\/|$)/, ["activity"]],
   [/^\/invoicing(\/|$)/, ["invoices"]],
+  [/^\/office-leads(\/|$)/, ["office_leads"]],
 ];
 
 // Returns true if the person may call this API path.

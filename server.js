@@ -27,6 +27,7 @@ import { registerMyHomeRoutes } from "./myHome.js";
 import { ensureRefillerApp, registerRefillerAppRoutes, refillerLogin, looksLikePhone, refillerByPhone, refillerSession } from "./refillerApp.js";
 import { registerOtpRoutes } from "./otpLogin.js";
 import { ensureSavedInvoices, registerSavedInvoiceRoutes, cleanOldInvoices } from "./savedInvoices.js";
+import { ensureOfficeBot, registerOfficeBotRoutes, handleOfficeWebhook } from "./officeBot.js";
 import { ensureImageRetention, cleanOldImages, registerImageRetentionRoutes } from "./imageRetention.js";
 import { registerAnalyticsOverview } from "./analyticsOverview.js";
 import { registerMachineRoutes } from "./machines.js";
@@ -3392,6 +3393,7 @@ registerRefillRoutes(app, { auth });
 const INVOICE_PAGE = fs.readFileSync(new URL("./invoiceDashboard.html", import.meta.url), "utf8");
 app.get("/invoicing/page", auth, (req, res) => res.json({ html: INVOICE_PAGE }));
 registerSavedInvoiceRoutes(app, { auth });
+registerOfficeBotRoutes(app, { auth });
 // Log in with a code on WhatsApp instead of a password (owner: ADMIN_PHONE; employees; refillers).
 registerOtpRoutes(app, {
   findAccount: async (phone) => {
@@ -4119,6 +4121,13 @@ if (!global.processedMessageIds) global.processedMessageIds = new Set();
 
 app.post("/webhook", async (req, res) => {
   try {
+    // The director's office number (coexistence): its own office bot, never the refund bot.
+    try {
+      if (await handleOfficeWebhook(req.body)) return res.sendStatus(200);
+    } catch (err) {
+      console.log("OFFICE WEBHOOK ERROR:", err.message);
+    }
+
     const entry = req.body?.entry?.[0];
     const change = entry?.changes?.[0];
     const value = change?.value;
@@ -4914,6 +4923,9 @@ try {
   setInterval(unlessQuiet(cleanOldImages), 6 * 60 * 60 * 1000);
   // Saved invoices older than Admin Settings → "Saved invoices" (0 = keep forever).
   await ensureSavedInvoices(db).catch((err) => console.error("SAVED INVOICES SETUP ERROR:", err.message));
+  // Office WhatsApp number + office bot; new leads alert admins and people with Office Leads.
+  await ensureOfficeBot(db, { leadAudience: () => ["admin", ...global.internalUsers.filter((user) => hasPage(accessFor(user), "office_leads")).map((user) => user.username)] })
+    .catch((err) => console.error("OFFICE BOT SETUP ERROR:", err.message));
   setTimeout(() => cleanOldInvoices().catch(() => {}), 6 * 60 * 1000);
   setInterval(unlessQuiet(() => cleanOldInvoices().catch((err) => console.log("INVOICE CLEAN-UP ERROR:", err.message))), 6 * 60 * 60 * 1000);
 } catch (err) {
