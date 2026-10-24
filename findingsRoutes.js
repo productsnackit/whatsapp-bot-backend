@@ -48,7 +48,8 @@ async function ensureFindingsTable(db) {
       ADD COLUMN IF NOT EXISTS whatsapp_sent_at TIMESTAMPTZ,
       ADD COLUMN IF NOT EXISTS whatsapp_delivery TEXT,
       ADD COLUMN IF NOT EXISTS files_sent_at TIMESTAMPTZ,
-      ADD COLUMN IF NOT EXISTS owner_department TEXT
+      ADD COLUMN IF NOT EXISTS owner_department TEXT,
+      ADD COLUMN IF NOT EXISTS cc JSONB NOT NULL DEFAULT '[]'::jsonb
   `);
   // When it was closed and by whom (for how long it took). Findings closed before this was kept:
   // from their last "Closed" follow-up, else when they were last changed.
@@ -101,6 +102,15 @@ function notifyAssignee(db, finding, byName, reassigned) {
     body: `${finding.risk}: ${finding.title} (due ${finding.due_date}). From ${byName}.`.slice(0, 180),
     view: "findings",
   });
+}
+
+// People kept in CC ([{ id, name }]): they can see it and are told when it's given out,
+// forwarded, started or resolved, like CC on an email. The person doing it isn't told twice.
+function notifyCc(db, finding, title, body, skipNames = []) {
+  const skip = new Set([...skipNames, finding.assignee_name].filter(Boolean));
+  const usernames = (finding.cc || []).map((person) => employeeById(person.id)).filter((user) => user?.username && !skip.has(user.name)).map((user) => user.username);
+  if (!usernames.length) return;
+  sendPushToUsers(db, usernames, { title: `CC · ${title}`.slice(0, 120), body: String(body || "").slice(0, 180), view: "findings" }).catch(() => {});
 }
 
 /* ---------- The task on the action owner's WhatsApp ----------
@@ -218,6 +228,7 @@ export async function handleFindingWhatsApp(msg) {
     title: action === "START" ? `${owner.name} started ${finding.ref}` : `✅ ${owner.name} finished ${finding.ref}: please verify`,
     body: finding.title.slice(0, 150), view: "findings",
   }).catch(() => {});
+  notifyCc(replyDb, finding, action === "START" ? `${owner.name} started ${finding.ref}` : `${owner.name} finished ${finding.ref}`, finding.title, [owner.name]);
   replyChanged?.();
   return true;
 }
@@ -256,6 +267,12 @@ function readFinding(body, { partial }) {
   if (values.status && !FINDING_STATUSES.includes(values.status)) return { error: "Invalid status" };
   for (const key of ["observed_on", "due_date"]) {
     if (values[key] && Number.isNaN(new Date(values[key]).getTime())) return { error: `Invalid ${key.replace("_", " ")}` };
+  }
+  if (body.cc !== undefined) {
+    const ids = [...new Set((Array.isArray(body.cc) ? body.cc : []).map((id) => String(id?.id ?? id ?? "")).filter(Boolean))].slice(0, 20);
+    const people = ids.map(employeeById);
+    if (people.some((person) => !person)) return { error: "Choose CC people from the employee list" };
+    values.cc = JSON.stringify(people.map((person) => ({ id: String(person.id), name: person.name })));
   }
   if (values.assignee_id) {
     const owner = employeeById(values.assignee_id);
@@ -300,10 +317,10 @@ export function registerFindingsRoutes(app, { db, auth, onChanged }) {
     if (error) return res.status(400).json({ error });
     const by = userName(req.user);
     const inserted = await db.query(
-      `INSERT INTO audit_findings (department, observed_on, title, description, risk, status, root_cause, action_plan, assignee_id, assignee_name, due_date, created_by, locations)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id`,
+      `INSERT INTO audit_findings (department, observed_on, title, description, risk, status, root_cause, action_plan, assignee_id, assignee_name, due_date, created_by, locations, cc)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb) RETURNING id`,
       [values.department, values.observed_on, values.title, values.description, values.risk, values.status || "Open",
-        values.root_cause, values.action_plan || "", values.assignee_id, values.assignee_name, values.due_date, by, values.locations || []]
+        values.root_cause, values.action_plan || "", values.assignee_id, values.assignee_name, values.due_date, by, values.locations || [], values.cc || "[]"]
     );
     const finding = toApi((await db.query(
       `UPDATE audit_findings SET ref = 'FND-' || LPAD(id::text, 5, '0'),
@@ -312,6 +329,7 @@ export function registerFindingsRoutes(app, { db, auth, onChanged }) {
       [inserted.rows[0].id, by]
     )).rows[0]);
     notifyAssignee(db, finding, by, false);
+    notifyCc(db, finding, `${finding.ref} given to ${finding.assignee_name}`, `${finding.risk}: ${finding.title} (due ${finding.due_date}). From ${by}.`, [by]);
     // To their WhatsApp now, or once the files are attached (the page then calls /whatsapp).
     if (!req.body?.files_pending) await sendFindingToOwner(db, finding.id, { byName: by }).catch((err) => console.log("FINDING WHATSAPP ERROR:", err.message));
     res.status(201).json(toApi((await db.query("SELECT * FROM audit_findings WHERE id = $1", [finding.id])).rows[0]));
@@ -378,7 +396,7 @@ export function registerFindingsRoutes(app, { db, auth, onChanged }) {
     if (error) return res.status(400).json({ error });
     const keys = Object.keys(values);
     if (!keys.length) return res.status(400).json({ error: "Nothing to update" });
-    const before = (await db.query("SELECT assignee_id FROM audit_findings WHERE id = $1", [req.params.id])).rows[0];
+    const before = (await db.query("SELECT assignee_id, cc FROM audit_findings WHERE id = $1", [req.params.id])).rows[0];
     if (!before) return res.status(404).json({ error: "Finding not found" });
     // Status changed on the edit form: closing records when and who, anything else clears it.
     const toPerson = values.assignee_id ? ", owner_department = NULL" : ""; // given to a person: no longer a team task
@@ -386,10 +404,14 @@ export function registerFindingsRoutes(app, { db, auth, onChanged }) {
       ? `, closed_at = CASE WHEN status = 'Closed' THEN closed_at ELSE NOW() END, closed_by = CASE WHEN status = 'Closed' THEN closed_by ELSE $${keys.length + 2} END`
       : ", closed_at = NULL, closed_by = NULL");
     const result = await db.query(
-      `UPDATE audit_findings SET ${keys.map((key, i) => `${key} = $${i + 1}`).join(", ")}, updated_at = NOW()${closing} WHERE id = $${keys.length + 1} RETURNING *`,
+      `UPDATE audit_findings SET ${keys.map((key, i) => `${key} = $${i + 1}${key === "cc" ? "::jsonb" : ""}`).join(", ")}, updated_at = NOW()${closing} WHERE id = $${keys.length + 1} RETURNING *`,
       [...keys.map((key) => values[key]), req.params.id, ...(values.status === "Closed" ? [userName(req.user)] : [])]
     );
     const finding = toApi(result.rows[0]);
+    // Newly added to CC: told now.
+    const hadCc = new Set((before.cc || []).map((person) => String(person.id)));
+    const addedCc = (finding.cc || []).filter((person) => !hadCc.has(String(person.id)));
+    if (addedCc.length) notifyCc(db, { ...finding, cc: addedCc }, `You're in CC on ${finding.ref}`, `${finding.title} · with ${finding.assignee_name || finding.owner_department || "—"} (added by ${userName(req.user)}).`, [userName(req.user)]);
     if (values.assignee_id && values.assignee_id !== before.assignee_id) {
       notifyAssignee(db, finding, userName(req.user), true);
       if (!req.body?.files_pending) await sendFindingToOwner(db, finding.id, { byName: userName(req.user), reassigned: true }).catch((err) => console.log("FINDING WHATSAPP ERROR:", err.message));
@@ -433,6 +455,8 @@ export function registerFindingsRoutes(app, { db, auth, onChanged }) {
         body: `${finding.title}${notes && !/^(started|resolved)\.?$/i.test(notes) ? ` · ${notes}` : ""}`.slice(0, 180), view: "findings",
       }).catch(() => {});
     }
+    notifyCc(db, finding, status === "Closed" ? `✅ ${by} resolved ${finding.ref}` : `${finding.ref} is now ${status} (${by})`,
+      `${finding.title}${notes && !/^(started|resolved)\.?$/i.test(notes) ? ` · ${notes}` : ""}`, [by, ["In Progress", "Closed"].includes(status) ? finding.created_by : null]); // the raiser was told above
     res.json(toApi(finding));
   }));
 
@@ -478,6 +502,8 @@ export function registerFindingsRoutes(app, { db, auth, onChanged }) {
       notifyAssignee(db, toApi(result.rows[0]), userName(req.user), true);
       res.locals.activity = { section: "Internal Audit", action: `Forwarded ${finding.ref} to ${owner.name}` };
     }
+    const now = result.rows[0];
+    notifyCc(db, now, `${finding.ref} forwarded to ${now.assignee_name || `the ${now.owner_department} team`}`, `${finding.title} (by ${userName(req.user)})${note ? ` · ${note}` : ""}`, [userName(req.user)]);
     res.json(toApi(result.rows[0]));
   }));
 

@@ -4473,6 +4473,49 @@ app.post("/internal/users/:id/reset-password", auth, (req, res) => {
   res.json({ success: true, credentials: { username: user.username, password } });
 });
 
+// Excel of everyone's login to share with them. Old passwords can't be read (they're scrambled),
+// so the list has none; "reset" gives the ticked people new passwords and puts those in the file.
+function sendLoginsExcel(res, rows, withPasswords) {
+  const loginAt = String(process.env.DASHBOARD_URL || "https://whatsapp-bot-frontend-snackit.vercel.app");
+  const header = ["Name", "Username", ...(withPasswords ? ["New password"] : []), "WhatsApp number", "Department", "Job title", "Access", "Log in at", "How to log in"];
+  const data = rows.map(({ user, password }) => [
+    user.name, user.username, ...(withPasswords ? [password] : []),
+    String(user.phone || "").replace(/^91(?=\d{10}$)/, ""), user.department || "", user.role || "", accessFor(user).roleLabel, loginAt,
+    user.phone ? "Username + password, or OTP on WhatsApp" : "Username + password",
+  ]);
+  const sheet = XLSX.utils.aoa_to_sheet([header, ...data]);
+  sheet["!cols"] = header.map((title, index) => ({ wch: Math.min(48, Math.max(title.length, ...data.map((row) => String(row[index] || "").length)) + 2) }));
+  const workbook = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(workbook, sheet, "Logins");
+  const day = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
+  res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+  res.setHeader("Content-Disposition", `attachment; filename="snackit-${withPasswords ? "new-passwords" : "logins"}-${day}.xlsx"`);
+  res.send(XLSX.write(workbook, { type: "buffer", bookType: "xlsx" }));
+}
+
+app.get("/internal/users/logins.xlsx", auth, (req, res) => {
+  if (!req.user?.isAdmin) return res.status(403).json({ error: "Admin access required" });
+  res.locals.activity = { action: "Downloaded the employee login list (no passwords)" };
+  sendLoginsExcel(res, global.internalUsers.map((user) => ({ user })), false);
+});
+
+// New passwords for the ticked people (never yourself, so you stay logged in), in an Excel.
+app.post("/internal/users/reset-passwords.xlsx", auth, (req, res) => {
+  if (!req.user?.isAdmin) return res.status(403).json({ error: "Admin access required" });
+  const ids = new Set((Array.isArray(req.body?.ids) ? req.body.ids : []).map(String));
+  const chosen = global.internalUsers.filter((user) => ids.has(String(user.id)) && String(user.id) !== String(req.user.userId));
+  if (!chosen.length) return res.status(400).json({ error: "Tick at least one person (other than you)" });
+  const rows = chosen.map((user) => {
+    const password = generatePassword();
+    user.password = hashPassword(password);
+    endSessionsOf(user.id);
+    return { user, password };
+  });
+  scheduleInternalSave();
+  res.locals.activity = { action: `Reset passwords for ${rows.length} employee${rows.length === 1 ? "" : "s"} and downloaded them: ${rows.map(({ user }) => user.name).join(", ")}` };
+  sendLoginsExcel(res, rows, true);
+});
+
 // Roles and pages the Employees page offers.
 app.get("/internal/access-options", auth, (req, res) => {
   res.json({ pages: PAGES, roles: Object.fromEntries(Object.entries(ROLE_PRESETS).map(([key, preset]) => [key, { label: preset.label, pages: preset.pages, readOnly: preset.readOnly }])) });
