@@ -8,7 +8,8 @@
     bot; they come here:
       • a new person messaging gets the office bot: a menu (refund / list your product / rent a
         machine / buy a machine / direct supply / talk to the team), then a few questions
-        (name, company, city, what they need) → a lead on the Office Leads page + a phone alert;
+        (name, email, city; "list your product" also gets where to send
+        samples and the product email) → a lead on the Office Leads page + a phone alert;
       • the director's saved contacts (synced from his app) are never answered by the bot;
       • when the director replies from his phone (smb_message_echoes), the bot stays quiet in that
         chat for 12 hours (Admin Settings), so the two never talk over each other.
@@ -43,6 +44,7 @@ export async function ensureOfficeBot(database, { leadAudience } = {}) {
       kind TEXT NOT NULL, details TEXT, status TEXT NOT NULL DEFAULT 'New', notes JSONB NOT NULL DEFAULT '[]'::jsonb,
       created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW(), updated_by TEXT
     );
+    ALTER TABLE office_leads ADD COLUMN IF NOT EXISTS email TEXT;
   `);
   await loadOffice();
 }
@@ -83,10 +85,10 @@ const list = (to, body, button, rows) => send({
 
 /* ---------- The office bot ---------- */
 const KINDS = {
-  OB_LIST: { kind: "List a product", ask: "Tell us about your product: brand, what it is, price and pack size. 🛒" },
-  OB_RENT: { kind: "Rent a machine", ask: "Where would the machine go (office, factory, college…) and about how many people are there? 🏢" },
-  OB_BUY: { kind: "Buy a machine", ask: "How many machines do you need, and for which location? 🤝" },
-  OB_SUPPLY: { kind: "Direct supply", ask: "What would you like supplied (fruits, snacks, drinks…), how often, and for how many people? 🍎" },
+  OB_LIST: { kind: "List a product" },
+  OB_RENT: { kind: "Rent a machine" },
+  OB_BUY: { kind: "Buy a machine" },
+  OB_SUPPLY: { kind: "Direct supply" },
 };
 const MENU_ROWS = [
   { id: "OB_RENT", title: "Rent a machine", description: "A vending machine at your place" },
@@ -96,8 +98,9 @@ const MENU_ROWS = [
   { id: "OB_TEAM", title: "Talk to our team", description: "A person will reply here" },
   { id: "OB_REFUND", title: "Refund / machine issue", description: "Money deducted, product not received" },
 ];
-const QUESTIONS = { ask_name: "May I have your name? 🙂", ask_company: "Which company or organisation are you from?", ask_city: "Which city / area is this for? 📍" };
-const NEXT = { ask_name: "ask_company", ask_company: "ask_city", ask_city: "ask_details" };
+// Just three questions: name, email, city (ask_company / ask_details only for chats started before).
+const QUESTIONS = { ask_name: "May I have your name? 🙂", ask_email: "What's your email address (Gmail)? 📧", ask_city: "Which city / area is this for? 📍" };
+const NEXT = { ask_name: "ask_email", ask_email: "ask_city", ask_company: "ask_city" };
 
 async function supportNumber() {
   if (process.env.SUPPORT_WHATSAPP) return digits(process.env.SUPPORT_WHATSAPP);
@@ -162,16 +165,21 @@ async function handleIncoming(msg, contactName) {
   const answer = said || (msg.type === "image" ? "(sent a photo)" : msg.type === "document" ? "(sent a document)" : msg.type === "audio" ? "(sent a voice note)" : "");
   if ((chat?.state || "").startsWith("ask_") && answer) {
     const step = chat.state;
-    const field = { ask_name: "name", ask_company: "company", ask_city: "city", ask_details: "details" }[step];
+    const field = { ask_name: "name", ask_email: "email", ask_company: "company", ask_city: "city", ask_details: "details" }[step];
+    if (step === "ask_email" && !EMAIL.test(answer.trim())) {
+      await text(phone, "That doesn't look like an email address. Please type it like *name@gmail.com* 📧");
+      return setChat(phone, { last_bot_at: new Date() });
+    }
     const next = { ...data, [field]: answer.slice(0, 1000) };
-    if (step === "ask_details") {
+    if (step === "ask_city" || step === "ask_details") {
       const lead = await saveLead(phone, contactName, next);
-      await text(phone, `Thank you${next.name ? `, ${next.name.split(" ")[0]}` : ""}! 🙏 We've noted your request (${lead.ref}). Our team will get back to you soon.\n\nType *menu* anytime to start again.`);
+      await text(phone, `Thank you${next.name ? `, ${next.name.split(" ")[0]}` : ""}! We've noted your request (${lead.ref}). Our team will get back to you soon.\n\nType *menu* anytime to start again.`);
+      if (data.choice === "OB_LIST") await text(phone, samplesMessage());
       await setChat(phone, { state: "done", data: {}, last_bot_at: new Date() });
-      return alert(`🆕 New lead: ${lead.kind} · ${lead.name || contactName || `+${phone}`}`, `${lead.company ? `${lead.company} · ` : ""}${lead.city || ""} · ${String(lead.details || "").slice(0, 80)}`);
+      return alert(`🆕 New lead: ${lead.kind} · ${lead.name || contactName || `+${phone}`}`, [lead.city, lead.email, lead.company, lead.details && String(lead.details).slice(0, 80)].filter(Boolean).join(" · ") || `+${phone}`);
     }
     const nextStep = NEXT[step];
-    await text(phone, nextStep === "ask_details" ? KINDS[data.choice]?.ask || "What do you need?" : QUESTIONS[nextStep]);
+    await text(phone, QUESTIONS[nextStep]);
     return setChat(phone, { state: nextStep, data: next, last_bot_at: new Date() });
   }
   if (chat?.state === "menu") {
@@ -185,6 +193,19 @@ async function handleIncoming(msg, contactName) {
   }
 }
 
+const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+const PRODUCT_EMAIL = process.env.PRODUCT_EMAIL || "product@snackit.in";
+// After "List your product": where to send samples (Admin Settings → Office WhatsApp number) and the email for details.
+function samplesMessage() {
+  const address = String(office?.samples_address || "").trim();
+  return [
+    "📦 *Next step: send us your samples*",
+    "",
+    address ? `Please share your product samples at this address:\n${address}` : "Our team will share the Snackit office address for your samples shortly.",
+    "",
+    `📧 You can also email your product details (catalogue, price list, pack sizes) to *${PRODUCT_EMAIL}* to list your products in our vending machines.`,
+  ].join("\n");
+}
 const pauseMs = () => Math.max(1, Number(office?.pause_hours) || 12) * 3600000;
 function alert(title, body) {
   return sendPushToUsers(db, audience(), { title, body: String(body).slice(0, 180), view: "office-leads" }).catch(() => {});
@@ -192,8 +213,8 @@ function alert(title, body) {
 async function saveLead(phone, waName, data) {
   const kind = KINDS[data.choice]?.kind || "Enquiry";
   const { rows } = await db.query(
-    "INSERT INTO office_leads (phone, wa_name, name, company, city, kind, details) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
-    [phone, waName || null, data.name || null, data.company || null, data.city || null, kind, data.details || null]
+    "INSERT INTO office_leads (phone, wa_name, name, company, city, kind, details, email) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
+    [phone, waName || null, data.name || null, data.company || null, data.city || null, kind, data.details || null, data.email ? data.email.trim().toLowerCase() : null]
   );
   const { rows: saved } = await db.query("UPDATE office_leads SET ref = 'LD-' || LPAD(id::text, 4, '0') WHERE id = $1 RETURNING *", [rows[0].id]);
   return saved[0];
@@ -251,6 +272,7 @@ export function registerOfficeBotRoutes(app, { auth }) {
     display_phone: office?.display_phone || null, verified_name: office?.verified_name || null, phone_number_id: office?.phone_number_id || null,
     waba_id: office?.waba_id || null, connected_at: office?.connected_at || null, connected_by: office?.connected_by || null,
     bot_on: office?.bot_on !== false, pause_hours: Number(office?.pause_hours) || 12, contacts_synced: office?.contacts_synced || null,
+    samples_address: office?.samples_address || "", product_email: PRODUCT_EMAIL,
   });
 
   app.get("/admin/office-whatsapp", auth, adminOnly, handle("OFFICE WA", async (req, res) => {
@@ -299,6 +321,7 @@ export function registerOfficeBotRoutes(app, { auth }) {
       if (!(hours >= 1 && hours <= 72)) return res.status(400).json({ error: "Choose 1 to 72 hours" });
       next.pause_hours = hours;
     }
+    if (req.body?.samples_address !== undefined) next.samples_address = String(req.body.samples_address || "").trim().slice(0, 600);
     await saveOffice(next);
     res.json(view());
   }));
