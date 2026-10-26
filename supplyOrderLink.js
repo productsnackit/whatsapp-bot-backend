@@ -42,22 +42,34 @@ async function companyByToken(token) {
   return rows[0] || null;
 }
 
-// Delivery dates still taking orders: collecting, and today or later (India time).
-// One entry per date, even when fruits and packaged each have a delivery that day (round_ids).
+// Delivery dates a company can order for, one entry per date (id = the date, "YYYY-MM-DD"):
+//   • dates Snackit already opened (collecting), today or later (India time), and
+//   • every day from tomorrow for ORDER_DAYS days, so the shop is never empty; that date's
+//     delivery is opened automatically when the first order comes in.
+// A date whose delivery has already gone to the buyer isn't offered again.
+const ORDER_DAYS = Math.max(1, Number(process.env.SUPPLY_ORDER_DAYS) || 14);
+const addDays = (date, days) => { const next = new Date(`${date}T00:00:00Z`); next.setUTCDate(next.getUTCDate() + days); return next.toISOString().slice(0, 10); };
 async function openRounds() {
+  const today = todayIst();
   const { rows } = await db.query(
-    "SELECT id, ref, delivery_date, title, segment FROM supply_rounds WHERE status = 'Collecting' AND delivery_date >= $1::date ORDER BY delivery_date, id",
-    [todayIst()]
+    "SELECT id, ref, delivery_date, title, segment, status FROM supply_rounds WHERE delivery_date >= $1::date ORDER BY delivery_date, id",
+    [today]
   );
   const byDate = new Map();
+  const started = new Set(); // dates with a delivery already past collecting
   for (const round of rows) {
     const date = plainDate(round.delivery_date);
-    const entry = byDate.get(date) || { id: round.id, ref: round.ref, delivery_date: date, title: round.title, round_ids: [] };
+    if (round.status !== "Collecting") { started.add(date); continue; }
+    const entry = byDate.get(date) || { id: date, ref: round.ref, delivery_date: date, title: round.title, round_ids: [], segments: {} };
     entry.round_ids.push(round.id);
-    entry.segments = { ...(entry.segments || {}), [round.segment]: round.id };
+    entry.segments[round.segment] = round.id;
     byDate.set(date, entry);
   }
-  return [...byDate.values()];
+  for (let day = 1; day <= ORDER_DAYS; day += 1) {
+    const date = addDays(today, day);
+    if (!byDate.has(date) && !started.has(date)) byDate.set(date, { id: date, ref: null, delivery_date: date, title: null, round_ids: [], segments: {} });
+  }
+  return [...byDate.values()].sort((x, y) => x.delivery_date.localeCompare(y.delivery_date));
 }
 
 // A few submissions per link per hour is plenty; this stops a leaked link being hammered.
@@ -122,8 +134,8 @@ export async function catalogFor(company) {
 
 // Places (or replaces) a company's order for an open delivery date. Returns { status, json }.
 export async function placeOrder(company, body, via = "order link") {
-  const roundId = Number(body?.round_id);
-  const round = (await openRounds()).find((item) => item.id === roundId);
+  const wanted = String(body?.round_id || body?.delivery_date || "");
+  const round = (await openRounds()).find((item) => item.id === wanted || item.round_ids.includes(Number(wanted)));
   if (!round) return { status: 400, json: { error: "That delivery date is no longer taking orders. Please refresh the page." } };
   const { rows: known } = await db.query("SELECT id, name, unit FROM supply_products");
   const byId = new Map(known.map((item) => [item.id, item]));
@@ -139,11 +151,20 @@ export async function placeOrder(company, body, via = "order link") {
   if (!lines.length) return { status: 400, json: { error: "Add a quantity for at least one item." } };
   const submittedBy = String(body?.name || "").trim().slice(0, 80) || null;
   const note = String(body?.note || "").trim().slice(0, 500) || null;
+  // Fruits and packaged items each go to that supply's delivery for the date. If that supply's
+  // delivery for the date already went to the buyer, don't open a second one.
+  const parts = Object.entries(await splitBySegment(lines));
+  for (const [segment] of parts) {
+    if (round.segments?.[segment]) continue;
+    const { rows: gone } = await db.query("SELECT 1 FROM supply_rounds WHERE delivery_date = $1 AND segment = $2 AND status <> 'Collecting'", [round.delivery_date, segment]);
+    if (gone.length) return { status: 400, json: { error: `The ${segment === "fruits" ? "fruits" : "packaged items"} for ${round.delivery_date} have already been ordered from our suppliers. Please choose another date.` } };
+  }
   // A new submission for the same date replaces their earlier link order (both supplies).
   const { rows: previous } = await db.query("DELETE FROM supply_orders WHERE company_id = $1 AND round_id = ANY($2) AND source = 'link' RETURNING id", [company.id, round.round_ids]);
-  // Fruits and packaged items each go to that supply's delivery for the date.
-  for (const [segment, part] of Object.entries(await splitBySegment(lines))) {
-    let roundId = round.segments?.[segment];
+  for (const [segment, part] of parts) {
+    // (another company may have opened this date's delivery a moment ago)
+    let roundId = round.segments?.[segment]
+      || (await db.query("SELECT id FROM supply_rounds WHERE delivery_date = $1 AND segment = $2 AND status = 'Collecting' ORDER BY id LIMIT 1", [round.delivery_date, segment])).rows[0]?.id;
     if (!roundId) {
       const { rows: created } = await db.query("INSERT INTO supply_rounds (delivery_date, title, created_by, segment) VALUES ($1, $2, $3, $4) RETURNING id", [round.delivery_date, round.title, `${company.name} (${via})`, segment]);
       roundId = created[0].id;
@@ -158,10 +179,10 @@ export async function placeOrder(company, body, via = "order link") {
   onChange();
   sendPushToUsers(db, ["admin"], {
     title: `${previous.length ? "Order updated" : "New order"} · ${company.name}`,
-    body: `${lines.length} item${lines.length === 1 ? "" : "s"} for ${round.ref} (${round.delivery_date})${submittedBy ? ` from ${submittedBy}` : ""}`,
+    body: `${lines.length} item${lines.length === 1 ? "" : "s"} for ${round.ref || "delivery"} (${round.delivery_date})${submittedBy ? ` from ${submittedBy}` : ""}`,
     view: "supply",
   }).catch(() => {});
-  console.log(`🛒 ${via}: ${company.name} ${previous.length ? "updated" : "sent"} ${lines.length} items for ${round.ref}`);
+  console.log(`🛒 ${via}: ${company.name} ${previous.length ? "updated" : "sent"} ${lines.length} items for ${round.delivery_date}`);
   return { status: 201, json: { success: true, updated: previous.length > 0, round, items: lines.length } };
 }
 

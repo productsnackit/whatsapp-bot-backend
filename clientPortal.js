@@ -166,8 +166,10 @@ export function registerClientPortalRoutes(app, { auth }) {
 
   /* ---------- The company admin's own shop ---------- */
   app.post("/client/login", handle("CLIENT LOGIN", async (req, res) => {
-    const username = String(req.body?.username || "").trim().toLowerCase().slice(0, 60);
-    const password = String(req.body?.password || "");
+    // Copied from WhatsApp: drop spaces, invisible characters and "Username:" / "Password:" labels.
+    const clean = (value) => String(value || "").replace(/[\u200B-\u200D\uFEFF\u00A0]/g, " ").replace(/^\s*(username|user|password|pass)\s*:\s*/i, "").trim();
+    const username = clean(req.body?.username).replace(/\s+/g, "").toLowerCase().slice(0, 60);
+    const password = clean(req.body?.password);
     if (!username || !password) return res.status(400).json({ error: "Enter your username and password" });
     if (locked(username)) return res.status(429).json({ error: "Too many wrong tries. Please wait 15 minutes and try again." });
     const { rows } = await db.query(
@@ -175,9 +177,17 @@ export function registerClientPortalRoutes(app, { auth }) {
       [username]
     );
     const user = rows[0];
-    if (!user || !verifyPassword(password, user.password)) {
+    if (!user) {
       failures.set(username, [...(failures.get(username) || []), Date.now()]);
-      return res.status(401).json({ error: "Wrong username or password" });
+      // A dashboard (employee / owner) login typed here by mistake: say so.
+      const staff = username === String(process.env.ADMIN_USER || "").toLowerCase() || (global.internalUsers || []).some((person) => String(person.username || "").toLowerCase() === username);
+      return res.status(401).json({ error: staff
+        ? "That is a dashboard (employee) login. The shop needs a company login: make one in Direct Supply → Setup → Company logins (shop)."
+        : "No company login with that username. Check the username (e.g. inks.priya) or ask Snackit." });
+    }
+    if (!verifyPassword(password, user.password)) {
+      failures.set(username, [...(failures.get(username) || []), Date.now()]);
+      return res.status(401).json({ error: "Wrong password. Check capital letters (e.g. Snackit@AB12CD), or ask Snackit to reset it." });
     }
     if (!user.active || !user.company_active) return res.status(403).json({ error: "This login is switched off. Please contact Snackit." });
     failures.delete(username);
