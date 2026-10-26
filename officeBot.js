@@ -154,15 +154,21 @@ async function handleIncoming(msg, contactName) {
     return setChat(phone, { state: "done", data: {}, last_bot_at: new Date() });
   }
   if (choice === "OB_TEAM") {
-    await text(phone, "Sure 🙂 Someone from our team will reply to you here shortly.");
-    await setChat(phone, { state: "done", data: {}, paused_until: new Date(Date.now() + pauseMs()), last_bot_at: new Date() });
-    return alert(`💬 ${contactName || `+${phone}`} wants to talk to the team`, "Reply to them from the office WhatsApp.");
+    await text(phone, "Sure 🙂 Please tell us your requirements or concerns.");
+    return setChat(phone, { state: "team_concern", data: { choice }, last_bot_at: new Date() });
   }
   if (KINDS[choice]) {
     await text(phone, `Great! Just a few quick questions about *${KINDS[choice].kind.toLowerCase()}*.\n\n${QUESTIONS.ask_name}`);
     return setChat(phone, { state: "ask_name", data: { choice }, last_bot_at: new Date() });
   }
   const answer = said || (msg.type === "image" ? "(sent a photo)" : msg.type === "document" ? "(sent a document)" : msg.type === "audio" ? "(sent a voice note)" : "");
+  // "Talk to our team": what they need → a lead, thanks, and the bot leaves the chat to the team.
+  if (chat?.state === "team_concern" && answer) {
+    const lead = await saveLead(phone, contactName, { choice: "OB_TEAM", details: answer.slice(0, 1000) });
+    await text(phone, "Thank you for contacting Snackit! Our team will check and contact you soon.");
+    await setChat(phone, { state: "done", data: {}, paused_until: new Date(Date.now() + pauseMs()), last_bot_at: new Date() });
+    return alert(`💬 ${contactName || `+${phone}`} wants to talk to the team (${lead.ref})`, answer);
+  }
   if ((chat?.state || "").startsWith("ask_") && answer) {
     const step = chat.state;
     const field = { ask_name: "name", ask_email: "email", ask_company: "company", ask_city: "city", ask_details: "details" }[step];
@@ -211,7 +217,7 @@ function alert(title, body) {
   return sendPushToUsers(db, audience(), { title, body: String(body).slice(0, 180), view: "office-leads" }).catch(() => {});
 }
 async function saveLead(phone, waName, data) {
-  const kind = KINDS[data.choice]?.kind || "Enquiry";
+  const kind = KINDS[data.choice]?.kind || (data.choice === "OB_TEAM" ? "Talk to our team" : "Enquiry");
   const { rows } = await db.query(
     "INSERT INTO office_leads (phone, wa_name, name, company, city, kind, details, email) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
     [phone, waName || null, data.name || null, data.company || null, data.city || null, kind, data.details || null, data.email ? data.email.trim().toLowerCase() : null]
