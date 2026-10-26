@@ -47,6 +47,7 @@ import { ensureCallLog, registerCallLogRoutes, handleCallLogWhatsApp } from "./c
 import { ensureDirectSupply, registerDirectSupplyRoutes } from "./directSupply.js";
 import { ensureSupplyBilling, registerSupplyBillingRoutes } from "./supplyBilling.js";
 import { ensureSupplyOrderLink, registerSupplyOrderLinkRoutes } from "./supplyOrderLink.js";
+import { ensureClientPortal, registerClientPortalRoutes } from "./clientPortal.js";
 import { initSupplyReports, registerSupplyReportRoutes } from "./supplyReports.js";
 import { initSupplyWhatsApp, handleSupplyWhatsApp } from "./supplyWhatsApp.js";
 import { ensureSupplyBuyer, registerSupplyBuyerRoutes, supplyBuyerTick, handleSupplyBuyerWhatsApp, buyerContact } from "./supplyBuyer.js";
@@ -3369,6 +3370,7 @@ registerCallLogRoutes(app, { auth });
 registerDirectSupplyRoutes(app, { auth });
 registerSupplyBillingRoutes(app, { auth });
 registerSupplyOrderLinkRoutes(app, { auth });
+registerClientPortalRoutes(app, { auth });
 registerSupplyReportRoutes(app, { auth });
 registerSupplyBuyerRoutes(app, { auth });
 registerMachineRoutes(app, { auth });
@@ -4948,6 +4950,7 @@ try {
   await ensureSupplySegments(db).catch((err) => console.error("SUPPLY SEGMENTS SETUP ERROR:", err.message));
   await ensureSupplyBilling(db).catch((err) => console.error("SUPPLY BILLING SETUP ERROR:", err.message));
   await ensureSupplyOrderLink(db, { onChanged: () => io.emit("supply-changed") }).catch((err) => console.error("SUPPLY ORDER LINK SETUP ERROR:", err.message));
+  await ensureClientPortal(db).catch((err) => console.error("CLIENT PORTAL SETUP ERROR:", err.message));
   initSupplyReports(db);
   initSupplyAnalytics(db);
   // Live Stock: what is in each vending machine (Wendor sales + refill photos).

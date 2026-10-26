@@ -70,6 +70,101 @@ function tooMany(token) {
   return list.length > 30;
 }
 
+/* ---------- Shared with the company login (clientPortal.js) ---------- */
+// What a company sees: open delivery dates, items (their usual first, with photos, no prices)
+// and what they already ordered through the link / login for each open date.
+export async function catalogFor(company) {
+  const rounds = await openRounds();
+  // Items: anything priced, or ordered by anyone in the last 4 months; this company's own items first.
+  const { rows: items } = await db.query(
+    `SELECT p.id, p.name, p.unit, p.category, p.segment, p.image_url,
+            mine.last_qty, mine.last_unit, mine.times
+     FROM supply_products p
+     LEFT JOIN supply_company_prices cp ON cp.company_id = $1 AND cp.product_id = p.id AND cp.unit = p.unit
+     LEFT JOIN LATERAL (
+       SELECT (ARRAY_AGG(l.qty ORDER BY l.created_at DESC))[1] AS last_qty, (ARRAY_AGG(l.unit ORDER BY l.created_at DESC))[1] AS last_unit, COUNT(*)::int AS times
+       FROM supply_lines l WHERE l.company_id = $1 AND l.product_id = p.id
+     ) mine ON TRUE
+     WHERE p.sell_price IS NOT NULL OR cp.price IS NOT NULL
+        OR EXISTS (SELECT 1 FROM supply_lines l2 WHERE l2.product_id = p.id AND l2.created_at > NOW() - INTERVAL '120 days')
+     ORDER BY (mine.times IS NOT NULL AND mine.times > 0) DESC, p.category NULLS LAST, p.name`,
+    [company.id]
+  );
+  // What they already sent through the link, per open date (so they can change it).
+  const { rows: mine } = await db.query(
+    `SELECT o.round_id, o.note, o.submitted_by, o.created_at, json_agg(json_build_object('product_id', l.product_id, 'name', l.raw_name, 'qty', l.qty, 'unit', l.unit) ORDER BY l.id) AS lines
+     FROM supply_orders o JOIN supply_lines l ON l.order_id = o.id
+     WHERE o.company_id = $1 AND o.source = 'link' AND o.round_id = ANY($2) GROUP BY o.id`,
+    [company.id, rounds.flatMap((round) => round.round_ids)]
+  );
+  // Fruits and packaged orders for one date are shown together under that date.
+  const dateOf = new Map(rounds.flatMap((round) => round.round_ids.map((id) => [id, round.id])));
+  for (const order of mine) order.round_id = dateOf.get(order.round_id) || order.round_id;
+  const merged = new Map();
+  for (const order of mine) {
+    const entry = merged.get(order.round_id);
+    if (entry) entry.lines = [...entry.lines, ...order.lines];
+    else merged.set(order.round_id, { ...order });
+  }
+  mine.splice(0, mine.length, ...merged.values());
+  const { rows: seller } = await db.query("SELECT value FROM app_settings WHERE key = 'supply_seller'").catch(() => ({ rows: [] }));
+  let sellerName = "Snackit";
+  try { sellerName = JSON.parse(seller[0]?.value || "{}").name || "Snackit"; } catch { /* default name */ }
+  return {
+    company: { name: company.name, contact_name: company.contact_name },
+    seller: sellerName,
+    rounds,
+    items: items.map((item) => ({ ...item, last_qty: item.last_qty == null ? null : Number(item.last_qty), usual: Number(item.times) > 0 })),
+    units: UNITS,
+    sent: Object.fromEntries(mine.map((order) => [order.round_id, { note: order.note, submitted_by: order.submitted_by, at: order.created_at, lines: order.lines.map((line) => ({ ...line, qty: Number(line.qty) })) }])),
+  };
+}
+
+// Places (or replaces) a company's order for an open delivery date. Returns { status, json }.
+export async function placeOrder(company, body, via = "order link") {
+  const roundId = Number(body?.round_id);
+  const round = (await openRounds()).find((item) => item.id === roundId);
+  if (!round) return { status: 400, json: { error: "That delivery date is no longer taking orders. Please refresh the page." } };
+  const { rows: known } = await db.query("SELECT id, name, unit FROM supply_products");
+  const byId = new Map(known.map((item) => [item.id, item]));
+  const lines = [];
+  for (const raw of (Array.isArray(body?.lines) ? body.lines : []).slice(0, 200)) {
+    const amount = Number(raw.qty);
+    if (!(amount > 0) || amount > 100000) continue;
+    const unit = UNITS.includes(raw.unit) ? raw.unit : null;
+    const item = raw.product_id ? byId.get(Number(raw.product_id)) : null;
+    if (item) lines.push({ product_id: item.id, name: item.name, qty: amount, unit: unit || item.unit });
+    else if (String(raw.name || "").trim()) lines.push({ name: displayName(String(raw.name).slice(0, 120)), qty: amount, unit: unit || "pcs" });
+  }
+  if (!lines.length) return { status: 400, json: { error: "Add a quantity for at least one item." } };
+  const submittedBy = String(body?.name || "").trim().slice(0, 80) || null;
+  const note = String(body?.note || "").trim().slice(0, 500) || null;
+  // A new submission for the same date replaces their earlier link order (both supplies).
+  const { rows: previous } = await db.query("DELETE FROM supply_orders WHERE company_id = $1 AND round_id = ANY($2) AND source = 'link' RETURNING id", [company.id, round.round_ids]);
+  // Fruits and packaged items each go to that supply's delivery for the date.
+  for (const [segment, part] of Object.entries(await splitBySegment(lines))) {
+    let roundId = round.segments?.[segment];
+    if (!roundId) {
+      const { rows: created } = await db.query("INSERT INTO supply_rounds (delivery_date, title, created_by, segment) VALUES ($1, $2, $3, $4) RETURNING id", [round.delivery_date, round.title, `${company.name} (${via})`, segment]);
+      roundId = created[0].id;
+      await db.query(`UPDATE supply_rounds SET ref = '${segment === "packaged" ? "PS" : "DS"}-' || LPAD(id::text, 4, '0') WHERE id = $1`, [roundId]);
+    }
+    const { rows: order } = await db.query(
+      "INSERT INTO supply_orders (round_id, company_id, source, raw_text, submitted_by, note, created_by) VALUES ($1, $2, 'link', $3, $4, $5, $6) RETURNING id",
+      [roundId, company.id, note, submittedBy, note, `${submittedBy || company.name} (${via})`]
+    );
+    await saveOrderLines(order[0].id, roundId, company.id, part);
+  }
+  onChange();
+  sendPushToUsers(db, ["admin"], {
+    title: `${previous.length ? "Order updated" : "New order"} · ${company.name}`,
+    body: `${lines.length} item${lines.length === 1 ? "" : "s"} for ${round.ref} (${round.delivery_date})${submittedBy ? ` from ${submittedBy}` : ""}`,
+    view: "supply",
+  }).catch(() => {});
+  console.log(`🛒 ${via}: ${company.name} ${previous.length ? "updated" : "sent"} ${lines.length} items for ${round.ref}`);
+  return { status: 201, json: { success: true, updated: previous.length > 0, round, items: lines.length } };
+}
+
 export function registerSupplyOrderLinkRoutes(app, { auth }) {
   const handle = (label, fn) => async (req, res) => {
     try {
@@ -117,96 +212,14 @@ export function registerSupplyOrderLinkRoutes(app, { auth }) {
   app.get("/public/supply/order/:token", handle("PUBLIC ORDER PAGE", async (req, res) => {
     const company = await companyByToken(req.params.token);
     if (!company) return res.status(404).json({ error: "This order link isn't valid any more. Please ask Snackit for a new one." });
-    const rounds = await openRounds();
-    // Items: anything priced, or ordered by anyone in the last 4 months; this company's own items first.
-    const { rows: items } = await db.query(
-      `SELECT p.id, p.name, p.unit, p.category, p.segment, p.image_url,
-              mine.last_qty, mine.last_unit, mine.times
-       FROM supply_products p
-       LEFT JOIN supply_company_prices cp ON cp.company_id = $1 AND cp.product_id = p.id AND cp.unit = p.unit
-       LEFT JOIN LATERAL (
-         SELECT (ARRAY_AGG(l.qty ORDER BY l.created_at DESC))[1] AS last_qty, (ARRAY_AGG(l.unit ORDER BY l.created_at DESC))[1] AS last_unit, COUNT(*)::int AS times
-         FROM supply_lines l WHERE l.company_id = $1 AND l.product_id = p.id
-       ) mine ON TRUE
-       WHERE p.sell_price IS NOT NULL OR cp.price IS NOT NULL
-          OR EXISTS (SELECT 1 FROM supply_lines l2 WHERE l2.product_id = p.id AND l2.created_at > NOW() - INTERVAL '120 days')
-       ORDER BY (mine.times IS NOT NULL AND mine.times > 0) DESC, p.category NULLS LAST, p.name`,
-      [company.id]
-    );
-    // What they already sent through the link, per open date (so they can change it).
-    const { rows: mine } = await db.query(
-      `SELECT o.round_id, o.note, o.submitted_by, o.created_at, json_agg(json_build_object('product_id', l.product_id, 'name', l.raw_name, 'qty', l.qty, 'unit', l.unit) ORDER BY l.id) AS lines
-       FROM supply_orders o JOIN supply_lines l ON l.order_id = o.id
-       WHERE o.company_id = $1 AND o.source = 'link' AND o.round_id = ANY($2) GROUP BY o.id`,
-      [company.id, rounds.flatMap((round) => round.round_ids)]
-    );
-    // Fruits and packaged orders for one date are shown together under that date.
-    const dateOf = new Map(rounds.flatMap((round) => round.round_ids.map((id) => [id, round.id])));
-    for (const order of mine) order.round_id = dateOf.get(order.round_id) || order.round_id;
-    const merged = new Map();
-    for (const order of mine) {
-      const entry = merged.get(order.round_id);
-      if (entry) entry.lines = [...entry.lines, ...order.lines];
-      else merged.set(order.round_id, { ...order });
-    }
-    mine.splice(0, mine.length, ...merged.values());
-    const { rows: seller } = await db.query("SELECT value FROM app_settings WHERE key = 'supply_seller'").catch(() => ({ rows: [] }));
-    let sellerName = "Snackit";
-    try { sellerName = JSON.parse(seller[0]?.value || "{}").name || "Snackit"; } catch { /* default name */ }
-    res.json({
-      company: { name: company.name, contact_name: company.contact_name },
-      seller: sellerName,
-      rounds,
-      items: items.map((item) => ({ ...item, last_qty: item.last_qty == null ? null : Number(item.last_qty), usual: Number(item.times) > 0 })),
-      units: UNITS,
-      sent: Object.fromEntries(mine.map((order) => [order.round_id, { note: order.note, submitted_by: order.submitted_by, at: order.created_at, lines: order.lines.map((line) => ({ ...line, qty: Number(line.qty) })) }])),
-    });
+    res.json(await catalogFor(company));
   }));
 
   app.post("/public/supply/order/:token", handle("PUBLIC ORDER SUBMIT", async (req, res) => {
     const company = await companyByToken(req.params.token);
     if (!company) return res.status(404).json({ error: "This order link isn't valid any more. Please ask Snackit for a new one." });
     if (tooMany(req.params.token)) return res.status(429).json({ error: "Too many submissions. Please wait a while and try again." });
-    const roundId = Number(req.body?.round_id);
-    const round = (await openRounds()).find((item) => item.id === roundId);
-    if (!round) return res.status(400).json({ error: "That delivery date is no longer taking orders. Please refresh the page." });
-    const { rows: known } = await db.query("SELECT id, name, unit FROM supply_products");
-    const byId = new Map(known.map((item) => [item.id, item]));
-    const lines = [];
-    for (const raw of (Array.isArray(req.body?.lines) ? req.body.lines : []).slice(0, 200)) {
-      const amount = Number(raw.qty);
-      if (!(amount > 0) || amount > 100000) continue;
-      const unit = UNITS.includes(raw.unit) ? raw.unit : null;
-      const item = raw.product_id ? byId.get(Number(raw.product_id)) : null;
-      if (item) lines.push({ product_id: item.id, name: item.name, qty: amount, unit: unit || item.unit });
-      else if (String(raw.name || "").trim()) lines.push({ name: displayName(String(raw.name).slice(0, 120)), qty: amount, unit: unit || "pcs" });
-    }
-    if (!lines.length) return res.status(400).json({ error: "Add a quantity for at least one item." });
-    const submittedBy = String(req.body?.name || "").trim().slice(0, 80) || null;
-    const note = String(req.body?.note || "").trim().slice(0, 500) || null;
-    // A new submission for the same date replaces their earlier link order (both supplies).
-    const { rows: previous } = await db.query("DELETE FROM supply_orders WHERE company_id = $1 AND round_id = ANY($2) AND source = 'link' RETURNING id", [company.id, round.round_ids]);
-    // Fruits and packaged items each go to that supply's delivery for the date.
-    for (const [segment, part] of Object.entries(await splitBySegment(lines))) {
-      let roundId = round.segments?.[segment];
-      if (!roundId) {
-        const { rows: created } = await db.query("INSERT INTO supply_rounds (delivery_date, title, created_by, segment) VALUES ($1, $2, $3, $4) RETURNING id", [round.delivery_date, round.title, `${company.name} (order link)`, segment]);
-        roundId = created[0].id;
-        await db.query(`UPDATE supply_rounds SET ref = '${segment === "packaged" ? "PS" : "DS"}-' || LPAD(id::text, 4, '0') WHERE id = $1`, [roundId]);
-      }
-      const { rows: order } = await db.query(
-        "INSERT INTO supply_orders (round_id, company_id, source, raw_text, submitted_by, note, created_by) VALUES ($1, $2, 'link', $3, $4, $5, $6) RETURNING id",
-        [roundId, company.id, note, submittedBy, note, `${submittedBy || company.name} (order link)`]
-      );
-      await saveOrderLines(order[0].id, roundId, company.id, part);
-    }
-    onChange();
-    sendPushToUsers(db, ["admin"], {
-      title: `${previous.length ? "Order updated" : "New order"} · ${company.name}`,
-      body: `${lines.length} item${lines.length === 1 ? "" : "s"} for ${round.ref} (${round.delivery_date})${submittedBy ? ` from ${submittedBy}` : ""}`,
-      view: "supply",
-    }).catch(() => {});
-    console.log(`🛒 Order link: ${company.name} ${previous.length ? "updated" : "sent"} ${lines.length} items for ${round.ref}`);
-    res.status(201).json({ success: true, updated: previous.length > 0, round, items: lines.length });
+    const result = await placeOrder(company, req.body, "order link");
+    res.status(result.status).json(result.json);
   }));
 }
