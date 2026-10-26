@@ -7,12 +7,15 @@
     Submitting again replaces their link order for that date, so they can correct it while
     the date is still collecting orders. The link can be replaced (the old one stops working)
     or switched off. No login: the token in the link is the key.
+    The page looks like a shop: item photos (Setup → Items), a cart, quantities in the item's
+    unit (pcs, kg…). No prices are shown to the company.
 ========================================================= */
 import crypto from "crypto";
 import { saveOrderLines } from "./directSupply.js";
 import { displayName } from "./supplyParse.js";
 import { splitBySegment } from "./supplySegments.js";
 import { sendPushToUsers } from "./pushNotifications.js";
+import { storeDashboardFile } from "./ticketChat.js";
 
 let db = null;
 let onChange = () => {};
@@ -29,6 +32,7 @@ export async function ensureSupplyOrderLink(database, { onChanged } = {}) {
       ADD COLUMN IF NOT EXISTS order_token TEXT UNIQUE,
       ADD COLUMN IF NOT EXISTS order_link_on BOOLEAN NOT NULL DEFAULT TRUE;
     ALTER TABLE supply_orders ADD COLUMN IF NOT EXISTS submitted_by TEXT, ADD COLUMN IF NOT EXISTS note TEXT;
+    ALTER TABLE supply_products ADD COLUMN IF NOT EXISTS image_url TEXT;
   `);
 }
 
@@ -89,6 +93,26 @@ export function registerSupplyOrderLinkRoutes(app, { auth }) {
     res.json({ token, on });
   }));
 
+  // An item's photo for the order page (Setup → Items): upload { file: { name, type, data } } or remove.
+  app.post("/supply/products/:id/image", auth, handle("SUPPLY ITEM PHOTO", async (req, res) => {
+    let stored;
+    try {
+      stored = await storeDashboardFile(req.body?.file);
+    } catch (err) {
+      return res.status(400).json({ error: err.message || "Could not store the photo" });
+    }
+    if (stored.kind !== "image") return res.status(400).json({ error: "Choose a photo (JPG or PNG)" });
+    const { rows } = await db.query("UPDATE supply_products SET image_url = $2 WHERE id = $1 RETURNING id, name, image_url", [req.params.id, stored.url]);
+    if (!rows.length) return res.status(404).json({ error: "Item not found" });
+    res.locals.activity = { section: "Direct Supply", action: `Added a photo for ${rows[0].name}` };
+    res.json(rows[0]);
+  }));
+  app.delete("/supply/products/:id/image", auth, handle("SUPPLY ITEM PHOTO", async (req, res) => {
+    const { rows } = await db.query("UPDATE supply_products SET image_url = NULL WHERE id = $1 RETURNING id, name", [req.params.id]);
+    if (!rows.length) return res.status(404).json({ error: "Item not found" });
+    res.json(rows[0]);
+  }));
+
   /* ---------- Public: the order page ---------- */
   app.get("/public/supply/order/:token", handle("PUBLIC ORDER PAGE", async (req, res) => {
     const company = await companyByToken(req.params.token);
@@ -96,8 +120,7 @@ export function registerSupplyOrderLinkRoutes(app, { auth }) {
     const rounds = await openRounds();
     // Items: anything priced, or ordered by anyone in the last 4 months; this company's own items first.
     const { rows: items } = await db.query(
-      `SELECT p.id, p.name, p.unit, p.category,
-              COALESCE(cp.price, CASE WHEN p.sell_price IS NOT NULL THEN p.sell_price END) AS price,
+      `SELECT p.id, p.name, p.unit, p.category, p.segment, p.image_url,
               mine.last_qty, mine.last_unit, mine.times
        FROM supply_products p
        LEFT JOIN supply_company_prices cp ON cp.company_id = $1 AND cp.product_id = p.id AND cp.unit = p.unit
@@ -134,7 +157,7 @@ export function registerSupplyOrderLinkRoutes(app, { auth }) {
       company: { name: company.name, contact_name: company.contact_name },
       seller: sellerName,
       rounds,
-      items: items.map((item) => ({ ...item, price: item.price == null ? null : Number(item.price), last_qty: item.last_qty == null ? null : Number(item.last_qty), usual: Number(item.times) > 0 })),
+      items: items.map((item) => ({ ...item, last_qty: item.last_qty == null ? null : Number(item.last_qty), usual: Number(item.times) > 0 })),
       units: UNITS,
       sent: Object.fromEntries(mine.map((order) => [order.round_id, { note: order.note, submitted_by: order.submitted_by, at: order.created_at, lines: order.lines.map((line) => ({ ...line, qty: Number(line.qty) })) }])),
     });

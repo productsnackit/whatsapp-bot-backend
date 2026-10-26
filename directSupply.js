@@ -134,7 +134,7 @@ export async function ensureDirectSupply(database) {
 }
 
 async function products() {
-  const { rows } = await db.query("SELECT id, name, key, unit, category, aliases, pack_size, sell_price, hsn, segment FROM supply_products ORDER BY name");
+  const { rows } = await db.query("SELECT id, name, key, unit, category, aliases, pack_size, sell_price, hsn, segment, image_url FROM supply_products ORDER BY name");
   return rows;
 }
 
