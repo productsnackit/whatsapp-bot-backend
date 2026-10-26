@@ -7,8 +7,10 @@
 ========================================================= */
 import crypto from "crypto";
 
-// Pages a person can be given. Internal Chat and Notifications are always on.
+// Pages a person can be given. Notifications are always on; Internal Chat is ticked per person
+// (new employees don't get it unless it's ticked).
 export const PAGES = {
+  chat: "Internal Chat",
   tickets: "Tickets & customer chat",
   feedback: "Feedback",
   products: "Product leads",
@@ -140,6 +142,7 @@ const PATH_RULES = [
   [/^\/activity(\/|$)/, ["activity"]],
   [/^\/invoicing(\/|$)/, ["invoices"]],
   [/^\/office-leads(\/|$)/, ["office_leads"]],
+  [/^\/internal\/(chats|direct|saved-replies|tasks)(\/|$)/, ["chat"]],
 ];
 
 // Returns true if the person may call this API path.
@@ -147,12 +150,26 @@ export function canUsePath(user, method, path) {
   // Refillers only have their own app (refillerApp.js).
   if (user?.role === "refiller") return path.startsWith("/refiller/") || path === "/logout";
   if (user?.isAdmin) return true;
-  if (path.startsWith("/internal/") || path === "/me" || path.startsWith("/me/")) return true;
   for (const [pattern, pages] of PATH_RULES) {
     if (pattern.test(path)) {
       const needed = typeof pages === "function" ? pages(method) : pages;
       return needed.some((page) => user?.pages?.includes(page));
     }
   }
+  if (path.startsWith("/internal/") || path === "/me" || path.startsWith("/me/")) return true;
   return false; // anything else is admin-only
+}
+
+// Internal Chat used to be on for everyone: people who were there before it became a tick box keep
+// it (once); new people get it only when it's ticked. Returns true if something changed.
+export function migrateChatAccess(users) {
+  let changed = false;
+  for (const user of users || []) {
+    if (user.chatAccessSet) continue;
+    const access = accessFor(user);
+    if (!access.isAdmin) user.pages = [...new Set([...access.pages, "chat"])];
+    user.chatAccessSet = true;
+    changed = true;
+  }
+  return changed;
 }

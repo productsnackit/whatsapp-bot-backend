@@ -19,7 +19,7 @@ import { registerAuditRoutes } from "./auditRoutes.js";
 import { registerPushRoutes, sendPushToUsers, pushUserKey } from "./pushNotifications.js";
 import { handleRefillerWhatsApp, setCapaEscalationPush } from "./refillerTasks.js";
 import { loadInternalState, internalSaveMiddleware, scheduleInternalSave } from "./internalStore.js";
-import { accessFor, canUsePath, hasPage, hashPassword, verifyPassword, generatePassword, newSessionToken, migrateUserPasswords, publicUser, PAGES, ROLE_PRESETS } from "./accessControl.js";
+import { accessFor, canUsePath, hasPage, hashPassword, verifyPassword, generatePassword, newSessionToken, migrateUserPasswords, migrateChatAccess, publicUser, PAGES, ROLE_PRESETS } from "./accessControl.js";
 import { ensureActivityLog, activityMiddleware, registerActivityRoutes, logActivity } from "./activityLog.js";
 import { ensureRefillTables, registerRefillRoutes, refillTick } from "./refillSchedule.js";
 import { registerTaskRoutes, taskReminderTick } from "./internalTasks.js";
@@ -3423,7 +3423,7 @@ registerOtpRoutes(app, {
   },
 });
 registerRefillerAppRoutes(app, { auth, adminGuard: (req, res, next) => (hasPage(req.user, "audit") ? next() : res.status(403).json({ error: "Only Refill Audit can set refiller PINs" })) });
-registerMyHomeRoutes(app, { db, auth, getUserKey: getInternalUserKey, canSeeChat: canSeeInternalChat });
+registerMyHomeRoutes(app, { db, auth, getUserKey: getInternalUserKey, canSeeChat: (chat, user) => hasPage(user, "chat") && canSeeInternalChat(chat, user) });
 registerTaskRoutes(app, {
   auth,
   getUserKey: getInternalUserKey,
@@ -4401,6 +4401,7 @@ app.post("/internal/users", auth, (req, res) => {
       tags: getInternalTagList(tags ? String(tags).split(",") : []),
       phone: whatsapp.phone,
       ...accessFields(req.body || {}),
+      chatAccessSet: true, // Internal Chat only if it was ticked
     };
 
     global.internalUsers.push(nextUser);
@@ -4802,7 +4803,8 @@ app.post("/internal/chats/:id/messages", auth, (req, res) => {
     // Phone notifications to every member but the sender; tagged people get a "tagged you" alert.
     const senderPushKey = pushUserKey(req.user);
     const pushBody = `${senderName}: ${cleanText || `📎 ${attachments.length} attachment${attachments.length === 1 ? "" : "s"}`}`.slice(0, 180);
-    const taggedUsers = global.internalUsers.filter((user) => message.mentions.includes(String(user.id)));
+    const chatUsers = global.internalUsers.filter((user) => hasPage(accessFor(user), "chat")); // only people with Internal Chat
+    const taggedUsers = chatUsers.filter((user) => message.mentions.includes(String(user.id)));
     const taggedKeys = taggedUsers.map((user) => user.username);
     sendPushToUsers(db, taggedKeys.filter((key) => key !== senderPushKey), {
       title: `${senderName} tagged you in ${chat.title || chat.department}`,
@@ -4811,7 +4813,7 @@ app.post("/internal/chats/:id/messages", auth, (req, res) => {
       department: chat.department,
       priority: message.priority,
     });
-    sendPushToUsers(db, ["admin", ...global.internalUsers.map((user) => user.username)].filter((key) => key !== senderPushKey && !taggedKeys.includes(key)), {
+    sendPushToUsers(db, ["admin", ...chatUsers.map((user) => user.username)].filter((key) => key !== senderPushKey && !taggedKeys.includes(key)), {
       title: chat.title || `${chat.department} chat`,
       body: pushBody,
       chatId: String(chat.id),
@@ -4921,6 +4923,7 @@ try {
 
 // Passwords left over from before are scrambled once; the plain text is never kept.
 if (migrateUserPasswords(global.internalUsers)) scheduleInternalSave();
+if (migrateChatAccess(global.internalUsers)) scheduleInternalSave();
 if (!ADMIN_PASS) console.warn("⚠️ ADMIN_PASS is not set: the shared owner login is disabled. Named admin accounts still work.");
 
 try {
