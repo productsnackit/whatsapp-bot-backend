@@ -89,12 +89,12 @@ const KINDS = {
   OB_SUPPLY: { kind: "Direct supply", ask: "What would you like supplied (fruits, snacks, drinks…), how often, and for how many people? 🍎" },
 };
 const MENU_ROWS = [
-  { id: "OB_REFUND", title: "Refund / machine issue", description: "Money deducted, product not received" },
-  { id: "OB_LIST", title: "List your product", description: "Sell your brand in Snackit machines" },
   { id: "OB_RENT", title: "Rent a machine", description: "A vending machine at your place" },
+  { id: "OB_LIST", title: "List your product", description: "Sell your brand in Snackit machines" },
   { id: "OB_BUY", title: "Buy a machine", description: "Buy vending machines" },
   { id: "OB_SUPPLY", title: "Direct supply", description: "Fruits & snacks for your office" },
   { id: "OB_TEAM", title: "Talk to our team", description: "A person will reply here" },
+  { id: "OB_REFUND", title: "Refund / machine issue", description: "Money deducted, product not received" },
 ];
 const QUESTIONS = { ask_name: "May I have your name? 🙂", ask_company: "Which company or organisation are you from?", ask_city: "Which city / area is this for? 📍" };
 const NEXT = { ask_name: "ask_company", ask_company: "ask_city", ask_city: "ask_details" };
@@ -144,7 +144,10 @@ async function handleIncoming(msg, contactName) {
   }
   if (choice === "OB_REFUND") {
     const support = await supportNumber();
-    await text(phone, `For a refund or a problem with a machine, please message our support number${support ? `: https://wa.me/${support}` : ""}\n\nSend *hi* there and our bot will help you right away (keep your UPI payment screenshot ready). 🙏`);
+    const shown = /^91\d{10}$/.test(support) ? `+91 ${support.slice(2, 7)} ${support.slice(7)}` : support ? `+${support}` : "";
+    await text(phone, support
+      ? `For refunds or a problem with a machine, please message this number 👇\n\n📞 *${shown}*\nhttps://wa.me/${support}\n\nSend *hi* there and our refund bot will help you right away (keep your UPI payment screenshot ready). 🙏`
+      : "For refunds or a problem with a machine, please message our Snackit support WhatsApp number. Send *hi* there and our refund bot will help you right away. 🙏");
     return setChat(phone, { state: "done", data: {}, last_bot_at: new Date() });
   }
   if (choice === "OB_TEAM") {
