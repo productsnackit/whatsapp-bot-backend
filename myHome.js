@@ -14,7 +14,7 @@ const plainDate = (value) => (value instanceof Date ? `${value.getFullYear()}-${
 const todayIst = () => new Date(Date.now() + 330 * 60000).toISOString().slice(0, 10);
 const short = (text, length = 140) => { const clean = String(text || "").replace(/\s+/g, " ").trim(); return clean.length > length ? `${clean.slice(0, length - 1)}…` : clean; };
 
-export function registerMyHomeRoutes(app, { db, auth, getUserKey, canSeeChat }) {
+export function registerMyHomeRoutes(app, { db, auth, getUserKey, canSeeChat, myLocations }) {
   app.get("/me/home", auth, async (req, res) => {
     try {
       const me = getUserKey(req.user);
@@ -104,9 +104,15 @@ export function registerMyHomeRoutes(app, { db, auth, getUserKey, canSeeChat }) 
         })
         .sort((a, b) => new Date(b.last?.at || 0) - new Date(a.last?.at || 0));
 
+      // The locations they manage (Locations & teams), most needing attention first.
+      const locations = myLocations && req.user?.role !== "admin" ? await myLocations(req.user).catch(() => []) : [];
       res.json({
         today,
         work,
+        locations: locations.slice(0, 40).map(({ id, name, refiller, open_tasks, overdue_tasks, open_problems, missed_refills, sales_30d, sales_prev_30d, managers }) => ({
+          id, name, refiller: refiller?.name || null, open_tasks, overdue_tasks, open_problems, missed_refills, sales_30d, sales_prev_30d,
+          covering: managers.some((manager) => manager.covered_by && String(manager.user_id) === String(req.user.userId)),
+        })),
         counts: {
           open: work.length, overdue: work.filter((item) => item.overdue).length,
           today: work.filter((item) => item.due_soon || (item.due && item.due.slice(0, 10) === today)).length,

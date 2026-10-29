@@ -19,6 +19,7 @@
     "refill_reminder", language REFILL_TEMPLATE_LANG, default "en") whose
     body has {{1}} name, {{2}} number of visits, {{3}} when, {{4}} visits.
 ========================================================= */
+import { notifyLocationManagers } from "./locationTeams.js";
 import { sendWhatsAppPayload, sendWhatsAppList } from "./whatsapp.js";
 import { storeIncomingMedia } from "./ticketChat.js";
 import { hasPage, accessFor } from "./accessControl.js";
@@ -573,6 +574,15 @@ async function markMissed(settings) {
       title: `⚠️ ${rows.length} refill${rows.length === 1 ? "" : "s"} missed`,
       body: rows.slice(0, 4).map((task) => `${task.refiller_name || "?"} · ${task.location_name}${tagOf(task.due_time)}`).join("\n"),
       view: "refills",
+    });
+  }
+  // Each location's managers hear about their own missed refills.
+  const byLocation = new Map();
+  for (const task of rows) if (task.location_id) byLocation.set(task.location_id, [...(byLocation.get(task.location_id) || []), task]);
+  for (const [locationId, tasks] of byLocation) {
+    notifyLocationManagers(locationId, {
+      title: `⚠️ Refill missed · ${tasks[0].location_name}`,
+      body: tasks.map((task) => `${task.refiller_name || "Refiller"}${tagOf(task.due_time)}`).join(", ").slice(0, 180),
     });
   }
 }

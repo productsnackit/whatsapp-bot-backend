@@ -8,6 +8,7 @@
       • a refill at another of their sites.
     A refiller login can only use /refiller/… (accessControl.js).
 ========================================================= */
+import { notifyLocationManagers } from "./locationTeams.js";
 import { hashPassword, verifyPassword, newSessionToken } from "./accessControl.js";
 import { istDate, completeRefillFromApp, refillerSites } from "./refillSchedule.js";
 import { answerCapaFromApp } from "./refillerTasks.js";
@@ -130,6 +131,7 @@ export function registerRefillerAppRoutes(app, { auth, adminGuard }) {
     if (!ticket) return res.status(404).json({ error: "That problem could not be found" });
     if (ticket.status === "RESOLVED") return res.json({ success: true, already: true });
     await answerCapaFromApp(db, refiller, ticket, answer, String(req.body?.note || "").slice(0, 500));
+    if (answer === "cant") notifyLocationManagers(ticket.location, { title: `🆘 ${refiller.name} can't fix ${ticket.ref || "a problem"} at ${ticket.location}`, body: `${ticket.defect}${req.body?.note ? ` · ${String(req.body.note).slice(0, 80)}` : ""}` });
     res.json({ success: true });
   }));
 

@@ -48,6 +48,7 @@ import { ensureDirectSupply, registerDirectSupplyRoutes } from "./directSupply.j
 import { ensureSupplyBilling, registerSupplyBillingRoutes } from "./supplyBilling.js";
 import { ensureSupplyOrderLink, registerSupplyOrderLinkRoutes } from "./supplyOrderLink.js";
 import { ensureClientPortal, registerClientPortalRoutes } from "./clientPortal.js";
+import { ensureLocationTeams, registerLocationTeamRoutes, myLocations } from "./locationTeams.js";
 import { initSupplyReports, registerSupplyReportRoutes } from "./supplyReports.js";
 import { initSupplyWhatsApp, handleSupplyWhatsApp } from "./supplyWhatsApp.js";
 import { ensureSupplyBuyer, registerSupplyBuyerRoutes, supplyBuyerTick, handleSupplyBuyerWhatsApp, buyerContact } from "./supplyBuyer.js";
@@ -3371,6 +3372,7 @@ registerDirectSupplyRoutes(app, { auth });
 registerSupplyBillingRoutes(app, { auth });
 registerSupplyOrderLinkRoutes(app, { auth });
 registerClientPortalRoutes(app, { auth });
+registerLocationTeamRoutes(app, { auth });
 registerSupplyReportRoutes(app, { auth });
 registerSupplyBuyerRoutes(app, { auth });
 registerMachineRoutes(app, { auth });
@@ -3425,7 +3427,7 @@ registerOtpRoutes(app, {
   },
 });
 registerRefillerAppRoutes(app, { auth, adminGuard: (req, res, next) => (hasPage(req.user, "audit") ? next() : res.status(403).json({ error: "Only Refill Audit can set refiller PINs" })) });
-registerMyHomeRoutes(app, { db, auth, getUserKey: getInternalUserKey, canSeeChat: (chat, user) => hasPage(user, "chat") && canSeeInternalChat(chat, user) });
+registerMyHomeRoutes(app, { db, auth, myLocations, getUserKey: getInternalUserKey, canSeeChat: (chat, user) => hasPage(user, "chat") && canSeeInternalChat(chat, user) });
 registerTaskRoutes(app, {
   auth,
   getUserKey: getInternalUserKey,
@@ -4951,6 +4953,7 @@ try {
   await ensureSupplyBilling(db).catch((err) => console.error("SUPPLY BILLING SETUP ERROR:", err.message));
   await ensureSupplyOrderLink(db, { onChanged: () => io.emit("supply-changed") }).catch((err) => console.error("SUPPLY ORDER LINK SETUP ERROR:", err.message));
   await ensureClientPortal(db).catch((err) => console.error("CLIENT PORTAL SETUP ERROR:", err.message));
+  await ensureLocationTeams(db).catch((err) => console.error("LOCATION TEAMS SETUP ERROR:", err.message));
   initSupplyReports(db);
   initSupplyAnalytics(db);
   // Live Stock: what is in each vending machine (Wendor sales + refill photos).

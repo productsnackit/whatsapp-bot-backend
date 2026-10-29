@@ -4,6 +4,7 @@
     Access: admin, plus employees in the Operations or Audit department.
 ========================================================= */
 
+import { notifyLocationManagers } from "./locationTeams.js";
 import { ensureCapaWhatsAppColumns, sendCapaToRefiller } from "./refillerTasks.js";
 
 export const AUDIT_DEPARTMENTS = ["Operations", "Audit"];
@@ -288,6 +289,8 @@ export function registerAuditRoutes(app, { db, auth, uploadImage }) {
       capaIds.push(capa.rows[0].id);
     }
     await db.query("UPDATE audit_capa SET ref = 'CAPA-' || LPAD(id::text, 5, '0') WHERE ref IS NULL");
+    // The location's managers hear about the problems found.
+    if (capaIds.length) notifyLocationManagers(location, { title: `🔎 Refill Audit at ${location}: ${capaIds.length} problem${capaIds.length === 1 ? "" : "s"}`, body: `${audit.rows[0].ref} · ${audit.rows[0].percentage}%${body.refiller ? ` · ${body.refiller}` : ""}` });
 
     // Send each task to the refiller on WhatsApp so they can fix it and reply Yes / No.
     const whatsapp = { sent: 0, failed: 0, error: null };
