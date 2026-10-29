@@ -144,7 +144,7 @@ const PATH_RULES = [
   [/^\/office-leads(\/|$)/, ["office_leads"]],
   [/^\/internal\/(chats|direct|saved-replies|tasks)(\/|$)/, ["chat"]],
   // Who looks after each location: everyone who works with locations can see it; Refill Audit edits it.
-  [/^\/location-teams(\/|$)/, (method) => (method === "GET" ? ["findings", "audit", "refills", "live_stock", "closing_stock", "sales_data", "tickets"] : ["audit"])],
+  [/^\/location-teams(\/|$)/, (method) => (method === "GET" ? ["findings", "audit", "refills", "live_stock", "closing_stock", "sales_data", "tickets", "analytics"] : ["audit"])],
 ];
 
 // Returns true if the person may call this API path.
