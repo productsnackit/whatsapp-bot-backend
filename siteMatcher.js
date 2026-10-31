@@ -203,7 +203,28 @@ const machine0Name = (machines) => {
 };
 
 // A machine's location: its Refill Audit site when linked, else the machine list's name.
-const fromMachine = (machine, how) => ({ site_id: machine.site_id || null, site_name: machine.site_name || machine.location, site_match: how === "screenshot" ? "machine" : machine.site_id ? "site" : "named" });
+const fromMachine = (machine, how) => ({ site_id: machine.site_id || null, site_name: machine.site_name || machine.location, site_match: how === "screenshot" ? "machine" : machine.site_id ? "site" : "named", machine_code: machine.code });
+
+// The machine at a site, when the site has exactly one (several: which one isn't known).
+export async function siteMachine(siteId) {
+  if (!siteId) return null;
+  const at = (await allMachines()).filter((machine) => machine.site_id === Number(siteId));
+  return at.length === 1 ? at[0].code : null;
+}
+
+/* The fields to save on a ticket for a site match: the site, and the machine when the customer's
+   location points to one machine (a typed ID, a machine's name or address, or a site with one
+   machine). A machine read from the payment screenshot always wins over one from the location. */
+export async function siteFields(result, current = {}) {
+  const { machine_code: fromText, ...site } = result || {};
+  const fields = { ...site };
+  const machine = fromText || (site.site_match === "site" ? await siteMachine(site.site_id) : null);
+  if (current.machine_source !== "screenshot" && (current.paid_machine || null) !== (machine || null) && (machine || current.machine_source === "location")) {
+    fields.paid_machine = machine || null;
+    fields.machine_source = machine ? "location" : null;
+  }
+  return fields;
+}
 
 export async function matchSite(text) {
   if (!db) return { site_id: null, site_name: null, site_match: "none" };
@@ -243,17 +264,17 @@ export async function applyPaidMachine(ticketId, text) {
   if (!machine) return null;
   // An ID that isn't in the machine list is still shown on the ticket, but sets no location.
   if (machine.unknown) {
-    await db.query("UPDATE tickets SET paid_machine = $2 WHERE id = $1", [ticketId, machine.code]);
+    await db.query("UPDATE tickets SET paid_machine = $2, machine_source = 'screenshot' WHERE id = $1", [ticketId, machine.code]);
     onTicketsChanged?.();
     return machine;
   }
   const site = fromMachine(machine, "screenshot");
   const { rowCount } = await db.query(
-    `UPDATE tickets SET paid_machine = $2, site_id = $3, site_name = $4, site_match = $5
+    `UPDATE tickets SET paid_machine = $2, machine_source = 'screenshot', site_id = $3, site_name = $4, site_match = $5
      WHERE id = $1 AND COALESCE(site_match, '') <> 'manual'`,
     [ticketId, machine.code, site.site_id, site.site_name, site.site_match]
   );
-  if (!rowCount) await db.query("UPDATE tickets SET paid_machine = $2 WHERE id = $1", [ticketId, machine.code]);
+  if (!rowCount) await db.query("UPDATE tickets SET paid_machine = $2, machine_source = 'screenshot' WHERE id = $1", [ticketId, machine.code]);
   onTicketsChanged?.();
   return machine;
 }
@@ -262,14 +283,18 @@ export async function applyPaidMachine(ticketId, text) {
 export async function rematchTickets() {
   if (!db) return 0;
   const { rows } = await db.query(
-    `SELECT id, location, site_id, site_name, site_match FROM tickets
-     WHERE NULLIF(TRIM(COALESCE(location, '')), '') IS NOT NULL AND COALESCE(site_match, '') NOT IN ('manual', 'machine')`
+    `SELECT id, location, site_id, site_name, site_match, paid_machine, machine_source FROM tickets
+     WHERE (NULLIF(TRIM(COALESCE(location, '')), '') IS NOT NULL AND COALESCE(site_match, '') NOT IN ('manual', 'machine'))
+        OR (site_match = 'manual' AND COALESCE(machine_source, '') <> 'screenshot')`
   );
   let changed = 0;
   for (const ticket of rows) {
-    const result = await matchSite(ticket.location);
-    if (result.site_id === ticket.site_id && result.site_name === ticket.site_name && result.site_match === ticket.site_match) continue;
-    await db.query("UPDATE tickets SET site_id = $2, site_name = $3, site_match = $4 WHERE id = $1", [ticket.id, result.site_id, result.site_name, result.site_match]);
+    // A site set by hand stays; only its machine is filled in.
+    const result = ticket.site_match === "manual" ? { site_id: ticket.site_id, site_name: ticket.site_name, site_match: "manual", machine_code: await siteMachine(ticket.site_id) } : await matchSite(ticket.location);
+    const fields = await siteFields(result, ticket);
+    const keys = Object.keys(fields).filter((key) => (fields[key] ?? null) !== (ticket[key] ?? null));
+    if (!keys.length) continue;
+    await db.query(`UPDATE tickets SET ${keys.map((key, index) => `${key} = $${index + 2}`).join(", ")} WHERE id = $1`, [ticket.id, ...keys.map((key) => fields[key])]);
     changed += 1;
   }
   if (changed) {
@@ -287,8 +312,11 @@ export async function ensureSiteMatching(database, { onChanged } = {}) {
     ALTER TABLE tickets
       ADD COLUMN IF NOT EXISTS site_id INTEGER,
       ADD COLUMN IF NOT EXISTS site_name TEXT,
-      ADD COLUMN IF NOT EXISTS site_match TEXT
+      ADD COLUMN IF NOT EXISTS site_match TEXT,
+      ADD COLUMN IF NOT EXISTS machine_source TEXT
   `);
+  // Machine IDs saved before the source was kept all came from screenshots.
+  await db.query("UPDATE tickets SET machine_source = 'screenshot' WHERE paid_machine IS NOT NULL AND machine_source IS NULL").catch(() => {});
   cache.at = 0;
   // The machine list, each machine linked to the Refill Audit site with its name (when clear).
   await ensureMachines(db).catch((err) => console.log("MACHINES SETUP ERROR:", err.message));
@@ -337,13 +365,19 @@ export function registerSiteRoutes(app, { auth }) {
       if (!siteId) {
         // Back to automatic matching.
         const result = await matchSite(ticket.location);
-        await db.query("UPDATE tickets SET site_id = $2, site_name = $3, site_match = $4 WHERE id = $1", [ticket.id, result.site_id, result.site_name, result.site_match]);
+        const current = (await db.query("SELECT paid_machine, machine_source FROM tickets WHERE id = $1", [ticket.id])).rows[0] || {};
+        const fields = await siteFields(result, current);
+        const keys = Object.keys(fields);
+        await db.query(`UPDATE tickets SET ${keys.map((key, index) => `${key} = $${index + 2}`).join(", ")} WHERE id = $1`, [ticket.id, ...keys.map((key) => fields[key])]);
         onTicketsChanged?.();
         return res.json(result);
       }
       const site = (await db.query("SELECT id, name, COALESCE(aliases, '{}') AS aliases FROM audit_locations WHERE id = $1", [siteId])).rows[0];
       if (!site) return res.status(400).json({ error: "That site doesn't exist" });
       await db.query("UPDATE tickets SET site_id = $2, site_name = $3, site_match = 'manual' WHERE id = $1", [ticket.id, site.id, site.name]);
+      const current = (await db.query("SELECT paid_machine, machine_source FROM tickets WHERE id = $1", [ticket.id])).rows[0] || {};
+      const machineFields = await siteFields({ site_id: site.id, site_name: site.name, site_match: "manual", machine_code: await siteMachine(site.id) }, current);
+      if ("paid_machine" in machineFields) await db.query("UPDATE tickets SET paid_machine = $2, machine_source = $3 WHERE id = $1", [ticket.id, machineFields.paid_machine, machineFields.machine_source]);
       let remembered = null;
       const wording = String(ticket.location || "").trim().replace(/\s+/g, " ").slice(0, 120);
       // Never remembered: wordings of only generic words (they'd match everything) and complaints

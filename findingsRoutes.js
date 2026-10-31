@@ -89,6 +89,19 @@ function userName(user) {
   return user?.role === "admin" ? "Admin" : user?.name || user?.username || "Employee";
 }
 
+/* Who can see a task and its files: whoever raised it, whoever it's with (or, while it waits in a
+   department, that department's people, so they can take it), the people in CC, and directors /
+   admins. Nobody else. */
+export function canSeeFinding(finding, user) {
+  if (!finding || !user) return false;
+  if (user.isAdmin) return true;
+  const me = String(user.userId ?? user.id ?? "");
+  return (Boolean(me) && String(finding.assignee_id || "") === me)
+    || (Boolean(finding.created_by) && finding.created_by === userName(user))
+    || (finding.cc || []).some((person) => String(person?.id) === me)
+    || (!finding.assignee_id && Boolean(finding.owner_department) && finding.owner_department === user.department);
+}
+
 function employeeById(id) {
   return (global.internalUsers || []).find((user) => String(user.id) === String(id)) || null;
 }
@@ -306,10 +319,16 @@ export function registerFindingsRoutes(app, { db, auth, onChanged }) {
       res.status(500).json({ error: "Server error" });
     }
   };
+  // For routes on one task: someone who can't see it gets "not found", as if it didn't exist.
+  const own = (label, fn) => handle(label, async (req, res) => {
+    const { rows } = await db.query("SELECT * FROM audit_findings WHERE id = $1", [req.params.id]);
+    if (!rows[0] || !canSeeFinding(rows[0], req.user)) return res.status(404).json({ error: "Finding not found" });
+    await fn(req, res);
+  });
 
   app.get("/findings", auth, handle("FINDINGS", async (req, res) => {
     const result = await db.query("SELECT * FROM audit_findings ORDER BY created_at DESC LIMIT 2000");
-    res.json(result.rows.map(toApi));
+    res.json(result.rows.filter((row) => canSeeFinding(row, req.user)).map(toApi));
   }));
 
   app.post("/findings", auth, handle("FINDING CREATE", async (req, res) => {
@@ -391,7 +410,7 @@ export function registerFindingsRoutes(app, { db, auth, onChanged }) {
     res.json({ inserted, skipped, errors });
   }));
 
-  app.patch("/findings/:id", auth, handle("FINDING UPDATE", async (req, res) => {
+  app.patch("/findings/:id", auth, own("FINDING UPDATE", async (req, res) => {
     const { values, error } = readFinding(req.body || {}, { partial: true });
     if (error) return res.status(400).json({ error });
     const keys = Object.keys(values);
@@ -421,7 +440,7 @@ export function registerFindingsRoutes(app, { db, auth, onChanged }) {
   }));
 
   // A follow-up check: notes plus the outcome status, which becomes the finding's status.
-  app.post("/findings/:id/follow-ups", auth, handle("FINDING FOLLOW-UP", async (req, res) => {
+  app.post("/findings/:id/follow-ups", auth, own("FINDING FOLLOW-UP", async (req, res) => {
     const status = String(req.body?.status || "");
     const notes = String(req.body?.notes || "").trim().slice(0, 4000);
     const date = String(req.body?.date || new Date().toISOString().slice(0, 10)).slice(0, 10);
@@ -469,7 +488,7 @@ export function registerFindingsRoutes(app, { db, auth, onChanged }) {
     date: new Date(Date.now() + 330 * 60000).toISOString().slice(0, 10), status, notes,
     auditor: userName(user), recordedBy: userName(user), recordedAt: new Date().toISOString(),
   });
-  app.post("/findings/:id/forward", auth, handle("FINDING FORWARD", async (req, res) => {
+  app.post("/findings/:id/forward", auth, own("FINDING FORWARD", async (req, res) => {
     const finding = (await db.query("SELECT * FROM audit_findings WHERE id = $1", [req.params.id])).rows[0];
     if (!finding) return res.status(404).json({ error: "Finding not found" });
     if (finding.status === "Closed") return res.status(400).json({ error: "This task is closed. Re-open it first." });
@@ -508,7 +527,7 @@ export function registerFindingsRoutes(app, { db, auth, onChanged }) {
   }));
 
   // Someone in the department a task was forwarded to takes it: it becomes theirs.
-  app.post("/findings/:id/take", auth, handle("FINDING TAKE", async (req, res) => {
+  app.post("/findings/:id/take", auth, own("FINDING TAKE", async (req, res) => {
     const finding = (await db.query("SELECT * FROM audit_findings WHERE id = $1", [req.params.id])).rows[0];
     if (!finding) return res.status(404).json({ error: "Finding not found" });
     if (finding.assignee_id) return res.status(400).json({ error: `${finding.assignee_name || "Someone"} has already taken it` });
@@ -526,7 +545,7 @@ export function registerFindingsRoutes(app, { db, auth, onChanged }) {
   }));
 
   // Send (or send again) the task to the action owner's WhatsApp.
-  app.post("/findings/:id/whatsapp", auth, handle("FINDING WHATSAPP", async (req, res) => {
+  app.post("/findings/:id/whatsapp", auth, own("FINDING WHATSAPP", async (req, res) => {
     const result = await sendFindingToOwner(db, Number(req.params.id), { byName: userName(req.user), reassigned: Boolean(req.body?.reassigned) });
     const finding = (await db.query("SELECT * FROM audit_findings WHERE id = $1", [req.params.id])).rows[0];
     if (!finding) return res.status(404).json({ error: "Finding not found" });
@@ -540,7 +559,7 @@ export function registerFindingsRoutes(app, { db, auth, onChanged }) {
   }));
 
   // Attach a file ({ name, type, data: base64 }, up to 15 MB): photos, PDFs, Excel, Word…
-  app.post("/findings/:id/attachments", auth, handle("FINDING ATTACH", async (req, res) => {
+  app.post("/findings/:id/attachments", auth, own("FINDING ATTACH", async (req, res) => {
     const { rows } = await db.query("SELECT jsonb_array_length(attachments) AS count FROM audit_findings WHERE id = $1", [req.params.id]);
     if (!rows[0]) return res.status(404).json({ error: "Finding not found" });
     if (rows[0].count >= MAX_ATTACHMENTS) return res.status(400).json({ error: `Up to ${MAX_ATTACHMENTS} files per finding` });
@@ -557,7 +576,7 @@ export function registerFindingsRoutes(app, { db, auth, onChanged }) {
   }));
 
   // Remove an attached file: whoever attached it, or an admin.
-  app.delete("/findings/:id/attachments/:index", auth, handle("FINDING ATTACH DELETE", async (req, res) => {
+  app.delete("/findings/:id/attachments/:index", auth, own("FINDING ATTACH DELETE", async (req, res) => {
     const { rows } = await db.query("SELECT attachments FROM audit_findings WHERE id = $1", [req.params.id]);
     if (!rows[0]) return res.status(404).json({ error: "Finding not found" });
     const list = rows[0].attachments || [];

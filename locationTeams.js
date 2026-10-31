@@ -14,6 +14,7 @@
     Audit problems, a refiller's "Can't fix") which go to the location's managers.
 ========================================================= */
 import { sendPushToUsers } from "./pushNotifications.js";
+import { canSeeFinding } from "./findingsRoutes.js";
 
 let db = null;
 const COVER_KEY = "location_manager_cover";
@@ -201,13 +202,16 @@ export function registerLocationTeamRoutes(app, { auth }) {
     const row = (await teamRows()).find((item) => String(item.id) === String(req.params.id));
     if (!row) return res.status(404).json({ error: "Location not found" });
     const [findings, problems, refills, products] = await Promise.all([
-      db.query("SELECT id, ref, title, status, risk, due_date::text, assignee_name, owner_department FROM audit_findings WHERE status <> 'Closed' AND $1 = ANY(locations) ORDER BY due_date LIMIT 20", [row.name]).catch(() => ({ rows: [] })),
+      db.query("SELECT id, ref, title, status, risk, due_date::text, assignee_id, assignee_name, owner_department, created_by, cc FROM audit_findings WHERE status <> 'Closed' AND $1 = ANY(locations) ORDER BY due_date LIMIT 50", [row.name]).catch(() => ({ rows: [] })),
       db.query("SELECT id, ref, defect, severity, refiller, created_at, escalated_at FROM audit_capa WHERE status = 'OPEN' AND LOWER(location) = LOWER($1) ORDER BY created_at DESC LIMIT 20", [row.name]).catch(() => ({ rows: [] })),
       db.query("SELECT id, due_date, due_time, status, refiller_name, completed_at FROM refill_tasks WHERE location_id = $1 AND due_date <= to_char(NOW() + INTERVAL '330 minutes', 'YYYY-MM-DD') ORDER BY due_date DESC, due_time DESC LIMIT 8", [row.id]).catch(() => ({ rows: [] })),
       db.query(`SELECT s.product, SUM(s.qty)::int AS units FROM stock_sales s JOIN stock_machines m ON m.id = s.machine_id
                 WHERE m.location_id = $1 AND s.day > CURRENT_DATE - 30 GROUP BY s.product ORDER BY units DESC LIMIT 5`, [row.id]).catch(() => ({ rows: [] })),
     ]);
-    res.json({ ...row, findings: findings.rows, problems: problems.rows, refills: refills.rows, top_products: products.rows });
+    // Tasks are private: the card lists only the ones this person may see (the counts stay for all).
+    const visible = findings.rows.filter((finding) => canSeeFinding(finding, req.user)).slice(0, 20)
+      .map(({ assignee_id, created_by, cc, ...finding }) => finding); // eslint-disable-line no-unused-vars
+    res.json({ ...row, findings: visible, problems: problems.rows, refills: refills.rows, top_products: products.rows });
   }));
 
   // Change who looks after a location: refiller, managers (names, main first), helpers.

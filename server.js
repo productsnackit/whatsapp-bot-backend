@@ -40,7 +40,7 @@ import { registerExpiryRoutes } from "./expiryRoutes.js";
 import { ensureUpiScanColumns, scanUpiScreenshot, registerUpiScanRoutes, readUpiImage, readMissedScreenshots } from "./upiScanner.js";
 import { ensureWhatsAppOutbox, applyOutboxStatuses, noteInbound, refillerWindowOpen } from "./whatsappOutbox.js";
 import { registerTicketCleanupRoutes } from "./ticketCleanup.js";
-import { ensureSiteMatching, matchSite, registerSiteRoutes } from "./siteMatcher.js";
+import { ensureSiteMatching, matchSite, siteFields, registerSiteRoutes } from "./siteMatcher.js";
 import { ensureTicketWatch, addTicketWatch, alertOverdueTickets, fingerprintMissedScreenshots, registerTicketWatchRoutes } from "./ticketWatch.js";
 import { ensureTicketChatSchema, registerTicketChatRoutes, storeIncomingMedia, saveTicketMessage, applyStatusUpdates } from "./ticketChat.js";
 import { ensureCallLog, registerCallLogRoutes, handleCallLogWhatsApp } from "./callLog.js";
@@ -642,7 +642,7 @@ async function saveMessage(ticketId, sender, message) {
 }
 
 async function updateTicket(id, fields) {
-  const currentResult = await db.query("SELECT phone, state, refund_stage, site_match FROM tickets WHERE id=$1", [id]);
+  const currentResult = await db.query("SELECT phone, state, refund_stage, site_match, paid_machine, machine_source FROM tickets WHERE id=$1", [id]);
   const current = currentResult.rows[0];
   const nextFields = { ...fields };
 
@@ -658,7 +658,8 @@ async function updateTicket(id, fields) {
     nextFields.location = location;
     // Which of our sites the customer's words point to (see siteMatcher.js), unless the site was
     // already read from the payment screenshot's machine ID or set by hand.
-    if (!["machine", "manual"].includes(current?.site_match)) Object.assign(nextFields, await matchSite(location).catch(() => ({})));
+    // The machine too, when the location points to exactly one (siteFields).
+    if (!["machine", "manual"].includes(current?.site_match)) Object.assign(nextFields, await siteFields(await matchSite(location).catch(() => ({})), current || {}).catch(() => ({})));
   }
 
   const nextStage = getRefundStage(nextFields.refund_stage || nextFields.status, nextFields.state || current?.state, current?.refund_stage);
@@ -2701,6 +2702,7 @@ app.get("/tickets", auth, async (req, res) => {
         site_name,
         site_match,
         paid_machine,
+        machine_source,
         (SELECT vm.location FROM vending_machines vm WHERE vm.code = tickets.paid_machine) AS paid_machine_location,
         upi_utr,
         payments,

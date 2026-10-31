@@ -457,9 +457,12 @@ export function registerCallLogRoutes(app, { auth }) {
   };
   // The person who raised it, the person it's with, or an admin.
   const canChange = (req, task) => req.user?.isAdmin || task.raised_by_key === userKey(req.user) || String(task.assignee_id) === String(req.user?.id);
+  // Private: a task (and its files) is seen only by who raised it, who it's with, and directors / admins.
+  const canSee = canChange;
 
   app.get("/internal/call-log", auth, handle("CALL LOG", async (req, res) => {
-    const { rows } = await db.query("SELECT * FROM call_logs ORDER BY created_at DESC LIMIT 1000");
+    const { rows: all } = await db.query("SELECT * FROM call_logs ORDER BY created_at DESC LIMIT 1000");
+    const rows = all.filter((task) => canSee(req, task));
     const windows = {};
     for (const task of rows) {
       const phone = phoneDigits(task.assignee_phone);
@@ -557,7 +560,7 @@ export function registerCallLogRoutes(app, { auth }) {
 
   app.post("/internal/call-log/:id/resend", auth, handle("CALL LOG RESEND", async (req, res) => {
     const task = await getTask(Number(req.params.id));
-    if (!task) return res.status(404).json({ error: "Task not found" });
+    if (!task || !canSee(req, task)) return res.status(404).json({ error: "Task not found" });
     // The number may have been added since the task was raised.
     const assignee = employeeById(task.assignee_id);
     if (assignee?.phone && assignee.phone !== task.assignee_phone) await db.query("UPDATE call_logs SET assignee_phone = $2 WHERE id = $1", [task.id, assignee.phone]);
