@@ -18,6 +18,7 @@
 ========================================================= */
 import axios from "axios";
 import { sendPushToUsers } from "./pushNotifications.js";
+import XLSX from "xlsx";
 
 const GRAPH = `https://graph.facebook.com/${process.env.GRAPH_VERSION || "v23.0"}`;
 export const META_APP_ID = process.env.META_APP_ID || "970407229041334";
@@ -340,6 +341,65 @@ export function registerOfficeBotRoutes(app, { auth }) {
   }));
 
   /* Office Leads page */
+  /* Excel of the leads received between two dates (India time, both days included), optionally
+     one status: a "Leads" sheet (one row per lead, newest first, with its notes) and a
+     "Summary" sheet (per day, per enquiry type, per status). */
+  app.get("/office-leads/export.xlsx", auth, handle("OFFICE LEADS EXCEL", async (req, res) => {
+    const day = (value) => (/^\d{4}-\d{2}-\d{2}$/.test(String(value || "")) ? String(value) : null);
+    const from = day(req.query.from);
+    const to = day(req.query.to);
+    if (from && to && from > to) return res.status(400).json({ error: "The start date is after the end date" });
+    const status = ["New", "Contacted", "Quoted", "Won", "Lost"].includes(req.query.status) ? req.query.status : null;
+    const { rows } = await db.query(
+      `SELECT *, to_char(created_at AT TIME ZONE 'Asia/Kolkata', 'YYYY-MM-DD') AS ist_day, to_char(created_at AT TIME ZONE 'Asia/Kolkata', 'HH12:MI AM') AS ist_time
+       FROM office_leads
+       WHERE ($1::date IS NULL OR (created_at AT TIME ZONE 'Asia/Kolkata')::date >= $1::date)
+         AND ($2::date IS NULL OR (created_at AT TIME ZONE 'Asia/Kolkata')::date <= $2::date)
+         AND ($3::text IS NULL OR status = $3)
+       ORDER BY created_at DESC`,
+      [from, to, status]
+    );
+    const showDay = (iso) => new Date(`${iso}T00:00:00Z`).toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric", timeZone: "UTC" });
+    const phone = (value) => { const digits = String(value || "").replace(/\D/g, ""); return digits.length === 12 && digits.startsWith("91") ? `+91 ${digits.slice(2, 7)} ${digits.slice(7)}` : digits ? `+${digits}` : ""; };
+    const notesOf = (lead) => (lead.notes || []).map((entry) => `${new Date(entry.at).toLocaleString("en-IN", { day: "numeric", month: "short", hour: "numeric", minute: "2-digit", timeZone: "Asia/Kolkata" })} ${entry.by}: ${[entry.status ? `→ ${entry.status}` : "", entry.note || ""].filter(Boolean).join(" ")}`).join("\n");
+    const header = ["Ref", "Date", "Time", "Enquiry", "Name", "WhatsApp name", "Email", "WhatsApp number", "City", "Company", "Details", "Status", "Notes", "Last updated by"];
+    const data = rows.map((lead) => [lead.ref, showDay(lead.ist_day), lead.ist_time, lead.kind, lead.name || "", lead.wa_name || "", lead.email || "", phone(lead.phone), lead.city || "", lead.company || "", lead.details || "", lead.status, notesOf(lead), lead.updated_by || ""]);
+    const title = `Office leads · ${from ? showDay(from) : "first lead"} to ${to ? showDay(to) : "today"}${status ? ` · ${status} only` : ""} · ${rows.length} lead${rows.length === 1 ? "" : "s"}`;
+    const sheet = XLSX.utils.aoa_to_sheet([[title], [], header, ...data]);
+    const widths = [9, 13, 10, 17, 20, 18, 28, 18, 16, 20, 40, 11, 48, 16];
+    sheet["!cols"] = widths.map((wch) => ({ wch }));
+    sheet["!autofilter"] = { ref: XLSX.utils.encode_range({ s: { r: 2, c: 0 }, e: { r: Math.max(2, data.length + 2), c: header.length - 1 } }) };
+    sheet["!merges"] = [{ s: { r: 0, c: 0 }, e: { r: 0, c: header.length - 1 } }];
+
+    // Summary: per day, per enquiry type, per status.
+    const count = (key) => [...rows.reduce((map, lead) => map.set(key(lead), (map.get(key(lead)) || 0) + 1), new Map()).entries()];
+    const days = count((lead) => lead.ist_day).sort((a, b) => b[0].localeCompare(a[0]));
+    const kinds = count((lead) => lead.kind).sort((a, b) => b[1] - a[1]);
+    const statuses = ["New", "Contacted", "Quoted", "Won", "Lost"].map((name) => [name, rows.filter((lead) => lead.status === name).length]).filter(([, n]) => n);
+    const summary = [
+      [title], [],
+      ["Leads per day", "", "", "By enquiry", "", "", "By status"],
+      ["Date", "Leads", "", "Enquiry", "Leads", "", "Status", "Leads"],
+    ];
+    for (let i = 0; i < Math.max(days.length, kinds.length, statuses.length); i += 1) {
+      summary.push([days[i] ? showDay(days[i][0]) : "", days[i]?.[1] ?? "", "", kinds[i]?.[0] || "", kinds[i]?.[1] ?? "", "", statuses[i]?.[0] || "", statuses[i]?.[1] ?? ""]);
+    }
+    summary.push([], ["Total", rows.length, "", "Won", rows.filter((lead) => lead.status === "Won").length, "", "Conversion", rows.length ? `${Math.round((rows.filter((lead) => lead.status === "Won").length / rows.length) * 100)}%` : "—"]);
+    const summarySheet = XLSX.utils.aoa_to_sheet(summary);
+    summarySheet["!cols"] = [{ wch: 15 }, { wch: 8 }, { wch: 3 }, { wch: 18 }, { wch: 8 }, { wch: 3 }, { wch: 12 }, { wch: 8 }];
+    summarySheet["!merges"] = [{ s: { r: 0, c: 0 }, e: { r: 0, c: 7 } }];
+
+    const book = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(book, sheet, "Leads");
+    XLSX.utils.book_append_sheet(book, summarySheet, "Summary");
+    const name = `office-leads_${from || "start"}_to_${to || new Date(Date.now() + 330 * 60000).toISOString().slice(0, 10)}${status ? `_${status.toLowerCase()}` : ""}.xlsx`;
+    res.locals.activity = { section: "Office Leads", action: `Downloaded ${rows.length} leads (${from || "start"} to ${to || "today"}${status ? `, ${status}` : ""})` };
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", `attachment; filename="${name}"`);
+    res.setHeader("Access-Control-Expose-Headers", "Content-Disposition");
+    res.send(XLSX.write(book, { type: "buffer", bookType: "xlsx" }));
+  }));
+
   app.get("/office-leads", auth, handle("OFFICE LEADS", async (req, res) => {
     const { rows } = await db.query("SELECT * FROM office_leads ORDER BY created_at DESC LIMIT 2000");
     res.json({ leads: rows, connected: Boolean(office?.phone_number_id), display_phone: office?.display_phone || null });
