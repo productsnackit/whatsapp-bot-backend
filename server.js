@@ -2704,6 +2704,8 @@ app.get("/tickets", auth, async (req, res) => {
         paid_machine,
         machine_source,
         (SELECT vm.location FROM vending_machines vm WHERE vm.code = tickets.paid_machine) AS paid_machine_location,
+        -- All machines at the ticket's location, listed when it isn't known which one was used.
+        (SELECT COALESCE(json_agg(json_build_object('code', vm.code, 'location', vm.location) ORDER BY vm.code), '[]'::json) FROM vending_machines vm WHERE tickets.site_id IS NOT NULL AND vm.site_id = tickets.site_id) AS site_machines,
         upi_utr,
         payments,
         product_received,
