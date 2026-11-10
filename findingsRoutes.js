@@ -172,14 +172,14 @@ function findingTemplate(finding, byName) {
 async function sendFindingFiles(finding, to) {
   for (const file of finding.attachments || []) await sendStoredFile(to, file, `${finding.ref}: ${file.name}`).catch(() => {});
 }
-// Audit tasks are handled on the dashboard (status buttons, Forward); WhatsApp only if
-// FINDING_WHATSAPP=on on Render.
-const findingWhatsAppOn = () => process.env.FINDING_WHATSAPP === "on";
+// Audit tasks are handled on the dashboard (status buttons, Forward); they also go to WhatsApp
+// for people ticked "Tasks on WhatsApp" in Employees & Access (everyone if FINDING_WHATSAPP=on on Render).
+const findingWhatsAppOn = (owner) => process.env.FINDING_WHATSAPP === "on" || Boolean(owner?.whatsappTasks);
 export async function sendFindingToOwner(db, findingId, { byName = null, reassigned = false } = {}) {
-  if (!findingWhatsAppOn()) return { ok: false, off: true };
   const finding = (await db.query("SELECT * FROM audit_findings WHERE id = $1", [findingId])).rows[0];
   if (!finding) return { ok: false };
   const owner = employeeById(finding.assignee_id);
+  if (!findingWhatsAppOn(owner)) return { ok: false, off: true };
   const to = fndPhone(owner?.phone);
   const save = (status, error) => db.query("UPDATE audit_findings SET whatsapp_status = $2, whatsapp_error = $3, whatsapp_delivery = NULL, whatsapp_sent_at = CASE WHEN $2 = 'SENT' THEN NOW() ELSE whatsapp_sent_at END WHERE id = $1", [findingId, status, error]);
   if (!to) {

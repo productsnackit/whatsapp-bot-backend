@@ -4409,6 +4409,7 @@ app.post("/internal/users", auth, (req, res) => {
       tags: getInternalTagList(tags ? String(tags).split(",") : []),
       phone: whatsapp.phone,
       ...accessFields(req.body || {}),
+      whatsappTasks: Boolean(req.body?.whatsappTasks), // Internal Audit tasks also sent to their WhatsApp
       chatAccessSet: true, // Internal Chat only if it was ticked
     };
 
@@ -4451,6 +4452,8 @@ app.patch("/internal/users/:id", auth, (req, res) => {
     if (role !== undefined) user.role = String(role).trim();
     if (tags !== undefined) user.tags = getInternalTagList(Array.isArray(tags) ? tags : String(tags).split(","));
     Object.assign(user, access);
+    const tasksBefore = Boolean(user.whatsappTasks);
+    if (req.body?.whatsappTasks !== undefined) user.whatsappTasks = Boolean(req.body.whatsappTasks);
 
     const after = accessFor(user);
     const labels = { name: "name", department: "department", role: "job title", tags: "tags", username: "username", phone: "WhatsApp" };
@@ -4461,7 +4464,8 @@ app.patch("/internal/users/:id", auth, (req, res) => {
     const accessNote = before.accessRole !== after.accessRole || before.pages.join() !== after.pages.join()
       ? ` · access: ${before.roleLabel} → ${after.roleLabel} (${after.pages.map((page) => PAGES[page]).join(", ") || "chat only"})`
       : "";
-    res.locals.activity = { action: `Updated employee ${user.name}${changes.length ? ` (${changes.join("; ")})` : ""}${accessNote}` };
+    const tasksNote = tasksBefore !== Boolean(user.whatsappTasks) ? ` · tasks on WhatsApp ${user.whatsappTasks ? "on" : "off"}` : "";
+    res.locals.activity = { action: `Updated employee ${user.name}${changes.length ? ` (${changes.join("; ")})` : ""}${accessNote}${tasksNote}` };
     io.emit("internal-user-updated", { user: publicUser(user) });
     res.json({ success: true, user: publicUser(user, { withAccess: true }) });
   } catch (err) {
