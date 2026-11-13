@@ -56,6 +56,7 @@ export function expectedAnswers(category, state) {
   if (category === "REFUND" && state === "MAIN") return ["1", "2", "3", "4", "5"];
   if (category === "REFUND" && state === "MULTI_PRODUCT") return ["1", "2", YES_NO];
   if (category === "PRODUCT" && state === "OPTIONS") return ["1", "2"];
+  if (category === "PRODUCT" && state === "BRAND_TOPIC") return ["1", "2"];
   if (category === "FEEDBACK" && state === "RATING") return ["1", "2", "3", "4", "5"];
   return null;
 }

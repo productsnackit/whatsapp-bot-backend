@@ -327,6 +327,8 @@ async function ensureSupportColumns() {
         ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ
     `);
     await db.query("ALTER TABLE feedback ADD COLUMN IF NOT EXISTS ticket_id INTEGER REFERENCES tickets(id)");
+    // What a brand enquiry is about (asked after "Brand Enquiry"): their products in our machines, or a machine.
+    await db.query("ALTER TABLE product_leads ADD COLUMN IF NOT EXISTS topic TEXT").catch(() => {});
     await ensureUpiScanColumns(db);
     await ensureAttention(db);
     await ensureTicketChatSchema(db);
@@ -2415,19 +2417,35 @@ Otherwise, reply with the number of times you were charged, e.g. *2*`);
 
     // ===== PRODUCT ENQUIRY LOGIC =====
     if (category === "PRODUCT") {
-      if (state === "OPTIONS") {
-        if (message === "1") {
-          await db.query(
-            "INSERT INTO product_leads (phone, type) VALUES ($1, $2)",
-            [from, "Brand Enquiry"]
-          );
+      if (state === "OPTIONS" && message === "1") {
+        await updateTicket(ticketId, { state: "BRAND_TOPIC" });
+        return sendWhatsApp(
+          from,
+          `🛍️ *BRAND ENQUIRY*
 
-          await updateTicket(ticketId, {
-            main_issue: "Product",
-            sub_issue: "Brand Enquiry",
-            state: "CLOSED",
-            status: "closed",
-          });
+What is your enquiry about?
+
+1️⃣ Placing your products in our machines
+2️⃣ A vending machine (rent or buy)
+
+Please reply with the number (1 or 2)`
+        );
+      }
+
+      if (state === "BRAND_TOPIC") {
+        const topic = { 1: "Products in machines", 2: "Vending machine" }[message];
+        if (!topic) return sendWhatsApp(from, `❌ Invalid option. Please reply with *1* or *2*.`);
+        await db.query(
+          "INSERT INTO product_leads (phone, type, topic) VALUES ($1, $2, $3)",
+          [from, "Brand Enquiry", topic]
+        );
+
+        await updateTicket(ticketId, {
+          main_issue: "Product",
+          sub_issue: `Brand Enquiry · ${topic}`,
+          state: "CLOSED",
+          status: "closed",
+        });
 
           return sendWhatsApp(
             from,
@@ -2441,8 +2459,9 @@ Snackit is a fast-growing smart vending solutions company providing seamless, ca
 
 Our team will reach out shortly. 🚀`
           );
-        }
+      }
 
+      if (state === "OPTIONS") {
         if (message === "2") {
           await db.query(
             "INSERT INTO product_leads (phone, type) VALUES ($1, $2)",
@@ -2784,7 +2803,7 @@ app.get("/feedback", auth, async (req, res) => {
 app.get("/product-leads", auth, async (req, res) => {
   try {
     const result = await db.query(`
-      SELECT id, phone, type, created_at
+      SELECT id, phone, type, topic, created_at
       FROM product_leads
       ORDER BY id DESC
     `);
