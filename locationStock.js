@@ -395,7 +395,7 @@ async function addDcMoves(dc) {
   }
 }
 
-export async function readDcFile({ buffer, mime, fileName, fileUrl, fromPhone, source, by }) {
+export async function readDcFile({ buffer, mime, fileName, fileUrl, fromPhone, source, by, locationId = null }) {
   const isPdf = /pdf/i.test(mime || "") || /\.pdf$/i.test(fileName || "");
   const pages = isPdf ? await pdfPages(buffer) : null;
   const text = isPdf ? pagesText(pages) : await imageText(buffer);
@@ -404,7 +404,7 @@ export async function readDcFile({ buffer, mime, fileName, fileUrl, fromPhone, s
   const table = isPdf ? dcTableFromPages(pages) : [];
   if (table.length) parsed.lines = table;
   if (!parsed.lines.length && isPdf) parsed.problem = "No items could be read";
-  return saveDc({ parsed, fileUrl, fromPhone, source: isPdf ? source : `${source} (photo)`, by });
+  return saveDc({ parsed, fileUrl, fromPhone, source: isPdf ? source : `${source} (photo)`, by, locationId });
 }
 
 /* ---------- DCs on WhatsApp from the DC numbers ---------- */
@@ -993,7 +993,10 @@ export function registerLocationStockRoutes(app, { auth }) {
     if (!buffer.length) return res.status(400).json({ error: "Choose the DC file" });
     // The DC itself is kept, to open from the dashboard.
     const stored = await storeDashboardFile({ name: file.name || "DC.pdf", type: file.type || (/\.pdf$/i.test(file.name || "") ? "application/pdf" : "image/jpeg"), data: file.data }).catch(() => null);
-    const dc = await readDcFile({ buffer, mime: file.type, fileName: file.name, fileUrl: stored?.url || null, fromPhone: null, source: "upload", by: who(req.user) });
+    // Uploaded from a location's page: it goes to that location (one company can have several
+    // locations with the same Bill To, so the DC's names can't tell them apart).
+    const locationId = Number(req.body?.location_id) || null;
+    const dc = await readDcFile({ buffer, mime: file.type, fileName: file.name, fileUrl: stored?.url || null, fromPhone: null, source: "upload", by: who(req.user), locationId });
     // Where it went, and whether that location's latest closing stock is after it (then it's
     // already in that count and the stock doesn't change), so the upload message can say so.
     if (dc.location_id) {
