@@ -994,6 +994,15 @@ export function registerLocationStockRoutes(app, { auth }) {
     // The DC itself is kept, to open from the dashboard.
     const stored = await storeDashboardFile({ name: file.name || "DC.pdf", type: file.type || (/\.pdf$/i.test(file.name || "") ? "application/pdf" : "image/jpeg"), data: file.data }).catch(() => null);
     const dc = await readDcFile({ buffer, mime: file.type, fileName: file.name, fileUrl: stored?.url || null, fromPhone: null, source: "upload", by: who(req.user) });
+    // Where it went, and whether that location's latest closing stock is after it (then it's
+    // already in that count and the stock doesn't change), so the upload message can say so.
+    if (dc.location_id) {
+      const { rows: place } = await db.query("SELECT name FROM audit_locations WHERE id = $1", [dc.location_id]);
+      const { rows: closing } = await db.query("SELECT MAX(at) AS at FROM stock_moves WHERE location_id = $1 AND kind = 'count' AND ref LIKE 'warehouse%'", [dc.location_id]);
+      dc.location_name = place[0]?.name || null;
+      dc.closing_at = closing[0]?.at || null;
+      dc.in_count = Boolean(dc.closing_at && new Date(dc.dc_at || dc.created_at) <= new Date(dc.closing_at));
+    }
     res.json(dc);
   }));
 
